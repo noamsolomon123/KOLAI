@@ -1,4 +1,4 @@
-from radioai.models import TrackAnalysis
+﻿from radioai.models import TrackAnalysis
 from radioai.mixplanner import choose_transition
 
 
@@ -29,11 +29,13 @@ def test_medium_compat_crossfade():
     assert t.type == "crossfade"
 
 
-def test_low_compat_cut():
+def test_low_compat_uses_short_crossfade():
+    # Very incompatible pair: no more hard cut -> a short crossfade so it still smooth.
     a = _track(120, "8A", 0.9)
     b = _track(180, "11A", 0.1)
     t = choose_transition(a, b, has_dj=False)
-    assert t.type == "cut"
+    assert t.type == "crossfade"
+    assert 0.0 < t.duration_s < 8.0   # shorter than the medium-compat blend
 
 
 def test_beatmatch_duration_deeper_for_compatible_keys():

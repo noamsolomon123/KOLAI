@@ -1,4 +1,4 @@
-from radioai.models import TrackAnalysis, Transition
+﻿from radioai.models import TrackAnalysis, Transition
 from radioai.scoring import compatibility
 from radioai.keys import camelot_relation
 
@@ -6,6 +6,7 @@ _BEATMATCH_MIN = 0.75
 _CROSSFADE_MIN = 0.45
 _TALKOVER_SECONDS = 4.0
 _BLEND_SECONDS = 8.0
+_SHORT_BLEND_SECONDS = 3.0
 
 
 def choose_transition(prev: TrackAnalysis, nxt: TrackAnalysis,
@@ -25,4 +26,4 @@ def choose_transition(prev: TrackAnalysis, nxt: TrackAnalysis,
         return Transition(type="beatmatch", duration_s=dur)
     if score >= _CROSSFADE_MIN:
         return Transition(type="crossfade", duration_s=_BLEND_SECONDS)
-    return Transition(type="cut", duration_s=0.0)
+    return Transition(type="crossfade", duration_s=_SHORT_BLEND_SECONDS)
