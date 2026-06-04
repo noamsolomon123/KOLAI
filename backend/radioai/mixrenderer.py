@@ -1,0 +1,69 @@
+import numpy as np
+import soundfile as sf
+import librosa
+import pyrubberband as pyrb
+
+SR = 44100  # working sample rate
+
+
+def load_mono(path: str) -> np.ndarray:
+    y, _ = librosa.load(path, sr=SR, mono=True)
+    return y.astype(np.float32)
+
+
+def equal_power_crossfade(a: np.ndarray, b: np.ndarray,
+                          overlap_s: float) -> np.ndarray:
+    n = int(overlap_s * SR)
+    n = min(n, len(a), len(b))
+    if n <= 0:
+        return np.concatenate([a, b])
+    t = np.linspace(0, 1, n, dtype=np.float32)
+    fade_out = np.cos(t * np.pi / 2)   # equal-power
+    fade_in = np.cos((1 - t) * np.pi / 2)
+    head = a[:-n]
+    mixed = a[-n:] * fade_out + b[:n] * fade_in
+    tail = b[n:]
+    out = np.concatenate([head, mixed, tail])
+    return np.clip(out, -1.0, 1.0)
+
+
+def duck(music: np.ndarray, voice: np.ndarray, start_s: float,
+         attenuation_db: float = -7.0, ramp_s: float = 0.3) -> np.ndarray:
+    out = music.copy()
+    start = int(start_s * SR)
+    end = min(len(out), start + len(voice))
+    gain = 10 ** (attenuation_db / 20.0)
+    ramp = int(ramp_s * SR)
+    # ramp down
+    for i in range(start, min(start + ramp, end)):
+        f = (i - start) / max(1, ramp)
+        out[i] *= (1.0 - f) + f * gain
+    # steady duck
+    out[min(start + ramp, end):end] *= gain
+    # overlay voice
+    vlen = end - start
+    out[start:end] += voice[:vlen]
+    return np.clip(out, -1.0, 1.0)
+
+
+def time_stretch_to_bpm(audio: np.ndarray, src_bpm: float,
+                        dst_bpm: float) -> np.ndarray:
+    if src_bpm <= 0 or dst_bpm <= 0:
+        return audio
+    rate = dst_bpm / src_bpm   # >1 = faster = shorter
+    try:
+        return pyrb.time_stretch(audio, SR, rate).astype(np.float32)
+    except Exception:
+        # rubberband CLI binary may not be installed; fall back to librosa's
+        # pure-Python phase vocoder (lower quality, no external dependency).
+        return librosa.effects.time_stretch(audio, rate=rate).astype(np.float32)
+
+
+def write_mp3(path: str, audio: np.ndarray) -> None:
+    wav_path = path.replace(".mp3", ".wav")
+    sf.write(wav_path, np.clip(audio, -1.0, 1.0), SR)
+    import subprocess
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, "-b:a", "192k", path],
+        check=True, capture_output=True,
+    )
