@@ -20,11 +20,15 @@ RADIO_STYLE = (
     "radio personality - not a robot. Speak only the Hebrew:"
 )
 
-# Hardcoded setlist for M1 (replaced by Spotify+LLM in M2).
+# Hardcoded setlist for M1 (replaced by Spotify+LLM in M2). Verified Israeli
+# hits, pinned to their official videos so versions are guaranteed correct.
 SETLIST = [
-    Song(title="Tudo Bom", artist="Static & Ben El Tavori"),
-    Song(title="Hofim", artist="Idan Raichel"),
-    Song(title="Malkat Hayofi", artist="Eden Ben Zaken"),
+    Song(title="טודו בום", artist="סטטיק ובן אל",
+         query="https://www.youtube.com/watch?v=Y_OLslE3bX8"),
+    Song(title="מיליון דולר", artist="נועה קירל",
+         query="https://www.youtube.com/watch?v=oQbh5Kvet04"),
+    Song(title="תל אביב", artist="עומר אדם",
+         query="https://www.youtube.com/watch?v=nMQw29nfzpg"),
 ]
 
 _SEGUE_S = 4.0  # crossfade out of a DJ talkover into the next song
@@ -81,3 +85,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
