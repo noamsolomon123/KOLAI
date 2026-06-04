@@ -14,6 +14,7 @@ from radioai.voice import VoiceRenderer, GeminiTTSSynth
 from radioai import mixrenderer as mx
 from radioai.taste import TasteService
 from radioai.setlist import SetlistPlanner
+from radioai.djcontext import DJContext
 
 # Pro radio-host delivery direction handed to the TTS for every DJ line.
 RADIO_STYLE = (
@@ -35,6 +36,12 @@ DEMO_SETLIST = [
 
 _SEGUE_S = 1.5  # crossfade out of a DJ talkover into the next song
 DUCK_DB = -15.0
+
+BEATS = ["song", "weather", "topic", "news"]
+
+
+def beat_for_break(k: int) -> str:
+    return BEATS[k % len(BEATS)]
 
 
 def build_setlist(cfg):
@@ -82,6 +89,13 @@ def main() -> None:
     if len(tracks) < 2:
         raise RuntimeError("Not enough playable songs to build a show")
 
+    ctx = DJContext.build(cfg)
+    print(f"Context: {ctx.time_str} {ctx.part_of_day} | weather={ctx.weather} | "
+          f"topics={list(ctx.topic_headlines)}")
+    topic_list = list(ctx.topic_headlines.keys())
+    break_k = 0
+    topic_k = 0
+
     timeline = tracks[0][2]
     dj_lines = []
     for i in range(1, len(tracks)):
@@ -91,15 +105,19 @@ def main() -> None:
         t = choose_transition(prev_an, an, has_dj=has_dj)
         print(f"  {prev_song.title} -> {song.title}: {t.type}")
         if t.type == "talkover":
-            script = brain.write_intro(prev=prev_song, nxt=song, seconds=t.duration_s)
-            print(f"    DJ: {script}")
-            dj_lines.append(f"[{prev_song.title} -> {song.title}]\n{script}")
+            beat = beat_for_break(break_k)
+            break_k += 1
+            topic = None
+            if beat == "topic" and topic_list:
+                topic = topic_list[topic_k % len(topic_list)]
+                topic_k += 1
+            script = brain.write_break(prev=prev_song, nxt=song, beat=beat,
+                                       ctx=ctx, seconds=t.duration_s, topic=topic)
+            print(f"    DJ [{beat}]: {script}")
+            dj_lines.append(f"[{beat}: {prev_song.title} -> {song.title}]\n{script}")
             slot = voice.render(script)
             dj_audio = mx.trim_silence(mx.load_mono(slot.audio_path))
             dj_dur = len(dj_audio) / mx.SR
-            # Duck the song deep under the DJ so the talk is clearly audible, and
-            # place the DJ so it FINISHES ~0.3s before the next song segues in
-            # (the incoming song must not blast over the voice).
             duck_start = max(0.0, len(timeline) / mx.SR - dj_dur - _SEGUE_S - 0.3)
             timeline = mx.duck(timeline, dj_audio, start_s=duck_start,
                                attenuation_db=DUCK_DB)
