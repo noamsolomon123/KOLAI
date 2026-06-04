@@ -1,4 +1,4 @@
-"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
+﻿"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
 
 Usage:  python -m radioai.render_show
 """
@@ -17,6 +17,7 @@ from radioai.setlist import SetlistPlanner
 from radioai.djcontext import DJContext
 from radioai.stems import StemSeparator
 from radioai.mashup import mashup_gate, build_mashup
+from radioai.showmeta import build_segments, write_show_json
 
 # Pro radio-host delivery direction handed to the TTS for every DJ line.
 RADIO_STYLE = (
@@ -101,7 +102,11 @@ def main() -> None:
 
     timeline = tracks[0][2]
     dj_lines = []
+    song_events = [{"type": "song", "title": tracks[0][0].title,
+                    "artist": tracks[0][0].artist, "start_s": 0.0}]
+    talk = []
     for i in range(1, len(tracks)):
+        boundary = round(len(timeline) / mx.SR, 2)
         prev_song, prev_an, _, prev_path = tracks[i - 1]
         song, an, audio, song_path = tracks[i]
         has_dj = (i % 2 == 1)  # witty talkover every ~2 songs
@@ -122,6 +127,9 @@ def main() -> None:
             dj_audio = mx.trim_silence(mx.load_mono(slot.audio_path))
             dj_dur = len(dj_audio) / mx.SR
             duck_start = max(0.0, len(timeline) / mx.SR - dj_dur - _SEGUE_S - 0.3)
+            talk.append({"beat": beat, "text": script,
+                         "start_s": round(duck_start, 2),
+                         "end_s": round(duck_start + dj_dur, 2)})
             timeline = mx.duck(timeline, dj_audio, start_s=duck_start,
                                attenuation_db=DUCK_DB)
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
@@ -148,6 +156,8 @@ def main() -> None:
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=t.duration_s)
         else:  # cut
             timeline = np.concatenate([timeline, audio])
+        song_events.append({"type": "song", "title": song.title,
+                            "artist": song.artist, "start_s": boundary})
 
     script_path = os.path.join(cfg.cache_dir, "show_script.txt")
     with open(script_path, "w", encoding="utf-8") as f:
@@ -157,6 +167,12 @@ def main() -> None:
     out = os.path.join(cfg.cache_dir, "show.mp3")
     mx.write_mp3(out, timeline)
     print(f"Done -> {out}")
+    total_s = round(len(timeline) / mx.SR, 2)
+    segments = build_segments(song_events, total_s)
+    write_show_json(os.path.join(cfg.cache_dir, "show.json"),
+                    station="רדיו AI", dj="רדיו AI", duration_s=total_s,
+                    segments=segments, talk=talk)
+    print(f"Show meta -> {os.path.join(cfg.cache_dir, 'show.json')}")
 
 
 if __name__ == "__main__":
