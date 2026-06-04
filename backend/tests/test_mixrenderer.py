@@ -85,3 +85,32 @@ def test_snap_overlap_to_beats():
     from radioai.mixrenderer import snap_overlap_to_beats
     assert abs(snap_overlap_to_beats(4.8, 120) - 5.0) < 1e-6
     assert abs(snap_overlap_to_beats(0.1, 120) - 0.5) < 1e-6
+
+def _sine(freq, seconds, sr):
+    t = np.linspace(0, seconds, int(seconds * sr), endpoint=False, dtype=np.float32)
+    return (0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def test_band_split_separates_low_and_high():
+    from radioai.mixrenderer import band_split
+    low_tone = _sine(60, 1.0, SR)
+    lo, hi = band_split(low_tone, crossover_hz=200)
+    assert np.mean(lo ** 2) > np.mean(hi ** 2) * 5
+
+    high_tone = _sine(4000, 1.0, SR)
+    lo2, hi2 = band_split(high_tone, crossover_hz=200)
+    assert np.mean(hi2 ** 2) > np.mean(lo2 ** 2) * 5
+
+
+def test_bass_swap_crossfade_length_and_swap():
+    from radioai.mixrenderer import bass_swap_crossfade
+    a = _sine(80, 4.0, SR)
+    b = np.zeros(SR * 4, dtype=np.float32)
+    out = bass_swap_crossfade(a, b, overlap_s=2.0)
+    assert abs(len(out) - SR * 6) <= 4
+    assert np.max(np.abs(out)) <= 1.0001
+    n = SR * 2
+    ov = out[len(a) - n: len(a)]
+    first_half = np.mean(ov[: n // 2] ** 2)
+    second_half = np.mean(ov[n // 2:] ** 2)
+    assert second_half < first_half * 0.5

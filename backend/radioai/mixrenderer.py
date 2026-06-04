@@ -96,3 +96,48 @@ def snap_overlap_to_beats(overlap_s: float, bpm: float) -> float:
     beat = 60.0 / bpm
     n = max(1, round(overlap_s / beat))
     return n * beat
+
+from scipy.signal import butter, filtfilt
+
+
+def band_split(audio: np.ndarray, crossover_hz: float = 200.0,
+               sr: int = SR):
+    """Split audio into (low, high) bands at crossover_hz (zero-phase Butterworth)."""
+    wc = crossover_hz / (0.5 * sr)
+    bl, al = butter(4, wc, btype="low")
+    bh, ah = butter(4, wc, btype="high")
+    low = filtfilt(bl, al, audio).astype(np.float32)
+    high = filtfilt(bh, ah, audio).astype(np.float32)
+    return low, high
+
+
+def bass_swap_crossfade(a: np.ndarray, b: np.ndarray, overlap_s: float,
+                        crossover_hz: float = 200.0) -> np.ndarray:
+    """Equal-power crossfade where the bass is swapped at the overlap midpoint,
+    so only one bassline plays at a time (no muddy double-bass)."""
+    n = int(overlap_s * SR)
+    n = min(n, len(a), len(b))
+    if n <= 0:
+        return np.concatenate([a, b])
+
+    a_low, a_high = band_split(a[-n:], crossover_hz)
+    b_low, b_high = band_split(b[:n], crossover_hz)
+
+    t = np.linspace(0, 1, n, dtype=np.float32)
+    fade_out = np.cos(t * np.pi / 2)
+    fade_in = np.cos((1 - t) * np.pi / 2)
+    high_mix = a_high * fade_out + b_high * fade_in
+
+    half = n // 2
+    low_mix = np.where(np.arange(n) < half, a_low, b_low).astype(np.float32)
+    r = min(int(0.05 * SR), half, n - half)
+    if r > 0:
+        seg = np.linspace(0, 1, 2 * r, dtype=np.float32)
+        fo2 = np.cos(seg * np.pi / 2)
+        fi2 = np.cos((1 - seg) * np.pi / 2)
+        s0 = half - r
+        low_mix[s0:s0 + 2 * r] = a_low[s0:s0 + 2 * r] * fo2 + b_low[s0:s0 + 2 * r] * fi2
+
+    mixed = high_mix + low_mix
+    out = np.concatenate([a[:-n], mixed, b[n:]])
+    return np.clip(out, -1.0, 1.0)
