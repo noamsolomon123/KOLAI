@@ -24,3 +24,13 @@ def test_from_env_defaults(monkeypatch):
     assert cfg.llm_model == "gemini-3.1-flash-lite-preview"
     assert cfg.tts_model == "gemini-3.1-flash-tts-preview"
     assert cfg.tts_voice == "Puck"
+
+
+def test_from_env_loads_spotify(monkeypatch):
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "cid")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "csecret")
+    monkeypatch.delenv("SPOTIFY_REDIRECT_URI", raising=False)
+    cfg = Config.from_env()
+    assert cfg.spotify_client_id == "cid"
+    assert cfg.spotify_client_secret == "csecret"
+    assert cfg.spotify_redirect_uri == "http://127.0.0.1:5173"  # default
