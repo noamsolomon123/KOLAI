@@ -1,5 +1,7 @@
+﻿import io
 import os
 import hashlib
+import wave
 from typing import Protocol
 import soundfile as sf
 from radioai.models import DJSlot
@@ -9,24 +11,55 @@ class Synth(Protocol):
     def synth(self, text: str) -> bytes: ...
 
 
-class ElevenLabsSynth:
-    """Thin wrapper around the ElevenLabs SDK; returns wav/mp3 bytes."""
+def pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """Wrap raw 16-bit mono PCM (Gemini TTS output) into WAV container bytes."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
 
-    def __init__(self, api_key: str, voice_id: str,
-                 model: str = "eleven_multilingual_v2"):
-        from elevenlabs.client import ElevenLabs
-        self._client = ElevenLabs(api_key=api_key)
-        self._voice_id = voice_id
+
+class GeminiTTSSynth:
+    """Synth over the Gemini TTS API. Returns WAV bytes (wraps Gemini's raw
+    24 kHz PCM). Rotates across multiple API keys on failure (rate-limit)."""
+
+    def __init__(self, api_keys: list[str], model: str, voice: str,
+                 sample_rate: int = 24000, clients=None):
         self._model = model
+        self._voice = voice
+        self._sample_rate = sample_rate
+        self._idx = 0
+        if clients is not None:
+            self._clients = list(clients)
+        else:
+            from google import genai
+            self._clients = [genai.Client(api_key=k) for k in api_keys]
+        if not self._clients:
+            raise ValueError("GeminiTTSSynth needs at least one API key/client")
 
     def synth(self, text: str) -> bytes:
-        audio = self._client.text_to_speech.convert(
-            voice_id=self._voice_id,
-            model_id=self._model,
-            text=text,
-            output_format="mp3_44100_128",
-        )
-        return b"".join(audio)
+        from google.genai import types
+        cfg = types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=self._voice))))
+        errors = []
+        for _ in range(len(self._clients)):
+            client = self._clients[self._idx]
+            try:
+                resp = client.models.generate_content(
+                    model=self._model, contents=text, config=cfg)
+                pcm = resp.candidates[0].content.parts[0].inline_data.data
+                return pcm_to_wav(pcm, self._sample_rate)
+            except Exception as e:  # rate-limit/transient -> rotate to next key
+                errors.append(repr(e))
+                self._idx = (self._idx + 1) % len(self._clients)
+        raise RuntimeError(f"All Gemini TTS keys failed: {errors}")
 
 
 class VoiceRenderer:
