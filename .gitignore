@@ -5,18 +5,5 @@ frontend/dist/
 backend/mashup_demo.py
 backend/_*.py
 *.png
-
-# Generated PWA icons are real source assets - keep them despite *.png above.
-!frontend/public/icons/
-!frontend/public/icons/*.png
-
-# Built debug APK lives at repo root; it's a build artifact, don't commit it.
-/RadioAI-debug.apk
-
-# Capacitor / Android build outputs (project config IS tracked; outputs are not)
-frontend/android/.gradle/
-frontend/android/build/
-frontend/android/app/build/
-frontend/android/capacitor-cordova-android-plugins/build/
-frontend/android/local.properties
-frontend/android/.idea/
+.chromeprof/
+RadioAI-debug.apk
