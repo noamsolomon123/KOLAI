@@ -39,3 +39,26 @@ def test_dedupe_and_cap():
 def test_malformed_raises():
     with pytest.raises(ValueError):
         parse_setlist("no json here at all", _TASTE, n=6)
+
+
+from radioai.setlist import SetlistPlanner
+
+
+class _FakeLLM:
+    def __init__(self, text):
+        self._text = text
+        self.last_prompt = None
+
+    def complete(self, prompt: str) -> str:
+        self.last_prompt = prompt
+        return self._text
+
+
+def test_planner_builds_songs_and_prompt_mentions_taste():
+    llm = _FakeLLM('[{"title": "Tel Aviv", "artist": "Omer Adam"}]')
+    planner = SetlistPlanner(client=llm)
+    songs = planner.plan(_TASTE, n=6)
+    assert songs[0].title == "Tel Aviv"
+    assert "Noa Kirel" in llm.last_prompt        # taste grounding
+    assert "Million Dollar" in llm.last_prompt
+    assert "6" in llm.last_prompt                 # requested count
