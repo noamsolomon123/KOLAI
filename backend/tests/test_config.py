@@ -34,3 +34,19 @@ def test_from_env_loads_spotify(monkeypatch):
     assert cfg.spotify_client_id == "cid"
     assert cfg.spotify_client_secret == "csecret"
     assert cfg.spotify_redirect_uri == "http://127.0.0.1:5173"  # default
+
+
+def test_from_env_loads_city_and_topics(monkeypatch):
+    monkeypatch.setenv("CITY", "Tel Aviv")
+    monkeypatch.setenv("TOPICS", "technology, physics ,robotics,AI")
+    cfg = Config.from_env()
+    assert cfg.city == "Tel Aviv"
+    assert cfg.topics == ["technology", "physics", "robotics", "AI"]  # trimmed, split
+
+
+def test_from_env_topics_empty(monkeypatch):
+    monkeypatch.delenv("TOPICS", raising=False)
+    monkeypatch.delenv("CITY", raising=False)
+    cfg = Config.from_env()
+    assert cfg.topics == []
+    assert cfg.city == ""

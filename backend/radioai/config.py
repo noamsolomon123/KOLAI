@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,6 +15,8 @@ class Config:
     spotify_client_id: str
     spotify_client_secret: str
     spotify_redirect_uri: str
+    city: str = ""
+    topics: list[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -34,4 +36,7 @@ class Config:
             spotify_client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET", ""),
             spotify_redirect_uri=os.environ.get("SPOTIFY_REDIRECT_URI",
                                                 "http://127.0.0.1:5173"),
+            city=os.environ.get("CITY", ""),
+            topics=[t.strip() for t in os.environ.get("TOPICS", "").split(",")
+                    if t.strip()],
         )
