@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 from radioai.mixrenderer import (
     equal_power_crossfade, duck, time_stretch_to_bpm, SR,
 )
@@ -38,3 +38,25 @@ def test_time_stretch_changes_length_toward_target():
     stretched = time_stretch_to_bpm(audio, src_bpm=120, dst_bpm=140)
     # faster target -> shorter audio
     assert len(stretched) < len(audio)
+
+
+def test_trim_silence_removes_leading_and_trailing():
+    from radioai.mixrenderer import trim_silence
+    sr = SR
+    sig = np.concatenate([
+        np.zeros(sr, dtype=np.float32),            # 1s leading silence
+        (np.ones(sr, dtype=np.float32) * 0.5),     # 1s tone
+        np.zeros(sr, dtype=np.float32),            # 1s trailing silence
+    ])
+    out = trim_silence(sig)
+    assert len(out) < len(sig)
+    assert abs(out[0]) > 0.01
+    assert abs(out[-1]) > 0.01
+    # roughly the 1s tone remains (allow a little slack)
+    assert abs(len(out) - sr) < sr * 0.1
+
+
+def test_trim_silence_all_silence_returns_input():
+    from radioai.mixrenderer import trim_silence
+    sig = np.zeros(SR, dtype=np.float32)
+    assert len(trim_silence(sig)) == len(sig)

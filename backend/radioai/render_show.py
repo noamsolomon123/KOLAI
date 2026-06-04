@@ -1,4 +1,4 @@
-"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
+﻿"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
 
 Usage:  python -m radioai.render_show
 """
@@ -67,6 +67,7 @@ def main() -> None:
             dj_lines.append(f"[{prev_song.title} -> {song.title}]\n{script}")
             slot = voice.render(script)
             dj_audio = mx.load_mono(slot.audio_path)
+            dj_audio = mx.trim_silence(dj_audio)  # remove leading/trailing dead air
             # Talk over the current song's outro, then segue (crossfade) into the
             # next song instead of a hard cut.
             duck_start = max(0.0, len(timeline) / mx.SR - slot.duration_s - 1.0)
@@ -92,4 +93,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import soundfile as sf
 import librosa
 import pyrubberband as pyrb
@@ -9,6 +9,14 @@ SR = 44100  # working sample rate
 def load_mono(path: str) -> np.ndarray:
     y, _ = librosa.load(path, sr=SR, mono=True)
     return y.astype(np.float32)
+
+
+def trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
+    """Strip leading/trailing near-silence so speech starts immediately."""
+    nz = np.where(np.abs(audio) > threshold)[0]
+    if len(nz) == 0:
+        return audio
+    return audio[nz[0]: nz[-1] + 1]
 
 
 def equal_power_crossfade(a: np.ndarray, b: np.ndarray,
