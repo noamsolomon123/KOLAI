@@ -1,2 +1,5 @@
 tools/
 .claude/
+frontend/node_modules/
+frontend/dist/
+backend/mashup_demo.py
