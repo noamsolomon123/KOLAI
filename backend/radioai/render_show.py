@@ -1,4 +1,4 @@
-﻿"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
+"""Render a 2-3 song show with one Hebrew DJ intro into a single MP3 (M1).
 
 Usage:  python -m radioai.render_show
 """
@@ -15,6 +15,8 @@ from radioai import mixrenderer as mx
 from radioai.taste import TasteService
 from radioai.setlist import SetlistPlanner
 from radioai.djcontext import DJContext
+from radioai.stems import StemSeparator
+from radioai.mashup import mashup_gate, build_mashup
 
 # Pro radio-host delivery direction handed to the TTS for every DJ line.
 RADIO_STYLE = (
@@ -73,6 +75,7 @@ def main() -> None:
         out_dir=os.path.join(cfg.cache_dir, "voice"),
     )
 
+    separator = StemSeparator(cache_dir=cfg.cache_dir)
     setlist = build_setlist(cfg)
     print("Setlist:")
     for s in setlist:
@@ -83,7 +86,7 @@ def main() -> None:
     for song in setlist:
         try:
             path = fetcher.fetch(song)
-            tracks.append((song, analyze(path), mx.load_mono(path)))
+            tracks.append((song, analyze(path), mx.load_mono(path), path))
         except Exception as e:
             print(f"  [skip] {song.title} — {song.artist}: {e}")
     if len(tracks) < 2:
@@ -99,8 +102,8 @@ def main() -> None:
     timeline = tracks[0][2]
     dj_lines = []
     for i in range(1, len(tracks)):
-        prev_song, prev_an, _ = tracks[i - 1]
-        song, an, audio = tracks[i]
+        prev_song, prev_an, _, prev_path = tracks[i - 1]
+        song, an, audio, song_path = tracks[i]
         has_dj = (i % 2 == 1)  # witty talkover every ~2 songs
         t = choose_transition(prev_an, an, has_dj=has_dj)
         print(f"  {prev_song.title} -> {song.title}: {t.type}")
@@ -123,10 +126,24 @@ def main() -> None:
                                attenuation_db=DUCK_DB)
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
         elif t.type == "beatmatch":
-            on_beat = mx.start_on_beat(audio, an.beat_times)   # enter on downbeat
-            stretched = mx.time_stretch_to_bpm(on_beat, an.bpm, prev_an.bpm)
-            overlap = mx.snap_overlap_to_beats(t.duration_s, prev_an.bpm)
-            timeline = mx.bass_swap_crossfade(timeline, stretched, overlap_s=overlap)
+            did_mashup = False
+            if cfg.mashups_enabled and mashup_gate(prev_an, an):
+                try:
+                    print(f"    [mashup] {prev_song.title} x {song.title} (separating stems...)")
+                    pv, _pi = separator.separate(prev_path)     # outgoing vocals
+                    _nv, ni = separator.separate(song_path)     # incoming instrumental
+                    seg = build_mashup(mx.load_mono(pv), mx.load_mono(ni), audio,
+                                       prev_an.bpm, an.bpm, an.beat_times)
+                    timeline = mx.equal_power_crossfade(timeline, seg, overlap_s=2.0)
+                    dj_lines.append(f"[mashup: {prev_song.title} x {song.title}]")
+                    did_mashup = True
+                except Exception as e:
+                    print(f"    [mashup-fallback] {e}")
+            if not did_mashup:
+                on_beat = mx.start_on_beat(audio, an.beat_times)
+                stretched = mx.time_stretch_to_bpm(on_beat, an.bpm, prev_an.bpm)
+                overlap = mx.snap_overlap_to_beats(t.duration_s, prev_an.bpm)
+                timeline = mx.bass_swap_crossfade(timeline, stretched, overlap_s=overlap)
         elif t.type == "crossfade":
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=t.duration_s)
         else:  # cut
