@@ -123,8 +123,10 @@ def main() -> None:
                                attenuation_db=DUCK_DB)
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
         elif t.type == "beatmatch":
-            stretched = mx.time_stretch_to_bpm(audio, an.bpm, prev_an.bpm)
-            timeline = mx.equal_power_crossfade(timeline, stretched, overlap_s=t.duration_s)
+            on_beat = mx.start_on_beat(audio, an.beat_times)   # enter on downbeat
+            stretched = mx.time_stretch_to_bpm(on_beat, an.bpm, prev_an.bpm)
+            overlap = mx.snap_overlap_to_beats(t.duration_s, prev_an.bpm)
+            timeline = mx.bass_swap_crossfade(timeline, stretched, overlap_s=overlap)
         elif t.type == "crossfade":
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=t.duration_s)
         else:  # cut
