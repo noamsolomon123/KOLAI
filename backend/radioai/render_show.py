@@ -33,7 +33,8 @@ DEMO_SETLIST = [
          query="https://www.youtube.com/watch?v=nMQw29nfzpg"),
 ]
 
-_SEGUE_S = 4.0  # crossfade out of a DJ talkover into the next song
+_SEGUE_S = 1.5  # crossfade out of a DJ talkover into the next song
+DUCK_DB = -15.0
 
 
 def build_setlist(cfg):
@@ -94,12 +95,14 @@ def main() -> None:
             print(f"    DJ: {script}")
             dj_lines.append(f"[{prev_song.title} -> {song.title}]\n{script}")
             slot = voice.render(script)
-            dj_audio = mx.load_mono(slot.audio_path)
-            dj_audio = mx.trim_silence(dj_audio)  # remove leading/trailing dead air
-            # Talk over the current song's outro, then segue (crossfade) into the
-            # next song instead of a hard cut.
-            duck_start = max(0.0, len(timeline) / mx.SR - slot.duration_s - 1.0)
-            timeline = mx.duck(timeline, dj_audio, start_s=duck_start)
+            dj_audio = mx.trim_silence(mx.load_mono(slot.audio_path))
+            dj_dur = len(dj_audio) / mx.SR
+            # Duck the song deep under the DJ so the talk is clearly audible, and
+            # place the DJ so it FINISHES ~0.3s before the next song segues in
+            # (the incoming song must not blast over the voice).
+            duck_start = max(0.0, len(timeline) / mx.SR - dj_dur - _SEGUE_S - 0.3)
+            timeline = mx.duck(timeline, dj_audio, start_s=duck_start,
+                               attenuation_db=DUCK_DB)
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
         elif t.type == "beatmatch":
             stretched = mx.time_stretch_to_bpm(audio, an.bpm, prev_an.bpm)

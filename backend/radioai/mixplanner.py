@@ -3,7 +3,7 @@ from radioai.scoring import compatibility
 
 _BEATMATCH_MIN = 0.75
 _CROSSFADE_MIN = 0.45
-_TALKOVER_SECONDS = 6.0
+_TALKOVER_SECONDS = 4.0
 _BLEND_SECONDS = 8.0
 
 
@@ -23,3 +23,4 @@ def choose_transition(prev: TrackAnalysis, nxt: TrackAnalysis,
     if score >= _CROSSFADE_MIN:
         return Transition(type="crossfade", duration_s=_BLEND_SECONDS)
     return Transition(type="cut", duration_s=0.0)
+
