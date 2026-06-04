@@ -17,6 +17,7 @@ class Config:
     spotify_redirect_uri: str
     city: str = ""
     topics: list[str] = field(default_factory=list)
+    mashups_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -39,4 +40,6 @@ class Config:
             city=os.environ.get("CITY", ""),
             topics=[t.strip() for t in os.environ.get("TOPICS", "").split(",")
                     if t.strip()],
+            mashups_enabled=os.environ.get("MASHUPS_ENABLED", "true").lower()
+            not in ("false", "0", "no", ""),
         )

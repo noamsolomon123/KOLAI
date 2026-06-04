@@ -50,3 +50,12 @@ def test_from_env_topics_empty(monkeypatch):
     cfg = Config.from_env()
     assert cfg.topics == []
     assert cfg.city == ""
+
+
+def test_from_env_mashups_enabled_default_and_off(monkeypatch):
+    monkeypatch.delenv("MASHUPS_ENABLED", raising=False)
+    assert Config.from_env().mashups_enabled is True       # default on
+    monkeypatch.setenv("MASHUPS_ENABLED", "false")
+    assert Config.from_env().mashups_enabled is False
+    monkeypatch.setenv("MASHUPS_ENABLED", "0")
+    assert Config.from_env().mashups_enabled is False
