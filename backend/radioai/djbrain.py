@@ -1,4 +1,4 @@
-﻿import re
+import re
 from typing import Optional, Protocol
 from radioai.models import Song
 
@@ -63,16 +63,63 @@ class DJBrain:
             f"בלי מרכאות, בלי כותרות ובלי הסברים."
         )
 
-    def write_intro(self, prev: Optional[Song], nxt: Song, seconds: float) -> str:
-        budget = words_for_seconds(seconds)
-        text = self.client.complete(self._prompt(prev, nxt, budget)).strip()
+    def _finish(self, text: str, budget: int) -> str:
+        text = text.strip()
         words = text.split()
         if len(words) <= budget:
             return text
-        # Over budget: keep up to `budget` words, then cut back to the last
-        # complete sentence so the DJ never stops mid-thought.
         capped = " ".join(words[:budget])
         matches = list(re.finditer(r"[.!?…]", capped))
         if matches:
             return capped[: matches[-1].end()].strip()
         return capped
+
+    def write_intro(self, prev: Optional[Song], nxt: Song, seconds: float) -> str:
+        budget = words_for_seconds(seconds)
+        text = self.client.complete(self._prompt(prev, nxt, budget))
+        return self._finish(text, budget)
+
+    def _weather_prompt(self, nxt: Song, ctx, budget: int) -> str:
+        return (
+            f"אתה {self.persona}, שדרן רדיו ישראלי שנון וקליל.\n"
+            f"השעה {ctx.time_str}, {ctx.part_of_day}. מזג האוויר עכשיו: {ctx.weather}.\n"
+            f'השיר הבא: "{nxt.title}" של {nxt.artist}.\n'
+            f"כתוב משפט אחד קצר וקולע בעברית מדוברת, עד {budget} מילים, שמשלב את "
+            f"השעה/מזג האוויר וזורם אל השיר הבא. אסור לחרוג מ-{budget} מילים, משפט שלם.\n"
+            f"החזר רק את המשפט, בלי מרכאות והסברים."
+        )
+
+    def _news_prompt(self, nxt: Song, headline: str, budget: int) -> str:
+        return (
+            f"אתה {self.persona}, שדרן רדיו ישראלי שנון.\n"
+            f'כותרת חדשות עכשווית: "{headline}".\n'
+            f'השיר הבא: "{nxt.title}" של {nxt.artist}.\n'
+            f"כתוב משפט אחד קצר בעברית מדוברת, עד {budget} מילים, שמזכיר בקצרה "
+            f"את הכותרת (בניסוח שלך, לא מילה במילה) וממשיך לשיר. אסור לחרוג "
+            f"מ-{budget} מילים, משפט שלם.\n"
+            f"החזר רק את המשפט, בלי מרכאות והסברים."
+        )
+
+    def _topic_prompt(self, nxt: Song, topic: str, headline: str, budget: int) -> str:
+        return (
+            f"אתה {self.persona}, שדרן רדיו ישראלי שנון שאוהב את הנושא '{topic}'.\n"
+            f'כותרת עדכנית בנושא {topic}: "{headline}".\n'
+            f'השיר הבא: "{nxt.title}" של {nxt.artist}.\n'
+            f"כתוב משפט אחד קצר וקולע בעברית מדוברת, עד {budget} מילים, שמזכיר את "
+            f"החדשה בנושא {topic} (בניסוח שלך) וזורם לשיר הבא. אסור לחרוג מ-{budget} "
+            f"מילים, משפט שלם.\n"
+            f"החזר רק את המשפט, בלי מרכאות והסברים."
+        )
+
+    def write_break(self, prev: Optional[Song], nxt: Song, beat: str, ctx,
+                    seconds: float, topic: Optional[str] = None) -> str:
+        budget = words_for_seconds(seconds)
+        if beat == "weather" and ctx.weather:
+            prompt = self._weather_prompt(nxt, ctx, budget)
+        elif beat == "news" and ctx.general_headline:
+            prompt = self._news_prompt(nxt, ctx.general_headline, budget)
+        elif beat == "topic" and topic and ctx.topic_headlines.get(topic):
+            prompt = self._topic_prompt(nxt, topic, ctx.topic_headlines[topic], budget)
+        else:
+            return self.write_intro(prev, nxt, seconds)  # song beat / fallback
+        return self._finish(self.client.complete(prompt), budget)

@@ -1,5 +1,6 @@
-﻿from radioai.models import Song
+from radioai.models import Song
 from radioai.djbrain import DJBrain, words_for_seconds
+from radioai.djcontext import DJContext
 
 
 def test_words_for_seconds_budget():
@@ -95,3 +96,47 @@ def test_intro_ends_at_sentence_boundary_when_over_budget():
     script = brain.write_intro(prev=None, nxt=Song("A", "B"), seconds=4.0)
     assert script == "ברוכים הבאים לרדיו."
     assert script.endswith(".")
+
+
+def _ctx(weather=None, general=None, topics=None):
+    return DJContext(time_str="19:00", part_of_day="ערב", weather=weather,
+                     general_headline=general, topic_headlines=topics or {})
+
+
+def test_write_break_weather_uses_context():
+    client = _FakeClient("ערב טוב, 24 מעלות, שיר בדרך!")
+    brain = DJBrain(client=client, persona="רדיו AI")
+    ctx = _ctx(weather="24 מעלות, שמיים בהירים")
+    out = brain.write_break(prev=None, nxt=Song("A", "B"), beat="weather",
+                            ctx=ctx, seconds=4.0)
+    assert "24 מעלות" in client.last_prompt
+    assert "ערב" in client.last_prompt
+    assert out.strip() != ""
+
+
+def test_write_break_topic_uses_headline():
+    client = _FakeClient("חדשות מהעולם הטכנולוגי, ועכשיו שיר!")
+    brain = DJBrain(client=client, persona="רדיו AI")
+    ctx = _ctx(topics={"AI": "פריצת דרך חדשה ב-AI"})
+    out = brain.write_break(prev=None, nxt=Song("A", "B"), beat="topic",
+                            ctx=ctx, seconds=4.0, topic="AI")
+    assert "פריצת דרך חדשה ב-AI" in client.last_prompt
+    assert "AI" in client.last_prompt
+
+
+def test_write_break_news_uses_general():
+    client = _FakeClient("כותרת חמה, ומיד מוזיקה!")
+    brain = DJBrain(client=client, persona="רדיו AI")
+    ctx = _ctx(general="כותרת חדשותית חשובה")
+    out = brain.write_break(prev=None, nxt=Song("A", "B"), beat="news",
+                            ctx=ctx, seconds=4.0)
+    assert "כותרת חדשותית חשובה" in client.last_prompt
+
+
+def test_write_break_falls_back_to_song_when_context_missing():
+    client = _FakeClient("ברוכים הבאים, שיר ראשון!")
+    brain = DJBrain(client=client, persona="רדיו AI")
+    ctx = _ctx(weather=None)  # weather beat requested but no weather data
+    brain.write_break(prev=None, nxt=Song("A", "B"), beat="weather",
+                      ctx=ctx, seconds=4.0)
+    assert "זו פתיחת השידור" in client.last_prompt  # fell back to song write_intro
