@@ -34,3 +34,12 @@ def test_low_compat_cut():
     b = _track(180, "11A", 0.1)
     t = choose_transition(a, b, has_dj=False)
     assert t.type == "cut"
+
+
+def test_beatmatch_duration_deeper_for_compatible_keys():
+    a = _track(120, "8A", 0.6)
+    same = choose_transition(a, _track(122, "8A", 0.6), has_dj=False)
+    adjacent = choose_transition(a, _track(122, "9A", 0.6), has_dj=False)
+    assert same.type == "beatmatch"
+    assert adjacent.type == "beatmatch"
+    assert same.duration_s > adjacent.duration_s
