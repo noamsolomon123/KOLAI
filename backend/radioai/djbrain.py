@@ -1,4 +1,4 @@
-﻿from typing import Optional, Protocol
+from typing import Optional, Protocol
 from radioai.models import Song
 
 _HEBREW_WORDS_PER_SEC = 2.5
@@ -12,21 +12,33 @@ class LLMClient(Protocol):
     def complete(self, prompt: str) -> str: ...
 
 
-class AnthropicClient:
-    """Thin wrapper around the Anthropic SDK so DJBrain stays testable."""
+class GeminiClient:
+    """LLMClient over the Gemini API. Rotates across multiple API keys on
+    failure (e.g. rate-limit) to extend the free-tier quota."""
 
-    def __init__(self, api_key: str, model: str = "claude-opus-4-8"):
-        import anthropic
-        self._client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, api_keys: list[str], model: str, clients=None):
         self._model = model
+        self._idx = 0
+        if clients is not None:
+            self._clients = list(clients)
+        else:
+            from google import genai
+            self._clients = [genai.Client(api_key=k) for k in api_keys]
+        if not self._clients:
+            raise ValueError("GeminiClient needs at least one API key/client")
 
     def complete(self, prompt: str) -> str:
-        msg = self._client.messages.create(
-            model=self._model,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text
+        errors = []
+        for _ in range(len(self._clients)):
+            client = self._clients[self._idx]
+            try:
+                resp = client.models.generate_content(
+                    model=self._model, contents=prompt)
+                return resp.text
+            except Exception as e:  # rate-limit/transient -> rotate to next key
+                errors.append(repr(e))
+                self._idx = (self._idx + 1) % len(self._clients)
+        raise RuntimeError(f"All Gemini keys failed: {errors}")
 
 
 class DJBrain:

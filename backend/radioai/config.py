@@ -7,16 +7,24 @@ load_dotenv()
 
 @dataclass
 class Config:
-    anthropic_api_key: str
-    elevenlabs_api_key: str
-    elevenlabs_voice_id: str
+    gemini_api_keys: list[str]
+    llm_model: str
+    tts_model: str
+    tts_voice: str
     cache_dir: str
 
     @classmethod
     def from_env(cls) -> "Config":
+        raw = [
+            os.environ.get("GEMINI_API_KEY", ""),
+            os.environ.get("GEMINI_API_KEY_2", ""),
+            os.environ.get("GEMINI_API_KEY_3", ""),
+        ]
+        keys = [k for k in raw if k]
         return cls(
-            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-            elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
-            elevenlabs_voice_id=os.environ.get("ELEVENLABS_VOICE_ID", ""),
+            gemini_api_keys=keys,
+            llm_model=os.environ.get("GEMINI_LLM_MODEL", "gemini-3.1-flash-lite-preview"),
+            tts_model=os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
+            tts_voice=os.environ.get("GEMINI_TTS_VOICE", "Puck"),
             cache_dir=os.environ.get("CACHE_DIR", "./cache"),
         )

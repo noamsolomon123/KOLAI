@@ -35,3 +35,52 @@ def test_intro_trims_to_word_budget():
     brain = DJBrain(client=client, persona="גלגלצ")
     script = brain.write_intro(prev=None, nxt=Song("A", "B"), seconds=4.0)
     assert len(script.split()) <= words_for_seconds(4.0)
+
+class _FakeResp:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeModels:
+    def __init__(self, behavior):
+        self._behavior = behavior
+
+    def generate_content(self, model, contents):
+        r = self._behavior()
+        if isinstance(r, Exception):
+            raise r
+        return _FakeResp(r)
+
+
+class _FakeGenaiClient:
+    def __init__(self, behavior):
+        self.models = _FakeModels(behavior)
+
+
+def test_gemini_client_returns_text():
+    from radioai.djbrain import GeminiClient
+    c = GeminiClient(api_keys=[], model="m",
+                     clients=[_FakeGenaiClient(lambda: "שלום")])
+    assert c.complete("hi") == "שלום"
+
+
+def test_gemini_client_rotates_on_failure():
+    from radioai.djbrain import GeminiClient
+
+    def first_fails():
+        raise RuntimeError("429 rate limit")
+
+    def second_ok():
+        return "הצלחה"
+
+    c = GeminiClient(api_keys=[], model="m",
+                     clients=[_FakeGenaiClient(first_fails),
+                              _FakeGenaiClient(second_ok)])
+    assert c.complete("hi") == "הצלחה"
+
+
+def test_gemini_client_requires_a_client():
+    from radioai.djbrain import GeminiClient
+    import pytest
+    with pytest.raises(ValueError):
+        GeminiClient(api_keys=[], model="m", clients=[])
