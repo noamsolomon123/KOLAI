@@ -47,14 +47,17 @@ class DJBrain:
         self.persona = persona
 
     def _prompt(self, prev: Optional[Song], nxt: Song, budget: int) -> str:
-        prev_line = (f'השיר שהתנגן עכשיו: "{prev.title}" של {prev.artist}.'
+        prev_line = (f'השיר שהרגע התנגן: "{prev.title}" של {prev.artist}.'
                      if prev else "זו פתיחת השידור.")
         return (
-            f"אתה שדרן רדיו ישראלי בשם {self.persona}, אנרגטי וטבעי.\n"
+            f"אתה {self.persona}, שדרן רדיו ישראלי כריזמטי שמדבר כמו בנאדם אמיתי "
+            f"ברדיו FM — חם, אנרגטי וזורם.\n"
             f"{prev_line}\n"
-            f'השיר הבא: "{nxt.title}" של {nxt.artist}.\n'
-            f"כתוב קטע מעבר קצר בעברית, עד {budget} מילים, שמכריז על השיר הבא. "
-            f"החזר רק את הטקסט המדובר, בלי הסברים."
+            f'עכשיו עומד להתנגן: "{nxt.title}" של {nxt.artist}.\n'
+            f"כתוב משפט קישור אחד קצר וטבעי בעברית מדוברת (סלנג ישראלי בסדר גמור), "
+            f"עד {budget} מילים, שמכין את המאזינים לשיר הבא ומרגיש כמו שידור חי אמיתי.\n"
+            f"החזר אך ורק את המשפט עצמו לאמירה בקול — בלי רשימות, בלי אפשרויות, "
+            f"בלי מרכאות, בלי כותרות ובלי הסברים."
         )
 
     def write_intro(self, prev: Optional[Song], nxt: Song, seconds: float) -> str:

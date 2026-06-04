@@ -59,3 +59,20 @@ def test_view_count_breaks_ties():
 def test_song_query_override_field():
     s = Song(title="A", artist="B", query="B A")
     assert s.query == "B A"
+
+
+def test_hebrew_titled_original_beats_official_collab():
+    song = Song(title="Tudo Bom", artist="Static & Ben El")  # no duration
+    candidates = [
+        {"id": "orig", "title": "Static and Ben El - Tudo Bom (Prod. by Jordi) | סטטיק ובן אל - טודו בום",
+         "duration": 210, "view_count": 81_000_000},
+        {"id": "collab", "title": "Static & Ben El with J Balvin - Tudo Bom (Official Video)",
+         "duration": 200, "view_count": 6_000_000},
+    ]
+    assert pick_best_candidate(song, candidates)["id"] == "orig"
+
+
+def test_has_hebrew_helper():
+    from radioai.fetcher import _has_hebrew
+    assert _has_hebrew("שלום world") is True
+    assert _has_hebrew("hello world") is False

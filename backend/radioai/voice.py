@@ -1,4 +1,4 @@
-﻿import io
+import io
 import os
 import hashlib
 import wave
@@ -27,9 +27,10 @@ class GeminiTTSSynth:
     24 kHz PCM). Rotates across multiple API keys on failure (rate-limit)."""
 
     def __init__(self, api_keys: list[str], model: str, voice: str,
-                 sample_rate: int = 24000, clients=None):
+                 style: str = "", sample_rate: int = 24000, clients=None):
         self._model = model
         self._voice = voice
+        self._style = style
         self._sample_rate = sample_rate
         self._idx = 0
         if clients is not None:
@@ -52,8 +53,9 @@ class GeminiTTSSynth:
         for _ in range(len(self._clients)):
             client = self._clients[self._idx]
             try:
+                contents = f"{self._style}\n\n{text}" if self._style else text
                 resp = client.models.generate_content(
-                    model=self._model, contents=text, config=cfg)
+                    model=self._model, contents=contents, config=cfg)
                 pcm = resp.candidates[0].content.parts[0].inline_data.data
                 return pcm_to_wav(pcm, self._sample_rate)
             except Exception as e:  # rate-limit/transient -> rotate to next key

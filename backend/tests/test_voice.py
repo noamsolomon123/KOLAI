@@ -124,3 +124,41 @@ def test_voice_renderer_with_gemini_synth(tmp_path):
     slot = r.render("שלום עולם")
     assert slot.text == "שלום עולם"
     assert abs(slot.duration_s - 1.0) < 0.05
+
+def test_gemini_tts_prepends_style(tmp_path):
+    from radioai.voice import GeminiTTSSynth
+    captured = {}
+
+    class _CapModels:
+        def generate_content(self, model, contents, config):
+            captured["contents"] = contents
+            return _FakeTTSResp(b"\x00\x00" * 24000)
+
+    class _CapClient:
+        def __init__(self):
+            self.models = _CapModels()
+
+    synth = GeminiTTSSynth(api_keys=[], model="m", voice="Algieba",
+                           style="Read like a pro radio host", clients=[_CapClient()])
+    synth.synth("hello world")
+    assert "Read like a pro radio host" in captured["contents"]
+    assert "hello world" in captured["contents"]
+
+
+def test_gemini_tts_no_style_sends_plain_text(tmp_path):
+    from radioai.voice import GeminiTTSSynth
+    captured = {}
+
+    class _CapModels:
+        def generate_content(self, model, contents, config):
+            captured["contents"] = contents
+            return _FakeTTSResp(b"\x00\x00" * 24000)
+
+    class _CapClient:
+        def __init__(self):
+            self.models = _CapModels()
+
+    synth = GeminiTTSSynth(api_keys=[], model="m", voice="Algieba",
+                           clients=[_CapClient()])
+    synth.synth("plain text")
+    assert captured["contents"] == "plain text"
