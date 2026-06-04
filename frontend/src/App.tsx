@@ -4,6 +4,7 @@ import StationRow from './components/StationRow'
 import NowPlaying from './components/NowPlaying'
 import UpNext from './components/UpNext'
 import StateCard from './components/StateCard'
+import { apiUrl } from './lib/api'
 import { useShow } from './hooks/useShow'
 import { useAudio } from './hooks/useAudio'
 import {
@@ -115,7 +116,7 @@ export default function App() {
   return (
     <div className="app">
       <Background />
-      <audio ref={audio.audioRef} src="/api/audio" preload="metadata" />
+      <audio ref={audio.audioRef} src={apiUrl('/api/audio')} preload="metadata" />
       <div className="stage">
         <StationRow
           station={show.station}

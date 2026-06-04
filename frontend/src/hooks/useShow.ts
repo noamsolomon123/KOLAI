@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { Show } from '../lib/types'
+import { apiUrl } from '../lib/api'
 
 type Status = 'loading' | 'ready' | 'empty' | 'error'
 
@@ -21,7 +22,7 @@ export function useShow(): UseShow {
   const refresh = useCallback(() => {
     let cancelled = false
     setStatus((s) => (s === 'ready' ? s : 'loading'))
-    fetch('/api/show', { cache: 'no-store' })
+    fetch(apiUrl('/api/show'), { cache: 'no-store' })
       .then((res) => {
         if (res.status === 404) {
           if (!cancelled) {
@@ -54,7 +55,7 @@ export function useShow(): UseShow {
   const regenerate = useCallback(async () => {
     setRegenerating(true)
     try {
-      await fetch('/api/generate', { method: 'POST' })
+      await fetch(apiUrl('/api/generate'), { method: 'POST' })
     } catch {
       /* best effort — backend just kicks off a render */
     }
