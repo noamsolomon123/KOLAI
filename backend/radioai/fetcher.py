@@ -1,11 +1,17 @@
 import os
+import math
 import hashlib
 from typing import Optional
 import yt_dlp
 from radioai.models import Song
 
-_GOOD_KEYWORDS = ("official audio", "audio", "official")
-_BAD_KEYWORDS = ("live", "remix", "reaction", "cover", "karaoke", "sped up")
+_GOOD_KEYWORDS = ("official audio", "official video", "official", "audio",
+                  "הרשמי", "הקליפ הרשמי")
+# Covers / alternate cuts / foreign-language re-recordings we want to avoid.
+_BAD_KEYWORDS = ("live", "remix", "reaction", "cover", "karaoke", "sped up",
+                 "slowed", "nightcore", "8d", "instrumental", "acoustic",
+                 "lyrics video", "version", "english", "spanish", "portuguese",
+                 "french", "francais", "tradução", "traducao", "mashup")
 
 
 def _candidate_score(song: Song, cand: dict) -> float:
@@ -19,7 +25,11 @@ def _candidate_score(song: Song, cand: dict) -> float:
             score += 5.0
     for kw in _BAD_KEYWORDS:
         if kw in title:
-            score -= 20.0
+            score -= 25.0
+    # Popularity: originals are usually the most-viewed. Log-scaled tiebreaker.
+    views = cand.get("view_count") or 0
+    if views > 0:
+        score += min(12.0, math.log10(views + 1) * 1.5)
     return score
 
 
@@ -39,7 +49,7 @@ class AudioFetcher:
         h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
         return os.path.join(self.cache_dir, f"{h}.mp3")
 
-    def _search(self, query: str, limit: int = 5) -> list[dict]:
+    def _search(self, query: str, limit: int = 8) -> list[dict]:
         opts = {"quiet": True, "skip_download": True, "extract_flat": True}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -51,7 +61,8 @@ class AudioFetcher:
         if os.path.exists(out_path):
             return out_path
 
-        candidates = self._search(f"{song.artist} {song.title} official audio")
+        query = song.query or f"{song.artist} {song.title}"
+        candidates = self._search(query)
         best = pick_best_candidate(song, candidates)
         if best is None:
             raise RuntimeError(f"No candidate found for {song.artist} - {song.title}")

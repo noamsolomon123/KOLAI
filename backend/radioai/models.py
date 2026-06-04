@@ -9,6 +9,7 @@ class Song:
     title: str
     artist: str
     duration_s: Optional[float] = None  # expected/reference duration if known
+    query: Optional[str] = None         # optional explicit search query override
 
 
 @dataclass
