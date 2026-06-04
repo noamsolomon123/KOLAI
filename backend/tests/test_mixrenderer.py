@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 from radioai.mixrenderer import (
     equal_power_crossfade, duck, time_stretch_to_bpm, SR,
 )
@@ -60,3 +60,28 @@ def test_trim_silence_all_silence_returns_input():
     from radioai.mixrenderer import trim_silence
     sig = np.zeros(SR, dtype=np.float32)
     assert len(trim_silence(sig)) == len(sig)
+
+def test_start_on_beat_trims_to_first_beat():
+    from radioai.mixrenderer import start_on_beat
+    sr = SR
+    audio = np.ones(sr * 4, dtype=np.float32)
+    out = start_on_beat(audio, [0.5, 1.0, 1.5], sr=sr)
+    assert abs(len(out) - sr * 3.5) <= 2
+
+
+def test_start_on_beat_no_beats_passthrough():
+    from radioai.mixrenderer import start_on_beat
+    audio = np.ones(100, dtype=np.float32)
+    assert len(start_on_beat(audio, [], sr=SR)) == 100
+
+
+def test_start_on_beat_ignores_late_first_beat():
+    from radioai.mixrenderer import start_on_beat
+    audio = np.ones(SR * 2, dtype=np.float32)
+    assert len(start_on_beat(audio, [9.0], sr=SR)) == SR * 2
+
+
+def test_snap_overlap_to_beats():
+    from radioai.mixrenderer import snap_overlap_to_beats
+    assert abs(snap_overlap_to_beats(4.8, 120) - 5.0) < 1e-6
+    assert abs(snap_overlap_to_beats(0.1, 120) - 0.5) < 1e-6

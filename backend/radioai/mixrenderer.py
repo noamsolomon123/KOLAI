@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import soundfile as sf
 import librosa
 import pyrubberband as pyrb
@@ -75,3 +75,24 @@ def write_mp3(path: str, audio: np.ndarray) -> None:
         ["ffmpeg", "-y", "-i", wav_path, "-b:a", "192k", path],
         check=True, capture_output=True,
     )
+
+def start_on_beat(audio: np.ndarray, beat_times, sr: int = SR,
+                  max_skip_s: float = 4.0) -> np.ndarray:
+    """Trim leading audio so the track starts on its first detected beat.
+    No beats, or a first beat beyond max_skip_s -> returned unchanged."""
+    if not beat_times:
+        return audio
+    first = beat_times[0]
+    if first <= 0 or first > max_skip_s:
+        return audio
+    start = int(first * sr)
+    return audio[start:] if start < len(audio) else audio
+
+
+def snap_overlap_to_beats(overlap_s: float, bpm: float) -> float:
+    """Round an overlap length to a whole number of beats (min 1) at `bpm`."""
+    if bpm <= 0:
+        return overlap_s
+    beat = 60.0 / bpm
+    n = max(1, round(overlap_s / beat))
+    return n * beat
