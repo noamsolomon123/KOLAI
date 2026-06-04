@@ -1,3 +1,4 @@
+import re
 from typing import Optional, Protocol
 from radioai.models import Song
 
@@ -64,6 +65,12 @@ class DJBrain:
         budget = words_for_seconds(seconds)
         text = self.client.complete(self._prompt(prev, nxt, budget)).strip()
         words = text.split()
-        if len(words) > budget:
-            text = " ".join(words[:budget])
-        return text
+        if len(words) <= budget:
+            return text
+        # Over budget: keep up to `budget` words, then cut back to the last
+        # complete sentence so the DJ never stops mid-thought.
+        capped = " ".join(words[:budget])
+        matches = list(re.finditer(r"[.!?…]", capped))
+        if matches:
+            return capped[: matches[-1].end()].strip()
+        return capped

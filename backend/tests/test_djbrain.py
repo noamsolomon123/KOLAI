@@ -84,3 +84,14 @@ def test_gemini_client_requires_a_client():
     import pytest
     with pytest.raises(ValueError):
         GeminiClient(api_keys=[], model="m", clients=[])
+
+
+def test_intro_ends_at_sentence_boundary_when_over_budget():
+    # budget = words_for_seconds(4.0) = 10. The first sentence (3 words) is the
+    # only complete sentence within the 10-word cap, so we should get exactly it.
+    long_text = "ברוכים הבאים לרדיו. " + " ".join(["מילה"] * 100)
+    client = _FakeClient(long_text)
+    brain = DJBrain(client=client, persona="גלגלצ")
+    script = brain.write_intro(prev=None, nxt=Song("A", "B"), seconds=4.0)
+    assert script == "ברוכים הבאים לרדיו."
+    assert script.endswith(".")
