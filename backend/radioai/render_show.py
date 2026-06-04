@@ -13,12 +13,21 @@ from radioai.djbrain import DJBrain, GeminiClient
 from radioai.voice import VoiceRenderer, GeminiTTSSynth
 from radioai import mixrenderer as mx
 
+# Pro radio-host delivery direction handed to the TTS for every DJ line.
+RADIO_STYLE = (
+    "Read the following like a charismatic, warm, professional Israeli FM radio "
+    "host. Energetic but smooth and confident, natural broadcast pacing, a real "
+    "radio personality - not a robot. Speak only the Hebrew:"
+)
+
 # Hardcoded setlist for M1 (replaced by Spotify+LLM in M2).
 SETLIST = [
     Song(title="Tudo Bom", artist="Static & Ben El Tavori"),
     Song(title="Hofim", artist="Idan Raichel"),
     Song(title="Malkat Hayofi", artist="Eden Ben Zaken"),
 ]
+
+_SEGUE_S = 4.0  # crossfade out of a DJ talkover into the next song
 
 
 def main() -> None:
@@ -30,7 +39,7 @@ def main() -> None:
     )
     voice = VoiceRenderer(
         synth=GeminiTTSSynth(api_keys=cfg.gemini_api_keys, model=cfg.tts_model,
-                             voice=cfg.tts_voice),
+                             voice=cfg.tts_voice, style=RADIO_STYLE),
         out_dir=os.path.join(cfg.cache_dir, "voice"),
     )
 
@@ -52,9 +61,11 @@ def main() -> None:
             print(f"    DJ: {script}")
             slot = voice.render(script)
             dj_audio = mx.load_mono(slot.audio_path)
+            # Talk over the current song's outro, then segue (crossfade) into the
+            # next song instead of a hard cut.
             duck_start = max(0.0, len(timeline) / mx.SR - slot.duration_s - 1.0)
             timeline = mx.duck(timeline, dj_audio, start_s=duck_start)
-            timeline = np.concatenate([timeline, audio])
+            timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
         elif t.type == "beatmatch":
             stretched = mx.time_stretch_to_bpm(audio, an.bpm, prev_an.bpm)
             timeline = mx.equal_power_crossfade(timeline, stretched, overlap_s=t.duration_s)
