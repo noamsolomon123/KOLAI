@@ -28,3 +28,24 @@ def test_wheel_wraps_around():
 
 def test_distant_keys_incompatible():
     assert are_keys_compatible("8A", "11A") is False
+
+from radioai.keys import camelot_relation
+
+
+def test_camelot_relation_same():
+    assert camelot_relation("8A", "8A") == "same"
+
+
+def test_camelot_relation_relative():
+    assert camelot_relation("8A", "8B") == "relative"
+
+
+def test_camelot_relation_adjacent_and_wrap():
+    assert camelot_relation("8A", "9A") == "adjacent"
+    assert camelot_relation("8A", "7A") == "adjacent"
+    assert camelot_relation("12A", "1A") == "adjacent"
+
+
+def test_camelot_relation_clash():
+    assert camelot_relation("8A", "11A") == "clash"
+    assert camelot_relation("8A", "3B") == "clash"

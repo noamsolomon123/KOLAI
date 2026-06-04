@@ -39,3 +39,18 @@ def are_keys_compatible(a: str, b: str) -> bool:
         diff = abs(na - nb)
         return diff == 1 or diff == 11
     return False
+
+
+def camelot_relation(a: str, b: str) -> str:
+    """Classify the harmonic relationship between two Camelot codes."""
+    na, la = _parse(a)
+    nb, lb = _parse(b)
+    if a == b:
+        return "same"
+    if na == nb and la != lb:
+        return "relative"
+    if la == lb:
+        diff = abs(na - nb)
+        if diff == 1 or diff == 11:
+            return "adjacent"
+    return "clash"
