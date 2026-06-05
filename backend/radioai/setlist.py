@@ -111,6 +111,17 @@ class SetlistPlanner:
         artists = ", ".join(taste.top_artists)
         return f"Top tracks:\n{tracks}\n\nTop artists: {artists}\n"
 
+    def _mood_block(self, mood=None) -> str:
+        from radioai.moods import MOODS
+        if not mood or mood not in MOODS:
+            return ""
+        return (
+            f"\nVIBE for this set: {MOODS[mood]['song']}. Choose songs from the "
+            "listener's taste (and closely related real songs) that fit this "
+            "vibe - stay grounded in their favorites, do NOT abandon their "
+            "taste.\n"
+        )
+
     def _constraints_block(self, exclude=None, seed=None) -> str:
         seed_line = ""
         if seed is not None:
@@ -164,23 +175,26 @@ class SetlistPlanner:
         'shape:\n[{"title": "...", "artist": "..."}, ...]'
     )
 
-    def _prompt(self, taste: TasteProfile, n: int, exclude=None, seed=None) -> str:
+    def _prompt(self, taste: TasteProfile, n: int, exclude=None, seed=None,
+                mood=None) -> str:
         return (
             "You are a radio music director building a personal station for one "
             "listener. Here is their recent taste.\n\n"
             f"{self._taste_block(taste)}"
-            f"{self._constraints_block(exclude=exclude, seed=seed)}\n"
+            f"{self._constraints_block(exclude=exclude, seed=seed)}"
+            f"{self._mood_block(mood)}\n"
             f"{self._craft_rules(n)}"
             f"{self._SHAPE}"
         )
 
     def _refine_prompt(self, taste: TasteProfile, n: int, draft_json: str,
-                       exclude=None, seed=None) -> str:
+                       exclude=None, seed=None, mood=None) -> str:
         return (
             "You are a meticulous radio music director doing QUALITY CONTROL on "
             "a draft setlist before it goes on air. CRITIQUE then REFINE it.\n\n"
             f"{self._taste_block(taste)}"
-            f"{self._constraints_block(exclude=exclude, seed=seed)}\n"
+            f"{self._constraints_block(exclude=exclude, seed=seed)}"
+            f"{self._mood_block(mood)}\n"
             "Here is the DRAFT setlist to review:\n"
             f"{draft_json}\n\n"
             "Silently critique the draft for: repeated songs or artists; two "
@@ -196,12 +210,12 @@ class SetlistPlanner:
         )
 
     def plan(self, taste: TasteProfile, n: int = 6, exclude=None, seed=None,
-             refine: bool = True) -> list[Song]:
+             refine: bool = True, mood=None) -> list[Song]:
         """Generate a setlist. By default runs a second self-critique/refine
         LLM pass; set refine=False to skip it. Always falls back to the first
         draft if the refine pass fails or yields nothing usable."""
         draft_text = self.client.complete(
-            self._prompt(taste, n, exclude=exclude, seed=seed))
+            self._prompt(taste, n, exclude=exclude, seed=seed, mood=mood))
         draft = parse_setlist(draft_text, taste, n)
         if not refine:
             return draft
@@ -212,7 +226,7 @@ class SetlistPlanner:
         try:
             refined_text = self.client.complete(
                 self._refine_prompt(taste, n, draft_json,
-                                    exclude=exclude, seed=seed))
+                                    exclude=exclude, seed=seed, mood=mood))
             refined = parse_setlist(refined_text, taste, n)
             if refined:
                 return refined
