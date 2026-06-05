@@ -4,9 +4,7 @@ import StationRow from './components/StationRow'
 import NowPlaying from './components/NowPlaying'
 import UpNext from './components/UpNext'
 import StateCard from './components/StateCard'
-import { apiUrl } from './lib/api'
-import { useShow } from './hooks/useShow'
-import { useAudio } from './hooks/useAudio'
+import { useStation } from './hooks/useStation'
 import {
   activeSegment,
   activeTalk,
@@ -15,8 +13,7 @@ import {
 } from './lib/util'
 
 export default function App() {
-  const { show, status, refresh, regenerate, regenerating } = useShow()
-  const audio = useAudio()
+  const { show, status, audio } = useStation()
 
   const segments = show?.segments ?? []
   const talk = show?.talk ?? []
@@ -75,28 +72,17 @@ export default function App() {
     [audio],
   )
 
+  // Endless station: there is no per-show regenerate. The "new station"
+  // affordance simply restarts the stream from the top.
+  const onRegenerate = useCallback(() => window.location.reload(), [])
+
   // ---- non-ready states ----
-  if (status === 'loading') {
+  if (status === 'tuning') {
     return (
       <div className="app">
         <Background />
         <div className="stage">
-          <StateCard spinner skeleton title="מתחברים לתחנה…" sub="טוען את השידור החי" />
-        </div>
-      </div>
-    )
-  }
-  if (status === 'empty') {
-    return (
-      <div className="app">
-        <Background />
-        <div className="stage">
-          <StateCard
-            emoji="📻"
-            title="מכינים את התחנה…"
-            sub="עוד אין שידור. אפשר לרנדר תחנה חדשה ולחזור בעוד רגע."
-            action={{ label: '🔁 צור תחנה חדשה', onClick: regenerate }}
-          />
+          <StateCard spinner skeleton title="מתחברים לתחנה…" sub="מתכוונן לשידור החי" />
         </div>
       </div>
     )
@@ -110,7 +96,7 @@ export default function App() {
             emoji="⚠️"
             title="משהו השתבש"
             sub="לא הצלחנו לטעון את השידור. ננסה שוב?"
-            action={{ label: 'נסה שוב', onClick: refresh }}
+            action={{ label: 'נסה שוב', onClick: () => window.location.reload() }}
           />
         </div>
       </div>
@@ -121,12 +107,12 @@ export default function App() {
   return (
     <div className="app">
       <Background />
-      <audio ref={audio.audioRef} src={apiUrl('/api/audio')} preload="metadata" />
+      <audio ref={audio.audioRef} preload="metadata" />
       <div className="stage">
         <StationRow
           station={show.station}
-          regenerating={regenerating}
-          onRegenerate={regenerate}
+          regenerating={false}
+          onRegenerate={onRegenerate}
         />
 
         <NowPlaying
