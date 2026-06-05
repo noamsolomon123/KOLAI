@@ -162,3 +162,60 @@ def test_gemini_tts_no_style_sends_plain_text(tmp_path):
                            clients=[_CapClient()])
     synth.synth("plain text")
     assert captured["contents"] == "plain text"
+
+
+class _RecordingSynth:
+    """Records (text, voice) per call; returns `secs` of silence wav."""
+    def __init__(self, secs=0.5, sr=24000):
+        self.calls = []
+        self._secs = secs
+        self._sample_rate = sr
+    def synth(self, text, voice=None):
+        import io
+        self.calls.append((text, voice))
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros(int(self._secs * self._sample_rate), dtype=np.float32),
+                 self._sample_rate, format="WAV")
+        return buf.getvalue()
+
+
+def test_render_banter_two_voices(tmp_path):
+    from radioai.voice import VoiceRenderer
+    synth = _RecordingSynth(secs=0.5)
+    r = VoiceRenderer(synth=synth, out_dir=str(tmp_path))
+    turns = [("A", "shalom shalom"), ("B", "ma nishma"), ("A", "hakol tov")]
+    slot = r.render_banter(turns, voice_a="Algieba", voice_b="Puck")
+    assert os.path.exists(slot.audio_path)
+    assert synth.calls[0] == ("shalom shalom", "Algieba")
+    assert synth.calls[1] == ("ma nishma", "Puck")
+    assert synth.calls[2] == ("hakol tov", "Algieba")
+    assert slot.duration_s > 1.4   # 3 x 0.5s + gaps
+
+
+def test_render_banter_empty_raises(tmp_path):
+    from radioai.voice import VoiceRenderer
+    import pytest
+    r = VoiceRenderer(synth=_RecordingSynth(), out_dir=str(tmp_path))
+    with pytest.raises(ValueError):
+        r.render_banter([])
+
+
+def test_gemini_synth_voice_override(tmp_path):
+    from radioai.voice import GeminiTTSSynth
+    captured = {}
+
+    class _CapModels:
+        def generate_content(self, model, contents, config):
+            vc = config.speech_config.voice_config.prebuilt_voice_config.voice_name
+            captured["voice"] = vc
+            return _FakeTTSResp(b"\x00\x00" * 24000)
+
+    class _CapClient:
+        def __init__(self):
+            self.models = _CapModels()
+
+    synth = GeminiTTSSynth(api_keys=[], model="m", voice="Algieba", clients=[_CapClient()])
+    synth.synth("hi", voice="Puck")
+    assert captured["voice"] == "Puck"
+    synth.synth("hi")
+    assert captured["voice"] == "Algieba"
