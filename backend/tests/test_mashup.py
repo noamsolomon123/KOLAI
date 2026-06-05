@@ -57,3 +57,36 @@ def test_build_mashup_empty_raises():
     with pytest.raises(ValueError):
         build_mashup(np.zeros(0, dtype=np.float32), np.ones(SR, dtype=np.float32),
                      np.ones(SR, dtype=np.float32), 120, 120, [0.0])
+
+
+def test_build_mashup_picks_loud_vocal_section():
+    from radioai.mashup import build_mashup
+    from radioai.mixrenderer import SR
+    bpm = 120
+    window_n = int(8 * 4 * 60 / bpm * SR)  # 16s
+    # vocals: QUIET first window, LOUD second window
+    voc = np.concatenate([
+        np.full(window_n, 0.05, dtype=np.float32),
+        np.full(window_n, 0.5, dtype=np.float32),
+    ])
+    inst = np.zeros(SR * 40, dtype=np.float32)   # silent bed (isolate the acapella)
+    full = np.zeros(SR * 40, dtype=np.float32)
+    out = build_mashup(voc, inst, full, bpm, bpm, [0.0], bars=8)
+    # mashup window must reflect the LOUD vocal (~0.5), not the quiet outro/intro (~0.05)
+    assert float(np.mean(np.abs(out[:window_n]))) > 0.3
+
+
+def test_build_mashup_picks_loud_middle_not_tail():
+    from radioai.mashup import build_mashup
+    from radioai.mixrenderer import SR
+    bpm = 120
+    window_n = int(8 * 4 * 60 / bpm * SR)
+    voc = np.concatenate([
+        np.full(window_n, 0.05, dtype=np.float32),   # quiet head
+        np.full(window_n, 0.5, dtype=np.float32),    # LOUD middle
+        np.full(window_n, 0.05, dtype=np.float32),   # quiet tail (outro) <- old code used this
+    ])
+    inst = np.zeros(SR * 60, dtype=np.float32)
+    full = np.zeros(SR * 60, dtype=np.float32)
+    out = build_mashup(voc, inst, full, bpm, bpm, [0.0], bars=8)
+    assert float(np.mean(np.abs(out[:window_n]))) > 0.3   # must find the loud MIDDLE

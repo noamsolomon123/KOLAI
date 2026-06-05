@@ -16,6 +16,19 @@ def mashup_gate(prev, nxt) -> bool:
     return ratio <= _MAX_BPM_RATIO
 
 
+def _peak_vocal_start(vocals, window_n, sr: int = SR) -> int:
+    """Index of the highest-energy window_n slice (the most vocal-rich section)."""
+    if len(vocals) <= window_n:
+        return 0
+    step = max(1, sr // 2)  # 0.5s hops
+    best_i, best_e = 0, -1.0
+    for i in range(0, len(vocals) - window_n + 1, step):
+        e = float(np.mean(vocals[i:i + window_n] ** 2))
+        if e > best_e:
+            best_e, best_i = e, i
+    return best_i
+
+
 def build_mashup(prev_vocals, nxt_instrumental, nxt_full, prev_bpm, nxt_bpm,
                  nxt_beats, bars: int = 8, sr: int = SR):
     """Acapella-over-next: outgoing vocal (tempo-matched) over the incoming
@@ -27,7 +40,11 @@ def build_mashup(prev_vocals, nxt_instrumental, nxt_full, prev_bpm, nxt_bpm,
 
     window_n = int(bars * 4 * 60.0 / nxt_bpm * sr)  # 4 beats/bar
 
-    acap = prev_vocals[-window_n:] if len(prev_vocals) >= window_n else prev_vocals
+    if len(prev_vocals) >= window_n:
+        _s = _peak_vocal_start(prev_vocals, window_n)
+        acap = prev_vocals[_s:_s + window_n]
+    else:
+        acap = prev_vocals
     acap = time_stretch_to_bpm(acap, prev_bpm, nxt_bpm)
 
     bed = start_on_beat(nxt_instrumental, nxt_beats)[:window_n]
