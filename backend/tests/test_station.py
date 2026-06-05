@@ -1,3 +1,4 @@
+import os
 import time
 from types import SimpleNamespace
 from radioai.models import Song
@@ -18,25 +19,30 @@ class FakePlanner:
 
 
 class FakeRenderer:
-    def __init__(self):
+    def __init__(self, blocks_dir):
+        self.blocks_dir = blocks_dir
         self.calls = []
     def render(self, songs, index, prev_track=None):
         self.calls.append({"index": index, "songs": list(songs), "prev_track": prev_track})
+        path = os.path.join(self.blocks_dir, f"block_{index}.mp3")
+        # Write a tiny real file so prune tests can verify deletion
+        open(path, "wb").write(b"ID3")
         return SimpleNamespace(
             meta={"index": index, "duration_s": 1.0, "segments": [], "talk": []},
-            path=f"block_{index}.mp3",
+            path=path,
             last_track=f"track-{index}",
         )
 
 
 def _engine(tmp_path, **kw):
-    return StationEngine(FakePlanner(), FakeRenderer(), blocks_dir=str(tmp_path), **kw)
+    renderer = FakeRenderer(blocks_dir=str(tmp_path))
+    return StationEngine(FakePlanner(), renderer, blocks_dir=str(tmp_path), **kw)
 
 
 def test_get_block_path_renders_block0(tmp_path):
     eng = _engine(tmp_path)
     p = eng.get_block_path(0)
-    assert p == "block_0.mp3"
+    assert os.path.basename(p) == "block_0.mp3"
     assert eng._renderer.calls[0]["index"] == 0
     assert eng._renderer.calls[0]["prev_track"] is None
 
@@ -75,3 +81,29 @@ def test_worker_buffers_ahead(tmp_path):
     eng.stop()
     assert eng.get_block_meta(0) is not None
     assert eng.get_block_meta(1) is not None
+
+
+def test_prunes_old_blocks(tmp_path):
+    eng = _engine(tmp_path, buffer_ahead=1, keep_behind=1)
+    for i in range(4):
+        eng.get_block_path(i)
+        eng.advance(i)
+    # current=3, keep_behind=1 -> blocks with index < 2 are pruned (files + registry)
+    assert not os.path.exists(os.path.join(str(tmp_path), "block_0.mp3"))
+    assert not os.path.exists(os.path.join(str(tmp_path), "block_1.mp3"))
+    assert eng.get_block_meta(0) is None      # registry pruned
+    assert eng.get_block_meta(3) is not None  # recent block kept
+
+
+def test_frontier_advances_past_pruned(tmp_path):
+    eng = _engine(tmp_path, buffer_ahead=1, keep_behind=1)
+    for i in range(4):
+        eng.get_block_path(i)
+        eng.advance(i)
+    # frontier is now 4; rendering block 4 must not re-render any pruned index
+    eng.get_block_path(4)
+    indices = [c["index"] for c in eng._renderer.calls]
+    # no duplicates
+    assert len(indices) == len(set(indices)), f"duplicate renders: {indices}"
+    # block 4 was rendered
+    assert 4 in indices

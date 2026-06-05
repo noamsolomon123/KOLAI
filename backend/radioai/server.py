@@ -72,8 +72,8 @@ def _build_station(cfg):
     ctx = DJContext.build(cfg)
     renderer = BlockRenderer(fetcher, brain, voice, ctx, blocks_dir=blocks_dir,
                              voice_a=cfg.tts_voice, voice_b="Aoede")
-    engine = StationEngine(planner, renderer, songs_per_block=3, buffer_ahead=1,
-                           blocks_dir=blocks_dir)
+    engine = StationEngine(planner, renderer, songs_per_block=3, buffer_ahead=2,
+                           keep_behind=2, blocks_dir=blocks_dir)
     engine.start()
     return engine
 
@@ -160,6 +160,30 @@ def create_app(cache_dir: str | None = None, engine=None) -> FastAPI:
             r.banter_chance = cfg_p["banter_chance"]
             r.max_silence = cfg_p["max_silence"]
         return {"ok": True, "level": level, **cfg_p}
+
+    @app.get("/api/station/moods")
+    def station_moods():
+        from radioai.moods import mood_list
+        return {"moods": mood_list()}
+
+    @app.post("/api/station/mood")
+    def station_mood(payload: dict):
+        from radioai.moods import MOODS, DEFAULT_MOOD
+        eng = _engine()
+        mood = (payload or {}).get("mood", DEFAULT_MOOD)
+        preset = MOODS.get(mood, MOODS[DEFAULT_MOOD])
+        planner = getattr(eng, "_planner", None)
+        if planner is not None:
+            setattr(planner, "mood", mood)
+        r = getattr(eng, "_renderer", None)
+        if r is not None:
+            r.talk_chance = preset["talk_chance"]
+            r.banter_chance = preset["banter_chance"]
+            r.max_silence = preset["max_silence"]
+            synth = getattr(getattr(r, "voice", None), "synth", None)
+            if synth is not None:
+                setattr(synth, "_style", preset["voice_style"])
+        return {"ok": True, "mood": mood, "label": preset["label"]}
 
     _backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _root = os.path.dirname(_backend)
