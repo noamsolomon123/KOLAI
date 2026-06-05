@@ -54,7 +54,9 @@ def test_from_env_topics_empty(monkeypatch):
 
 def test_from_env_mashups_enabled_default_and_off(monkeypatch):
     monkeypatch.delenv("MASHUPS_ENABLED", raising=False)
-    assert Config.from_env().mashups_enabled is True       # default on
+    assert Config.from_env().mashups_enabled is False      # default OFF (disabled - sounded bad)
+    monkeypatch.setenv("MASHUPS_ENABLED", "true")
+    assert Config.from_env().mashups_enabled is True        # explicit opt-in
     monkeypatch.setenv("MASHUPS_ENABLED", "false")
     assert Config.from_env().mashups_enabled is False
     monkeypatch.setenv("MASHUPS_ENABLED", "0")
