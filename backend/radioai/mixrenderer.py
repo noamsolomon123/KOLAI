@@ -68,13 +68,22 @@ def time_stretch_to_bpm(audio: np.ndarray, src_bpm: float,
 
 
 def write_mp3(path: str, audio: np.ndarray) -> None:
+    import os as _os
+    import subprocess
     wav_path = path.replace(".mp3", ".wav")
     sf.write(wav_path, np.clip(audio, -1.0, 1.0), SR)
-    import subprocess
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", wav_path, "-b:a", "192k", path],
-        check=True, capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-b:a", "192k", path],
+            check=True, capture_output=True,
+        )
+    finally:
+        # drop the large intermediate wav so an endless station doesn't fill disk
+        if _os.path.exists(wav_path):
+            try:
+                _os.remove(wav_path)
+            except OSError:
+                pass
 
 def start_on_beat(audio: np.ndarray, beat_times, sr: int = SR,
                   max_skip_s: float = 4.0) -> np.ndarray:
