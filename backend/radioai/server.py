@@ -71,7 +71,7 @@ def _build_station(cfg):
     planner = RollingPlanner(taste, setlist)
     ctx = DJContext.build(cfg)
     renderer = BlockRenderer(fetcher, brain, voice, ctx, blocks_dir=blocks_dir,
-                             voice_a=cfg.tts_voice, voice_b="Puck")
+                             voice_a=cfg.tts_voice, voice_b="Aoede")
     engine = StationEngine(planner, renderer, songs_per_block=3, buffer_ahead=1,
                            blocks_dir=blocks_dir)
     engine.start()
