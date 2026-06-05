@@ -291,3 +291,123 @@ def test_topic_prompt_includes_topic_and_headline():
                       seconds=10.0, topic="AI")
     p = client.prompts[-1]
     assert "AI" in p and "פריצת דרך ב-AI" in p
+
+
+# === ROUND 2: NAMING SONGS ON AIR + TWO-HOST BANTER ===
+import json as _json
+
+
+def test_write_break_song_beat_names_both_songs_and_artists():
+    # The witty handoff path must put BOTH the outgoing and incoming song
+    # titles + artists into the prompt so the DJ can announce/back-announce.
+    client = _SeqClient("שיר")
+    brain = _DJ(client=client, persona="גלגלצ")
+    prev = Song(title="Tudo Bom", artist="Static Ben El")
+    nxt = Song(title="Million Dollar", artist="Noa Kirel")
+    brain.write_break(prev=prev, nxt=nxt, beat="song", ctx=_ctx2(),
+                      seconds=8.0)
+    p = client.prompts[-1]
+    assert "Tudo Bom" in p and "Static Ben El" in p
+    assert "Million Dollar" in p and "Noa Kirel" in p
+
+
+def test_write_break_song_beat_instructs_to_name_songs_naturally():
+    client = _SeqClient("שיר")
+    brain = _DJ(client=client, persona="גלגלצ")
+    prev = Song(title="A", artist="B")
+    nxt = Song(title="C", artist="D")
+    brain.write_break(prev=prev, nxt=nxt, beat="song", ctx=_ctx2(),
+                      seconds=8.0)
+    p = client.prompts[-1]
+    assert "שם השיר" in p
+    assert ("בטבעיות" in p) or ("טבעי" in p)
+    assert ("לא בכל" in p) or ("לא תמיד" in p) or ("מגוון" in p)
+
+
+def test_write_intro_also_names_songs_naturally():
+    client = _SeqClient("שיר")
+    brain = _DJ(client=client, persona="גלגלצ")
+    brain.write_intro(prev=Song("Prev T", "Prev A"),
+                      nxt=Song("Next T", "Next A"), seconds=8.0)
+    p = client.prompts[-1]
+    assert "Prev T" in p and "Next T" in p
+    assert "שם השיר" in p
+
+
+# ---- write_banter -----------------------------------------------------------
+
+def test_write_banter_parses_json_into_alternating_turns():
+    raw = ("כאן בלייני קצת:\n"
+           "[{\"speaker\":\"A\",\"text\":\"ערב טוב, איזה מזג אוויר מטורף היום!\"},"
+           "{\"speaker\":\"B\",\"text\":\"מטורף? אני כבר נמס פה באולפן.\"},"
+           "{\"speaker\":\"A\",\"text\":\"אז בוא נמיס גם את המאזינים עם שיר.\"}]")
+    client = _SeqClient(raw)
+    brain = _DJ(client=client, persona="גלגלצ")
+    turns = brain.write_banter(ctx=_ctx2(weather="32 מעלות"), seconds=12.0)
+    assert isinstance(turns, list)
+    assert len(turns) >= 2
+    speakers = [s for s, _ in turns]
+    assert speakers[0] == "A"
+    for i in range(1, len(speakers)):
+        assert speakers[i] != speakers[i - 1]
+        assert speakers[i] in ("A", "B")
+    for _, text in turns:
+        assert text.strip() != ""
+        assert not _re.search(r"[A-Za-z]", text)
+        assert '"' not in text and "*" not in text
+
+
+def test_write_banter_respects_small_word_budget():
+    turns_json = _json.dumps(
+        [{"speaker": "A", "text": " ".join(["מילה"] * 40)},
+         {"speaker": "B", "text": " ".join(["דבר"] * 40)}],
+        ensure_ascii=False)
+    client = _SeqClient(turns_json)
+    brain = _DJ(client=client, persona="גלגלצ")
+    turns = brain.write_banter(ctx=_ctx2(), seconds=4.0)
+    total = sum(len(t.split()) for _, t in turns)
+    assert total <= words_for_seconds(4.0)
+    assert len(turns) >= 1
+
+
+def test_write_banter_prompt_includes_context_and_topic():
+    client = _SeqClient("[{\"speaker\":\"A\",\"text\":\"שלום\"},"
+                        "{\"speaker\":\"B\",\"text\":\"היי\"}]")
+    brain = _DJ(client=client, persona="גלגלצ")
+    brain.write_banter(ctx=_ctx2(weather="28 מעלות", general="כותרת חמה"),
+                       seconds=12.0, topic="ספורט")
+    p = client.prompts[-1]
+    assert "28 מעלות" in p
+    assert "ספורט" in p
+    assert "speaker" in p and "text" in p
+    assert "A" in p and "B" in p
+
+
+def test_write_banter_fallback_returns_single_turn_on_non_json():
+    client = _SeqClient("סתם שורה אחת בלי שום ג'ייסון בכלל")
+    brain = _DJ(client=client, persona="גלגלצ")
+    turns = brain.write_banter(ctx=_ctx2(), seconds=12.0)
+    assert len(turns) == 1
+    spk, text = turns[0]
+    assert spk == "A"
+    assert text.strip() != ""
+    assert not _re.search(r"[A-Za-z]", text)
+
+
+def test_write_banter_fallback_when_json_has_no_usable_lines():
+    raw = "[{\"speaker\":\"A\",\"text\":\"%%%   ***\"},{\"speaker\":\"B\",\"text\":\"   \"}]"
+    client = _SeqClient([raw, "אבל הנה שורה אחת טובה בעברית"])
+    brain = _DJ(client=client, persona="גלגלצ")
+    turns = brain.write_banter(ctx=_ctx2(), seconds=12.0)
+    assert len(turns) == 1
+    assert turns[0][0] == "A"
+    assert turns[0][1].strip() != ""
+
+
+def test_write_banter_default_topic_none_is_fine():
+    client = _SeqClient("[{\"speaker\":\"A\",\"text\":\"ערב טוב חברים\"},"
+                        "{\"speaker\":\"B\",\"text\":\"איזה כיף לחזור לאולפן\"}]")
+    brain = _DJ(client=client, persona="גלגלצ")
+    turns = brain.write_banter(ctx=_ctx2())
+    assert len(turns) >= 2
+    assert turns[0][0] == "A" and turns[1][0] == "B"
