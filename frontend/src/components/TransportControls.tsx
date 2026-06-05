@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion'
+import { AnimatePresence, motion } from 'framer-motion'
 
 interface Props {
   playing: boolean
@@ -9,6 +9,7 @@ interface Props {
 }
 
 const spring = { type: 'spring' as const, stiffness: 520, damping: 24 }
+const morph = { type: 'spring' as const, stiffness: 600, damping: 26 }
 
 function PrevIcon() {
   return (
@@ -52,7 +53,8 @@ export default function TransportControls({
       <motion.button
         className="tbtn"
         onClick={onPrev}
-        whileTap={{ scale: 0.86 }}
+        whileTap={{ scale: 0.84 }}
+        whileHover={{ scale: 1.06 }}
         transition={spring}
         aria-label="הקודם"
       >
@@ -63,22 +65,52 @@ export default function TransportControls({
         className="tbtn tbtn--play"
         onClick={onToggle}
         whileTap={{ scale: 0.9 }}
+        whileHover={{ scale: 1.04 }}
         transition={spring}
         aria-label={playing ? 'השהה' : 'נגן'}
       >
-        {buffering ? (
-          <span className="spinner" style={{ width: 28, height: 28, borderWidth: 3 }} />
-        ) : playing ? (
-          <PauseIcon />
-        ) : (
-          <PlayIcon />
-        )}
+        <AnimatePresence mode="popLayout" initial={false}>
+          {buffering ? (
+            <motion.span
+              key="buffer"
+              initial={{ opacity: 0, scale: 0.6 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.6 }}
+              transition={morph}
+              className="spinner"
+              style={{ width: 28, height: 28, borderWidth: 3 }}
+            />
+          ) : playing ? (
+            <motion.span
+              key="pause"
+              initial={{ opacity: 0, scale: 0.4, rotate: -90 }}
+              animate={{ opacity: 1, scale: 1, rotate: 0 }}
+              exit={{ opacity: 0, scale: 0.4, rotate: 90 }}
+              transition={morph}
+              style={{ display: 'grid', placeItems: 'center' }}
+            >
+              <PauseIcon />
+            </motion.span>
+          ) : (
+            <motion.span
+              key="play"
+              initial={{ opacity: 0, scale: 0.4, rotate: 90 }}
+              animate={{ opacity: 1, scale: 1, rotate: 0 }}
+              exit={{ opacity: 0, scale: 0.4, rotate: -90 }}
+              transition={morph}
+              style={{ display: 'grid', placeItems: 'center' }}
+            >
+              <PlayIcon />
+            </motion.span>
+          )}
+        </AnimatePresence>
       </motion.button>
 
       <motion.button
         className="tbtn"
         onClick={onNext}
-        whileTap={{ scale: 0.86 }}
+        whileTap={{ scale: 0.84 }}
+        whileHover={{ scale: 1.06 }}
         transition={spring}
         aria-label="הבא"
       >

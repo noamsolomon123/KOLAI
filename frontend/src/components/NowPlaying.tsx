@@ -27,7 +27,7 @@ export default function NowPlaying(props: Props) {
 
   return (
     <>
-      <CoverArt title={title} artist={artist} />
+      <CoverArt title={title} artist={artist} playing={props.playing} />
 
       <motion.div
         className="meta"

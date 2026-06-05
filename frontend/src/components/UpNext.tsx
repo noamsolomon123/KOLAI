@@ -17,8 +17,23 @@ function thumbBg(title: string): string {
   ].join(', ')
 }
 
+const list = {
+  hidden: {},
+  show: {
+    transition: { staggerChildren: 0.05, delayChildren: 0.18 },
+  },
+}
+const item = {
+  hidden: { opacity: 0, y: 12 },
+  show: {
+    opacity: 1,
+    y: 0,
+    transition: { duration: 0.42, ease: [0.16, 1, 0.3, 1] as const },
+  },
+}
+
 // Glass sheet of upcoming songs. Tap a row to seek to its start_s.
-// The currently-playing row is highlighted with a small equalizer.
+// Rows fade/slide in with a gentle stagger; the active row is highlighted.
 export default function UpNext({ segments, activeIndex, onPick }: Props) {
   return (
     <motion.section
@@ -31,7 +46,12 @@ export default function UpNext({ segments, activeIndex, onPick }: Props) {
         <span className="upnext__title">רשימת השמעה</span>
         <span className="upnext__count">{segments.length} שירים</span>
       </header>
-      <div className="upnext__list">
+      <motion.div
+        className="upnext__list"
+        variants={list}
+        initial="hidden"
+        animate="show"
+      >
         {segments.map((s, i) => {
           const isActive = i === activeIndex
           const glyph = (s.title || s.artist || '♪').trim().charAt(0) || '♪'
@@ -40,8 +60,10 @@ export default function UpNext({ segments, activeIndex, onPick }: Props) {
               key={`${s.title}-${i}`}
               className="row"
               data-active={isActive}
+              variants={item}
               onClick={() => onPick(s.start_s)}
               whileTap={{ scale: 0.985 }}
+              whileHover={{ x: 2 }}
               transition={{ type: 'spring', stiffness: 500, damping: 30 }}
             >
               <span className="row__thumb" style={{ background: thumbBg(s.title) }}>
@@ -70,7 +92,7 @@ export default function UpNext({ segments, activeIndex, onPick }: Props) {
             </motion.button>
           )
         })}
-      </div>
+      </motion.div>
     </motion.section>
   )
 }

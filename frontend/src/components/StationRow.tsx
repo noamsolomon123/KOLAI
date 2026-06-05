@@ -22,14 +22,16 @@ export default function StationRow({ station, regenerating, onRegenerate }: Prop
           LIVE
         </span>
       </div>
-      <button
+      <motion.button
         className="ghost-btn"
         data-busy={regenerating}
         onClick={onRegenerate}
         disabled={regenerating}
+        whileTap={regenerating ? undefined : { scale: 0.94 }}
+        whileHover={regenerating ? undefined : { scale: 1.03 }}
       >
         {regenerating ? 'מרנדרים…' : '🔁 תחנה חדשה'}
-      </button>
+      </motion.button>
     </motion.header>
   )
 }

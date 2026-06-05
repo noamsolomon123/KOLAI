@@ -11,7 +11,8 @@ interface Props {
 }
 
 // Glass progress track with a glowing thumb, segment-boundary tick marks,
-// and drag-to-seek (pointer events, works on touch + mouse).
+// and drag-to-seek (pointer events, works on touch + mouse). The rail/fill
+// thicken and the thumb grows while dragging for a satisfying grab.
 export default function Scrubber({
   currentTime,
   duration,
@@ -68,6 +69,7 @@ export default function Scrubber({
     <div className="scrubber">
       <div
         className="scrubber__track"
+        data-dragging={dragging}
         ref={trackRef}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -92,7 +94,10 @@ export default function Scrubber({
         <div className="scrubber__fill" style={{ width: `${pct}%` }} />
         <div
           className="scrubber__thumb"
-          style={{ left: `${pct}%`, transform: `translate(-50%, -50%) scale(${dragging ? 1.25 : 1})` }}
+          style={{
+            left: `${pct}%`,
+            transform: `translate(-50%, -50%) scale(${dragging ? 1.35 : 1})`,
+          }}
         />
       </div>
       <div className="scrubber__time">

@@ -5,6 +5,7 @@ export default function Background() {
     <>
       <div className="mesh" aria-hidden>
         <div className="blob" />
+        <div className="blob-2" />
       </div>
       <div className="grain" aria-hidden />
     </>

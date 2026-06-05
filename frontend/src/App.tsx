@@ -42,6 +42,11 @@ export default function App() {
     root.style.setProperty('--hue-c', String(pal.hueC))
   }, [activeTitle])
 
+  // Drive the playback-glow intensity (cover + play button) from play state.
+  useEffect(() => {
+    document.documentElement.style.setProperty('--glow', audio.playing ? '1' : '0')
+  }, [audio.playing])
+
   // prev / next seek to the previous / next segment's start_s.
   const onPrev = useCallback(() => {
     if (!segments.length) return
@@ -76,7 +81,7 @@ export default function App() {
       <div className="app">
         <Background />
         <div className="stage">
-          <StateCard spinner title="מתחברים לתחנה…" sub="טוען את השידור החי" />
+          <StateCard spinner skeleton title="מתחברים לתחנה…" sub="טוען את השידור החי" />
         </div>
       </div>
     )
