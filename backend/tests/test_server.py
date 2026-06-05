@@ -31,3 +31,44 @@ def test_audio_range(tmp_path):
 def test_audio_404_when_missing(tmp_path):
     c = TestClient(create_app(str(tmp_path)))
     assert c.get("/api/audio").status_code == 404
+
+
+def test_station_endpoints(tmp_path):
+    from radioai.server import create_app
+    from fastapi.testclient import TestClient
+    import os
+
+    class FakeEngine:
+        def __init__(self):
+            self.meta = None
+            self.advanced = []
+            self.started = False
+        def start(self): self.started = True
+        def advance(self, n): self.advanced.append(n)
+        def get_block_meta(self, n): return self.meta
+
+    fake = FakeEngine()
+    app = create_app(cache_dir=str(tmp_path), engine=fake)
+    c = TestClient(app)
+
+    r = c.post("/api/station/start")
+    assert r.status_code == 200 and r.json()["block"] == 0
+    assert fake.started is True
+
+    r = c.get("/api/station/block/0/meta")          # not ready -> 202
+    assert r.status_code == 202
+    assert 0 in fake.advanced
+
+    fake.meta = {"index": 0, "duration_s": 1.0, "segments": [], "talk": []}
+    r = c.get("/api/station/block/0/meta")          # ready -> 200
+    assert r.status_code == 200 and r.json()["index"] == 0
+
+    r = c.get("/api/station/block/0")               # file missing -> 202
+    assert r.status_code == 202
+
+    os.makedirs(os.path.join(tmp_path, "blocks"), exist_ok=True)
+    with open(os.path.join(tmp_path, "blocks", "block_0.mp3"), "wb") as f:
+        f.write(bytes([0]) * 5000)
+    r = c.get("/api/station/block/0", headers={"Range": "bytes=0-99"})   # -> 206
+    assert r.status_code == 206
+    assert r.headers["Content-Range"].startswith("bytes 0-99/")
