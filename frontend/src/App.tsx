@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo } from 'react'
 import Background from './components/Background'
 import StationRow from './components/StationRow'
 import NowPlaying from './components/NowPlaying'
-import UpNext from './components/UpNext'
 import StateCard from './components/StateCard'
 import { useStation } from './hooks/useStation'
 import {
@@ -64,14 +63,6 @@ export default function App() {
     else audio.seek(total)
   }, [segments, activeIndex, audio, total])
 
-  const onPickRow = useCallback(
-    (startS: number) => {
-      audio.seek(startS)
-      if (!audio.playing) audio.play()
-    },
-    [audio],
-  )
-
   // Endless station: there is no per-show regenerate. The "new station"
   // affordance simply restarts the stream from the top.
   const onRegenerate = useCallback(() => window.location.reload(), [])
@@ -128,12 +119,6 @@ export default function App() {
           onNext={onNext}
           onSeek={audio.seek}
           onScrub={audio.setScrub}
-        />
-
-        <UpNext
-          segments={segments}
-          activeIndex={activeIndex}
-          onPick={onPickRow}
         />
       </div>
     </div>

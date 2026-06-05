@@ -6,7 +6,7 @@ interface Props {
   talk: Talk | null
 }
 
-// During a talk window: slides up + glows, shows the beat icon + Hebrew line.
+// During a talk window: glows with ON AIR + beat-type label (no spoken text shown).
 // Idle: a quiet "now playing" state with a little equalizer.
 export default function DJChip({ talk }: Props) {
   const active = !!talk
@@ -25,16 +25,14 @@ export default function DJChip({ talk }: Props) {
         <AnimatePresence mode="wait" initial={false}>
           {active ? (
             <motion.div
-              key={talk!.text}
+              key={beatLabel}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.32, ease: [0.16, 1, 0.3, 1] }}
             >
-              <div className="djchip__beat">{beatLabel}</div>
-              <p className="djchip__text" dir="auto">
-                {talk!.text}
-              </p>
+              <div className="djchip__beat">ON AIR</div>
+              <p className="djchip__text">{beatLabel || 'שידור חי'}</p>
             </motion.div>
           ) : (
             <motion.div

@@ -144,6 +144,23 @@ def create_app(cache_dir: str | None = None, engine=None) -> FastAPI:
             return JSONResponse({"status": "rendering", "index": n}, status_code=202)
         return _serve_range(path, request)
 
+    @app.post("/api/station/settings")
+    def station_settings(payload: dict):
+        eng = _engine()
+        level = (payload or {}).get("level", "normal")
+        presets = {
+            "less":   {"talk_chance": 0.25, "banter_chance": 0.10, "max_silence": 6},
+            "normal": {"talk_chance": 0.50, "banter_chance": 0.20, "max_silence": 4},
+            "more":   {"talk_chance": 0.85, "banter_chance": 0.40, "max_silence": 2},
+        }
+        cfg_p = presets.get(level, presets["normal"])
+        r = getattr(eng, "_renderer", None)
+        if r is not None:
+            r.talk_chance = cfg_p["talk_chance"]
+            r.banter_chance = cfg_p["banter_chance"]
+            r.max_silence = cfg_p["max_silence"]
+        return {"ok": True, "level": level, **cfg_p}
+
     _backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _root = os.path.dirname(_backend)
     for _candidate in (os.path.join(_root, "frontend", "dist"),

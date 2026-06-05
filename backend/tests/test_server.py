@@ -1,4 +1,4 @@
-﻿import json
+import json
 from fastapi.testclient import TestClient
 from radioai.server import create_app
 
@@ -72,3 +72,34 @@ def test_station_endpoints(tmp_path):
     r = c.get("/api/station/block/0", headers={"Range": "bytes=0-99"})   # -> 206
     assert r.status_code == 206
     assert r.headers["Content-Range"].startswith("bytes 0-99/")
+
+
+def test_station_settings(tmp_path):
+    """POST /api/station/settings updates _renderer attributes and returns the preset."""
+
+    class FakeRenderer:
+        talk_chance = 0.5
+        banter_chance = 0.2
+        max_silence = 4
+
+    class FakeEngine:
+        _renderer = FakeRenderer()
+        def start(self): pass
+        def advance(self, n): pass
+        def get_block_meta(self, n): return None
+
+    fake = FakeEngine()
+    app = create_app(cache_dir=str(tmp_path), engine=fake)
+    c = TestClient(app)
+
+    r = c.post("/api/station/settings", json={"level": "more"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["level"] == "more"
+    assert data["talk_chance"] == 0.85
+    assert data["max_silence"] == 2
+    # Confirm the live renderer was mutated
+    assert fake._renderer.talk_chance == 0.85
+    assert fake._renderer.banter_chance == 0.40
+    assert fake._renderer.max_silence == 2
