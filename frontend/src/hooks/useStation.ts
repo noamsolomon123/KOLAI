@@ -173,6 +173,12 @@ export function useStation(): UseStation {
   // ---- attach media listeners to the current <audio> node (callback ref) ----
   useEffect(() => {
     if (!el) return
+    // The <audio> only mounts once status flips to 'ready', AFTER loadBlock(0)
+    // ran (when the element did not exist yet). Set the current block's src here
+    // on mount, otherwise play() has no source and loads forever.
+    if (!el.src) {
+      el.src = blockUrl(indexRef.current)
+    }
     const onTime = () => {
       if (scrubRef.current == null) setCurrentTime(el.currentTime)
     }
