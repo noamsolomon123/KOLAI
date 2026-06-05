@@ -78,3 +78,29 @@ def test_get_profile_uses_cache(tmp_path):
     again = svc.get_profile(use_cache=True)  # should read cache, no new call
     assert fake.calls == 1
     assert again.top_tracks[0].title == "Song A"
+
+
+def test_get_profile_force_refresh_bypasses_cache(tmp_path):
+    import json, os
+    from radioai.taste import TasteService
+    class Cfg:
+        cache_dir = str(tmp_path)
+        spotify_client_id = "x"; spotify_client_secret = "y"; spotify_redirect_uri = "z"
+    os.makedirs(tmp_path, exist_ok=True)
+    with open(os.path.join(tmp_path, "taste.json"), "w", encoding="utf-8") as f:
+        json.dump({"top_tracks": [], "top_artists": ["CACHED"]}, f)
+    class FakeSpotify:
+        def __init__(self): self.calls = 0
+        def current_user_top_tracks(self, **k):
+            self.calls += 1
+            return {"items": [{"name": "Live", "artists": [{"name": "Net"}], "duration_ms": 1000}]}
+        def current_user_top_artists(self, **k):
+            return {"items": [{"name": "FRESH"}]}
+    fake = FakeSpotify()
+    svc = TasteService(Cfg(), client=fake)
+    assert svc.get_profile().top_artists == ["CACHED"]   # cache hit
+    assert fake.calls == 0
+    fresh = svc.get_profile(use_cache=False)              # force refresh
+    assert fresh.top_artists == ["FRESH"]
+    assert fake.calls == 1
+

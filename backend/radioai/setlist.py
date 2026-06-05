@@ -1,4 +1,4 @@
-﻿import re
+import re
 import json
 from typing import Protocol
 from radioai.models import Song
@@ -49,16 +49,27 @@ class SetlistPlanner:
     def __init__(self, client: "_LLM"):
         self.client = client
 
-    def _prompt(self, taste: TasteProfile, n: int) -> str:
+    def _prompt(self, taste: TasteProfile, n: int, exclude=None, seed=None) -> str:
+        em = "—"
         tracks = "\n".join(
-            f'- "{t.title}" — {t.artist}' for t in taste.top_tracks
+            f'- "{t.title}" {em} {t.artist}' for t in taste.top_tracks
         )
         artists = ", ".join(taste.top_artists)
+        seed_line = ""
+        if seed is not None:
+            seed_line = (f'\nThe station is currently playing "{seed.title}" {em} '
+                         f"{seed.artist}; make the first song flow naturally from it.\n")
+        exclude_line = ""
+        if exclude:
+            joined = "; ".join(exclude)
+            exclude_line = ("\nDo NOT include any of these recently played songs: "
+                            f"{joined}.\n")
         return (
             "You are a radio music director building a personal station for one "
             "listener. Here is their recent taste.\n\n"
             f"Top tracks:\n{tracks}\n\n"
-            f"Top artists: {artists}\n\n"
+            f"Top artists: {artists}\n"
+            f"{seed_line}{exclude_line}\n"
             f"Curate a flowing {n}-song setlist with a natural energy arc. Prefer "
             "the listener's own tracks and closely related real songs by the same "
             "or adjacent artists. Only include real, well-known songs.\n"
@@ -66,6 +77,6 @@ class SetlistPlanner:
             '[{"title": "...", "artist": "..."}, ...]'
         )
 
-    def plan(self, taste: TasteProfile, n: int = 6) -> list[Song]:
-        text = self.client.complete(self._prompt(taste, n))
+    def plan(self, taste: TasteProfile, n: int = 6, exclude=None, seed=None) -> list[Song]:
+        text = self.client.complete(self._prompt(taste, n, exclude=exclude, seed=seed))
         return parse_setlist(text, taste, n)
