@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo } from 'react'
+﻿import { useCallback, useEffect, useMemo } from 'react'
 import Background from './components/Background'
 import StationRow from './components/StationRow'
+import MoodBar from './components/MoodBar'
 import NowPlaying from './components/NowPlaying'
 import StateCard from './components/StateCard'
 import { useStation } from './hooks/useStation'
@@ -105,6 +106,8 @@ export default function App() {
           regenerating={false}
           onRegenerate={onRegenerate}
         />
+
+        <MoodBar />
 
         <NowPlaying
           segment={active?.seg ?? null}
