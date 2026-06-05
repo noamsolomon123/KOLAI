@@ -45,7 +45,7 @@ def test_build_mashup_overlay_then_full():
     beats = [0.0, 0.5, 1.0]
     out = build_mashup(voc, inst, full, bpm, bpm, beats, bars=8)
     window_n = int(8 * 4 * 60 / bpm * SR)
-    assert abs(float(np.mean(out[: window_n])) - 0.5) < 0.05
+    assert abs(float(np.mean(out[: window_n])) - 0.44) < 0.05
     assert abs(float(np.mean(out[window_n + SR: window_n + 2 * SR])) - 0.7) < 0.05
     assert abs(len(out) - SR * 30) < SR * 0.2
     assert float(np.max(np.abs(out))) <= 1.0001
@@ -90,3 +90,39 @@ def test_build_mashup_picks_loud_middle_not_tail():
     full = np.zeros(SR * 60, dtype=np.float32)
     out = build_mashup(voc, inst, full, bpm, bpm, [0.0], bars=8)
     assert float(np.mean(np.abs(out[:window_n]))) > 0.3   # must find the loud MIDDLE
+
+
+def test_vocal_forward_gains_boosts_quiet_vocal():
+    from radioai.mashup import _vocal_forward_gains
+    rng = np.random.default_rng(0)
+    bed = (rng.standard_normal(40000).astype(np.float32)) * 0.3
+    acap = (rng.standard_normal(40000).astype(np.float32)) * 0.12
+    bg, ag = _vocal_forward_gains(bed, acap)
+    br = float(np.sqrt(np.mean(bed ** 2)))
+    ar = float(np.sqrt(np.mean(acap ** 2)))
+    assert ar * ag > br * bg          # vocal ends up on top of the bed
+
+
+def test_vocal_forward_gains_silent_bed_keeps_vocal():
+    from radioai.mashup import _vocal_forward_gains
+    bed = np.zeros(2000, dtype=np.float32)
+    acap = np.full(2000, 0.2, dtype=np.float32)
+    bg, ag = _vocal_forward_gains(bed, acap)
+    assert ag == 1.0                  # nothing to compete with -> no boost
+
+
+def test_same_recording_true_for_identical():
+    from radioai.mashup import same_recording
+    from radioai.mixrenderer import SR
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal(SR * 30).astype(np.float32) * 0.3
+    assert same_recording(x, x.copy()) is True
+
+
+def test_same_recording_false_for_different():
+    from radioai.mashup import same_recording
+    from radioai.mixrenderer import SR
+    rng = np.random.default_rng(2)
+    a = rng.standard_normal(SR * 30).astype(np.float32) * 0.3
+    b = rng.standard_normal(SR * 30).astype(np.float32) * 0.3
+    assert same_recording(a, b) is False

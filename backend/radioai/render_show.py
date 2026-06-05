@@ -16,7 +16,7 @@ from radioai.taste import TasteService
 from radioai.setlist import SetlistPlanner
 from radioai.djcontext import DJContext
 from radioai.stems import StemSeparator
-from radioai.mashup import mashup_gate, build_mashup
+from radioai.mashup import mashup_gate, build_mashup, same_recording
 from radioai.showmeta import build_segments, write_show_json
 
 # Pro radio-host delivery direction handed to the TTS for every DJ line.
@@ -107,7 +107,7 @@ def main() -> None:
     talk = []
     for i in range(1, len(tracks)):
         boundary = round(len(timeline) / mx.SR, 2)
-        prev_song, prev_an, _, prev_path = tracks[i - 1]
+        prev_song, prev_an, prev_audio, prev_path = tracks[i - 1]
         song, an, audio, song_path = tracks[i]
         has_dj = (i % 2 == 1)  # witty talkover every ~2 songs
         t = choose_transition(prev_an, an, has_dj=has_dj)
@@ -135,7 +135,7 @@ def main() -> None:
             timeline = mx.equal_power_crossfade(timeline, audio, overlap_s=_SEGUE_S)
         elif t.type == "beatmatch":
             did_mashup = False
-            if cfg.mashups_enabled and mashup_gate(prev_an, an):
+            if cfg.mashups_enabled and mashup_gate(prev_an, an) and not same_recording(prev_audio, audio):
                 try:
                     print(f"    [mashup] {prev_song.title} x {song.title} (separating stems...)")
                     pv, _pi = separator.separate(prev_path)     # outgoing vocals

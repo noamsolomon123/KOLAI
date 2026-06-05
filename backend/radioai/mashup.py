@@ -29,6 +29,44 @@ def _peak_vocal_start(vocals, window_n, sr: int = SR) -> int:
     return best_i
 
 
+_BED_DUCK = 0.7          # incoming instrumental sits slightly back...
+_VOCAL_TARGET = 1.4      # ...so the outgoing vocal is ~1.4x the bed
+_MAX_VOCAL_BOOST = 4.0
+
+
+def _vocal_forward_gains(bed, acap):
+    """Gains so the acapella sits clearly on top of the (ducked) bed."""
+    def _rms(x):
+        return float(np.sqrt(np.mean(x ** 2))) if len(x) else 0.0
+    br, ar = _rms(bed), _rms(acap)
+    if ar <= 1e-6:
+        return _BED_DUCK, 1.0
+    acap_gain = min(_MAX_VOCAL_BOOST,
+                    max(1.0, (_VOCAL_TARGET * br * _BED_DUCK) / ar))
+    return _BED_DUCK, acap_gain
+
+
+def same_recording(a, b, sr: int = SR, dur_s: float = 20.0,
+                   threshold: float = 0.95) -> bool:
+    """True when a and b are the same underlying recording."""
+    n = int(dur_s * sr)
+
+    def _mid(x):
+        if len(x) <= n:
+            return x
+        s = (len(x) - n) // 2
+        return x[s:s + n]
+
+    a2, b2 = _mid(a), _mid(b)
+    m = min(len(a2), len(b2))
+    if m < sr:
+        return False
+    a2, b2 = a2[:m], b2[:m]
+    if float(np.std(a2)) < 1e-6 or float(np.std(b2)) < 1e-6:
+        return False
+    return float(np.corrcoef(a2, b2)[0, 1]) >= threshold
+
+
 def build_mashup(prev_vocals, nxt_instrumental, nxt_full, prev_bpm, nxt_bpm,
                  nxt_beats, bars: int = 8, sr: int = SR):
     """Acapella-over-next: outgoing vocal (tempo-matched) over the incoming
@@ -54,6 +92,11 @@ def build_mashup(prev_vocals, nxt_instrumental, nxt_full, prev_bpm, nxt_bpm,
     if n == 0:
         raise ValueError("mashup window empty")
 
-    seg1 = np.clip(bed[:n] + acap[:n], -1.0, 1.0).astype(np.float32)
+    bg, ag = _vocal_forward_gains(bed[:n], acap[:n])
+    mixed = bed[:n] * bg + acap[:n] * ag
+    peak = float(np.max(np.abs(mixed))) if n else 0.0
+    if peak > 0.98:
+        mixed = mixed * (0.98 / peak)
+    seg1 = mixed.astype(np.float32)
     seg2 = full[n:]
     return np.concatenate([seg1, seg2]).astype(np.float32)
