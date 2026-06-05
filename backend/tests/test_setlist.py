@@ -98,3 +98,89 @@ def test_plan_without_new_args_still_works():
     songs = SetlistPlanner(client=FakeLLM()).plan(taste, n=2)
     assert len(songs) == 2
 
+# === SMART PLANNER TESTS (appended) ===
+from radioai.setlist import SetlistPlanner as _SP
+
+
+class _RecordingLLM:
+    """Records prompts; returns canned outputs in order (last one repeats)."""
+
+    def __init__(self, outputs):
+        if isinstance(outputs, str):
+            outputs = [outputs]
+        self._outputs = list(outputs)
+        self.prompts = []
+
+    def complete(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        idx = min(len(self.prompts) - 1, len(self._outputs) - 1)
+        return self._outputs[idx]
+
+
+_DRAFT = '[{"title": "Tel Aviv", "artist": "Omer Adam"}, {"title": "Million Dollar", "artist": "Noa Kirel"}]'
+_REFINED = '[{"title": "Yalla", "artist": "Static & Ben El"}, {"title": "Tudo Bom", "artist": "Static & Ben El"}]'
+
+
+def test_prompt_mentions_energy_arc_and_flow_craft():
+    llm = _RecordingLLM([_DRAFT, _REFINED])
+    songs = _SP(client=llm).plan(_TASTE, n=2)
+    assert songs
+    p = llm.prompts[0].lower()
+    assert "energy" in p and "arc" in p
+    assert "camelot" in p or "harmonic" in p
+    assert "bpm" in p or "tempo" in p
+    assert "key" in p
+    assert "hebrew" in p
+    assert "international" in p or "english" in p
+    assert "discover" in p or "deep cut" in p or "related" in p
+    assert "favorite" in p or "familiar" in p
+    assert "remix" in p or "live" in p or "sped" in p or "version" in p
+    assert "real" in p
+    assert "era" in p or "mood" in p
+
+
+def test_plan_runs_generate_then_critique_refine_two_calls():
+    llm = _RecordingLLM([_DRAFT, _REFINED])
+    songs = _SP(client=llm).plan(_TASTE, n=2)
+    assert len(llm.prompts) == 2
+    crit = llm.prompts[1].lower()
+    assert "critique" in crit or "refine" in crit or "review" in crit
+    assert "Tel Aviv" in llm.prompts[1]
+    assert [(s.title, s.artist) for s in songs] == [
+        ("Yalla", "Static & Ben El"), ("Tudo Bom", "Static & Ben El")]
+
+
+def test_plan_falls_back_to_draft_when_refine_is_garbage():
+    llm = _RecordingLLM([_DRAFT, "totally not json, the model rambled"])
+    songs = _SP(client=llm).plan(_TASTE, n=2)
+    assert len(llm.prompts) == 2
+    assert [(s.title, s.artist) for s in songs] == [
+        ("Tel Aviv", "Omer Adam"), ("Million Dollar", "Noa Kirel")]
+
+
+def test_plan_falls_back_to_draft_when_refine_is_empty_array():
+    llm = _RecordingLLM([_DRAFT, "[]"])
+    songs = _SP(client=llm).plan(_TASTE, n=2)
+    assert [(s.title, s.artist) for s in songs] == [
+        ("Tel Aviv", "Omer Adam"), ("Million Dollar", "Noa Kirel")]
+
+
+def test_plan_can_disable_refine_pass():
+    llm = _RecordingLLM([_DRAFT, _REFINED])
+    songs = _SP(client=llm).plan(_TASTE, n=2, refine=False)
+    assert len(llm.prompts) == 1
+    assert [(s.title, s.artist) for s in songs] == [
+        ("Tel Aviv", "Omer Adam"), ("Million Dollar", "Noa Kirel")]
+
+
+def test_refine_prompt_carries_exclude_and_seed_constraints():
+    from radioai.models import Song as _Song
+    excl = "Old Hit — Past Artist"
+    llm = _RecordingLLM([_DRAFT, _REFINED])
+    _SP(client=llm).plan(
+        _TASTE, n=2,
+        exclude=[excl],
+        seed=_Song(title="Seed Song", artist="Seed Artist"))
+    for p in llm.prompts:
+        assert excl in p
+        assert "Seed Song" in p
