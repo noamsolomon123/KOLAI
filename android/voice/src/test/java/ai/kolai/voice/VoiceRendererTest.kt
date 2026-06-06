@@ -1,0 +1,100 @@
+package ai.kolai.voice
+
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.headersOf
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.util.Base64
+
+/**
+ * Pure-JVM tests for [VoiceRenderer] — no network. A FAKE synth is built from a
+ * MockEngine that always returns a known WAV (Wav.pcmToWav(knownPcm, 24000)) and
+ * counts how many times it was hit, so we can assert the sha1 cache-hit path.
+ */
+class VoiceRendererTest {
+
+    @get:Rule
+    val tmp = TemporaryFolder()
+
+    private val jsonHeaders = headersOf(HttpHeaders.ContentType, "application/json")
+
+    // 24000 samples of 16-bit mono PCM == 48000 bytes == exactly 1.0 s @ 24 kHz.
+    private val knownPcm = ByteArray(48000) { (it and 0x7F).toByte() }
+
+    private fun audioBody(pcm: ByteArray): String {
+        val b64 = Base64.getEncoder().encodeToString(pcm)
+        return """{"candidates":[{"content":{"parts":[{"inlineData":{"data":"$b64"}}]}}]}"""
+    }
+
+    /** A synth whose underlying HTTP engine records every call (to detect caching). */
+    private fun fakeSynth(callCount: IntArray): GeminiTtsSynth {
+        val engine = MockEngine {
+            callCount[0]++
+            respond(content = audioBody(knownPcm), status = HttpStatusCode.OK, headers = jsonHeaders)
+        }
+        return GeminiTtsSynth(
+            apiKeys = listOf("KEY_A"),
+            model = "gemini-tts",
+            voice = "Algieba",
+            httpClient = HttpClient(engine),
+        )
+    }
+
+    @Test
+    fun render_writes_wav_and_returns_djslot_with_correct_path_and_duration() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "שלום עולם"
+
+        val slot = renderer.render(text)
+
+        // file written under outDir with the dj_<sha1[:16]>.wav name
+        val written = java.io.File(slot.audioPath)
+        assertTrue("file exists", written.exists())
+        assertEquals(tmp.root.absolutePath, written.parentFile!!.absolutePath)
+        assertTrue("dj_ prefix", written.name.startsWith("dj_"))
+        assertTrue(".wav suffix", written.name.endsWith(".wav"))
+        // sha1 hex is 40 chars -> name is "dj_" + 16 + ".wav" = 23 chars
+        assertEquals("dj_".length + 16 + ".wav".length, written.name.length)
+
+        // slot text preserved (Hebrew round-trip)
+        assertEquals(text, slot.text)
+
+        // duration matches the known PCM: 48000 bytes / (24000*1*2) = 1.0 s
+        assertEquals(1.0, slot.durationS, 1e-9)
+
+        // a valid RIFF/WAVE on disk: 44-byte header + 48000 PCM bytes
+        val bytes = written.readBytes()
+        assertEquals("RIFF", String(bytes, 0, 4, Charsets.US_ASCII))
+        assertEquals(44 + knownPcm.size, bytes.size)
+    }
+
+    @Test
+    fun render_is_cached_by_sha1_and_does_not_resynth() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "אותו טקסט בדיוק"
+
+        val first = renderer.render(text)
+        val second = renderer.render(text)
+
+        assertEquals("same cached path", first.audioPath, second.audioPath)
+        assertEquals("same duration", first.durationS, second.durationS, 1e-9)
+        // synth (HTTP engine) hit exactly once across two renders -> cache hit
+        assertEquals("synth called only once", 1, calls[0])
+    }
+
+    @Test
+    fun wavDurationSeconds_parses_known_pcm() {
+        val wav = pcmToWav(knownPcm, 24000)
+        assertEquals(1.0, wavDurationSeconds(wav), 1e-9)
+    }
+}

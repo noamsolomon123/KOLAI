@@ -10,6 +10,9 @@ android {
     defaultConfig {
         minSdk = 31
 
+        // On-device androidTest (GeminiTtsDeviceTest): real Gemini TTS call.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -26,6 +29,9 @@ android {
 }
 
 dependencies {
+    // VoiceRenderer returns ai.kolai.core.DJSlot.
+    implementation(project(":core"))
+
     // Task 1.3 (:voice half): raw Gemini REST via Ktor + kotlinx-serialization-json
     // RUNTIME ONLY (tree navigation, no @Serializable / no serialization compiler plugin).
     // Literal versions on purpose: do NOT touch the shared gradle/libs.versions.toml
@@ -38,4 +44,10 @@ dependencies {
     testImplementation("io.ktor:ktor-client-mock:3.0.3")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("junit:junit:4.13.2")
+
+    // On-device androidTest plumbing for GeminiTtsDeviceTest (real Gemini TTS call).
+    // Literal versions on purpose: do NOT touch gradle/libs.versions.toml.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 }
