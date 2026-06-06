@@ -49,4 +49,9 @@ dependencies {
     // NOT touch gradle/libs.versions.toml (parallel-module-safe).
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+
+    // Task 2.3: the on-device AudioDecoder round-trip test synths PCM, encodes it
+    // with ai.kolai.mix.AacEncoder, then decodes+analyzes it. Pulls :mix onto the
+    // androidTest classpath only (no main-code dependency on :mix).
+    androidTestImplementation(project(":mix"))
 }
