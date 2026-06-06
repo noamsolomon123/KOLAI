@@ -16,19 +16,55 @@ import kotlinx.serialization.json.put
  * Ported 1:1 from backend/radioai/setlist.py class SetlistPlanner. All prompt
  * text (taste/constraints/craft-rules/shape) is verbatim from the Python
  * because the curation quality depends on the exact wording.
+ *
+ * VARIETY (Android addition, not in the Python): the listener's seeded taste
+ * does not change between launches, so a deterministic prompt made Gemini
+ * return the same favourites every cold start (the station always opened with
+ * the same track). To break that without abandoning the taste, each [plan]
+ * call injects per-call variety: the taste top-tracks/top-artists shown to the
+ * LLM are SHUFFLED (re-framed) and a random "Variety seed" nonce + directive
+ * is added, asking for a fresh selection (especially a different opener) while
+ * staying true to the taste. The [rng] is constructor-injected so production
+ * gets real randomness ([kotlin.random.Random.Default]) and tests can pass a
+ * seeded [kotlin.random.Random] for a deterministic, reproducible prompt.
+ *
+ * TODO post-MVP: persist no-repeat history across launches -- a cross-launch
+ * played-songs log on disk fed into the exclude list would further guarantee
+ * variety beyond the in-prompt nonce/shuffle. Not implemented for the MVP.
  */
-class SetlistPlanner(private val client: LlmClient) {
+class SetlistPlanner(
+    private val client: LlmClient,
+    private val rng: kotlin.random.Random = kotlin.random.Random.Default,
+) {
 
     /** em dash used in "Title - Artist" lines (Python _EM). */
     private val em = "—"
 
+    /**
+     * Render the taste block with the top-tracks and top-artists SHUFFLED via
+     * [rng]. The SET of tracks/artists shown is unchanged -- only their ORDER
+     * differs run-to-run -- so the LLM stays grounded in the same taste while
+     * the input framing varies each call.
+     */
     private fun tasteBlock(taste: TasteProfile): String {
-        val tracks = taste.topTracks.joinToString("\n") { t ->
+        val tracks = taste.topTracks.shuffled(rng).joinToString("\n") { t ->
             "- \"${t.title}\" $em ${t.artist}"
         }
-        val artists = taste.topArtists.joinToString(", ")
+        val artists = taste.topArtists.shuffled(rng).joinToString(", ")
         return "Top tracks:\n$tracks\n\nTop artists: $artists\n"
     }
+
+    /**
+     * Per-call variety directive grounded by a random [nonce]. Pushes the LLM
+     * off its default favourites -- especially the opening song -- so repeated
+     * cold starts produce genuinely different sets, while explicitly keeping
+     * the selection true to the listener's taste.
+     */
+    private fun varietyBlock(nonce: Int): String =
+        "\nVariety seed: $nonce. Produce a FRESH, different selection than your " +
+            "default for this listener - especially vary the OPENING song; do " +
+            "NOT always start with the same track across sets. Still stay true " +
+            "to the listener's taste above.\n"
 
     /**
      * MVP: mood vibe injection is DEFERRED (the moods table from Python
@@ -104,10 +140,12 @@ class SetlistPlanner(private val client: LlmClient) {
         exclude: List<String>?,
         seed: Song?,
         mood: String?,
+        nonce: Int,
     ): String =
         "You are a radio music director building a personal station for one " +
             "listener. Here is their recent taste.\n\n" +
             tasteBlock(taste) +
+            varietyBlock(nonce) +
             constraintsBlock(exclude = exclude, seed = seed) +
             moodBlock(mood) + "\n" +
             craftRules(n) +
@@ -120,10 +158,12 @@ class SetlistPlanner(private val client: LlmClient) {
         exclude: List<String>?,
         seed: Song?,
         mood: String?,
+        nonce: Int,
     ): String =
         "You are a meticulous radio music director doing QUALITY CONTROL on " +
             "a draft setlist before it goes on air. CRITIQUE then REFINE it.\n\n" +
             tasteBlock(taste) +
+            varietyBlock(nonce) +
             constraintsBlock(exclude = exclude, seed = seed) +
             moodBlock(mood) + "\n" +
             "Here is the DRAFT setlist to review:\n" +
@@ -144,6 +184,12 @@ class SetlistPlanner(private val client: LlmClient) {
      * pass; set [refine] = false to skip it. Always falls back to the first
      * draft if the refine pass fails or yields nothing usable. Mirrors Python
      * SetlistPlanner.plan.
+     *
+     * Per-call variety: a single random [rng] nonce is drawn for this call and
+     * shared by the draft and refine prompts (so both passes agree on the same
+     * variety framing), and [tasteBlock] re-shuffles the taste each time it is
+     * rendered. With [kotlin.random.Random.Default] (production) this makes
+     * repeated launches diverge; with a seeded [rng] (tests) it is reproducible.
      */
     suspend fun plan(
         taste: TasteProfile,
@@ -153,8 +199,9 @@ class SetlistPlanner(private val client: LlmClient) {
         refine: Boolean = true,
         mood: String? = null,
     ): List<Song> {
+        val nonce = rng.nextInt(0, Int.MAX_VALUE)
         val draftText = client.complete(
-            prompt(taste, n, exclude = exclude, seed = seed, mood = mood),
+            prompt(taste, n, exclude = exclude, seed = seed, mood = mood, nonce = nonce),
         )
         val draft = parseSetlist(draftText, taste, n)
         if (!refine) return draft
@@ -174,7 +221,10 @@ class SetlistPlanner(private val client: LlmClient) {
 
         try {
             val refinedText = client.complete(
-                refinePrompt(taste, n, draftJson, exclude = exclude, seed = seed, mood = mood),
+                refinePrompt(
+                    taste, n, draftJson,
+                    exclude = exclude, seed = seed, mood = mood, nonce = nonce,
+                ),
             )
             val refined = parseSetlist(refinedText, taste, n)
             if (refined.isNotEmpty()) return refined
