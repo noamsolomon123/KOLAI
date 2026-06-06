@@ -10,6 +10,9 @@ android {
     defaultConfig {
         minSdk = 31
 
+        // Task 2.2: on-device NewPipe search+download spike runs via androidTest.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -28,8 +31,24 @@ android {
 dependencies {
     implementation(project(":core"))
 
+    // Task 2.2: on-device YouTube search + audio-stream resolution. Published via
+    // JitPack (see settings.gradle.kts). Literal version on purpose: do NOT touch
+    // the shared gradle/libs.versions.toml (parallel-module-safe).
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.2")
+
+    // OkHttp backs the NewPipe Downloader and the stream download to cache.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     // Task 2.1: pure-JVM unit tests for the ported candidate-scoring logic.
     // Literal version on purpose: do NOT touch the shared gradle/libs.versions.toml
     // (avoids conflicts with parallel module work).
     testImplementation("junit:junit:4.13.2")
+
+    // Task 2.2: instrumented (androidTest) device test exercises real
+    // search -> download, then decodes the result to PROVE it is real audio.
+    // Literal versions on purpose: do NOT touch gradle/libs.versions.toml.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    // :analyze provides AudioDecoder.decodeToPcm to validate the download.
+    androidTestImplementation(project(":analyze"))
 }

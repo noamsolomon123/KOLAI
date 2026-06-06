@@ -11,6 +11,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // NewPipeExtractor (Task 0.4 / 2.2 download spike) is published via JitPack.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

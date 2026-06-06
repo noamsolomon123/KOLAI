@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Task 2.2 spike: the on-device test performs real YouTube search + audio
+      download over the phone's own network, so the test APK needs INTERNET.
+      Scoped to the androidTest source set: the production :app module declares
+      its own INTERNET permission; the :acquire library main manifest stays clean.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      The 2026 PO-token wall forces us onto the muxed 360p mp4 fallback, so the
+      decoded full-length track is a large FloatArray (a ~4 min song is ~10M
+      samples ~= 40 MB, and AudioDecoder's growth buffer transiently doubles).
+      largeHeap lets the instrumented decode of a full song fit in memory.
+    -->
+    <application android:largeHeap="true" />
+
+</manifest>
