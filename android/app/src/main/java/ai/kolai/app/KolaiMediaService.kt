@@ -51,13 +51,22 @@ import java.io.File
  *  - Playback is LOCAL files, so nothing streams at playback time -- only the
  *    render is networked, and that runs ahead of playback.
  *
- * Foreground lifecycle: a MediaSessionService normally only becomes foreground
- * once the player starts playing. KOLAI's FIRST block cold-renders for ~1.5-2
- * min with NO playback yet, so we explicitly startForeground() with a "tuning in"
- * notification the moment the service starts -- otherwise Android kills the
- * (still-background) process as soon as the activity is backgrounded (e.g. by the
- * notification-permission dialog). Once Media3 starts real playback it manages
- * the media notification itself; we keep a low-priority placeholder during tuning.
+ * COLD-START LIFECYCLE (the crux):
+ *  - KOLAI's FIRST block cold-renders for several minutes with NO playback yet.
+ *    During that window the ExoPlayer playlist is EMPTY and the player stays
+ *    IDLE. We NEVER call prepare()/play()/playWhenReady on the empty player --
+ *    doing so makes ExoPlayer jump straight to STATE_ENDED, which makes the
+ *    MediaSessionService look "done", drops its foreground/playing status, and
+ *    lets the OS tear the service down mid-render (cancelling the render scope),
+ *    so block 0 never finishes -> infinite "tuning". Instead we hold our OWN
+ *    foreground notification ("connecting to the station") via startForeground()
+ *    from onCreate, independent of player state, so the process survives the full
+ *    cold render. ONLY when block 0 is actually added do we prepare()+play(),
+ *    honoring the user's remembered "tap Listen" intent.
+ *  - The render-ahead loop runs on [serviceScope] (SupervisorJob + Default),
+ *    created in onCreate and cancelled ONLY in onDestroy, so it survives player
+ *    state changes. We do NOT reset()/wipe the blocks dir on onCreate, so a
+ *    genuine restart resumes from existing block files instead of re-rendering.
  */
 class KolaiMediaService : MediaSessionService() {
 
@@ -67,6 +76,8 @@ class KolaiMediaService : MediaSessionService() {
     private lateinit var engine: KolaiEngine
     private lateinit var stationEngine: StationEngine
 
+    // Service-owned scope: survives player state changes; cancelled ONLY in
+    // onDestroy. The render-ahead loop and feed loop run here.
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var feedJob: Job? = null
 
@@ -100,15 +111,20 @@ class KolaiMediaService : MediaSessionService() {
         }
         mediaSession = builder.build()
 
-        // Promote to foreground IMMEDIATELY so the process survives the cold
-        // render even if the activity is backgrounded (permission dialog etc.).
+        // Promote to foreground IMMEDIATELY so the process survives the entire
+        // cold render even though nothing is playing yet (player stays IDLE until
+        // block 0 lands). This is what keeps the OS/Media3 from killing us.
         promoteToForeground("מתחבר לתחנה…")
 
         buildEngine()
         startFeedLoop()
     }
 
-    /** START_STICKY so the OS restarts the service if it is ever reclaimed. */
+    /**
+     * START_STICKY so the OS restarts the service if it is ever reclaimed. We
+     * re-assert our foreground notification on every start command. We do NOT
+     * wipe blocks here, so a restart resumes from already-rendered block files.
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         promoteToForeground(currentNotifText())
@@ -192,6 +208,8 @@ class KolaiMediaService : MediaSessionService() {
                 blocksDir = blocksDir.absolutePath,
                 scope = serviceScope,
             )
+            // NOTE: deliberately NO reset() here -- a restart resumes from any
+            // block files already on disk instead of re-rendering from zero.
             stationEngine.start()
             Log.i(TAG, "engine built; blocksDir=${blocksDir.absolutePath}")
         } catch (e: Throwable) {
@@ -203,6 +221,8 @@ class KolaiMediaService : MediaSessionService() {
     /**
      * Feed loop: keep the player playlist fed from the engine, staying
      * ~bufferAhead items ahead of the current item so the next block is buffered.
+     * The player is left IDLE/empty until block 0 is actually ready; only then do
+     * we prepare()+play() (see the COLD-START LIFECYCLE note above).
      */
     private fun startFeedLoop() {
         feedJob = serviceScope.launch {
@@ -227,7 +247,19 @@ class KolaiMediaService : MediaSessionService() {
 
                     runOnPlayer {
                         player.addMediaItem(item)
-                        if (player.playbackState == Player.STATE_IDLE) {
+                        if (idx == 0) {
+                            // Block 0 just landed after the long cold render. The
+                            // player has been IDLE/empty until now; ONLY NOW (with
+                            // a real item present) do we prepare + start, applying
+                            // the user's remembered "tap Listen" intent. We never
+                            // drive an empty player, which would jump to STATE_ENDED
+                            // and let the service be torn down mid-render.
+                            player.prepare()
+                            player.playWhenReady = true
+                            player.play()
+                            Log.i(TAG, "block 0 added -> prepare()+play() (honoring tap)")
+                        } else if (player.playbackState == Player.STATE_IDLE) {
+                            // Defensive: never force play on a later block.
                             player.prepare()
                         }
                     }

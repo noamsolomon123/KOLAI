@@ -68,9 +68,12 @@ import com.google.common.util.concurrent.MoreExecutors
  *    transport that glows while playing.
  *
  * On the first tap it starts + binds the [KolaiMediaService] via a
- * [MediaController]. The engine begins rendering block 0 immediately; playback
- * is gated on the user's tap (mobile autoplay rules) and begins once block 0 is
- * ready. State comes from [KolaiState].
+ * [MediaController]. The engine begins rendering block 0 immediately. Playback is
+ * NOT pushed from here against an (empty) player during the cold render -- that
+ * would drive ExoPlayer to STATE_ENDED and let the service be killed mid-render.
+ * Instead the service itself remembers the tap and starts playback the moment
+ * block 0 lands. We only call play()/pause() on the controller once real items
+ * exist (resume-from-pause). State comes from [KolaiState].
  *
  * Debug: launching with `--ez auto_start true` auto-taps Listen (used by adb to
  * verify play + advance with no human).
@@ -118,15 +121,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** First tap: start the service, bind a controller, and play once ready. */
+    /**
+     * First tap: start the foreground service (it begins rendering block 0 and
+     * will auto-start playback when block 0 lands) and bind a controller for
+     * media controls + transport. We do NOT push play()/playWhenReady against the
+     * empty player during the cold render -- that is the cold-start bug. We only
+     * call play() when the player already has items (resume from pause).
+     */
     private fun onListenTapped() {
         KolaiState.setTuning()
-        // Ensure the service is created (it starts rendering block 0 in onCreate).
+        // Ensure the service is created (it starts rendering block 0 in onCreate
+        // and remembers the tap by auto-playing block 0 once it is ready).
         val intent = Intent(this, KolaiMediaService::class.java)
         ContextCompat.startForegroundService(this, intent)
 
-        if (controller != null) {
-            controller?.play()
+        controller?.let { c ->
+            // Player already exists: if items are loaded, this is a resume; if it
+            // is still empty (cold render in progress), do NOT call play() -- the
+            // service will start block 0 itself.
+            if (c.mediaItemCount > 0) c.play()
             return
         }
         if (controllerFuture != null) return // bind in progress
@@ -139,16 +152,19 @@ class MainActivity : ComponentActivity() {
                 Log.e(TAG, "controller bind failed", e); KolaiState.setError("bind failed: ${e.message}"); return@addListener
             }
             controller = c
-            // playWhenReady so playback starts the moment block 0 is buffered.
-            c.playWhenReady = true
-            c.play()
-            Log.i(TAG, "controller bound; play() requested (playWhenReady=true)")
+            // Do NOT set playWhenReady / play() here: during the cold render the
+            // player is EMPTY, and play() on an empty player jumps to STATE_ENDED
+            // (which gets the service killed). The service starts block 0 itself.
+            // If the player already has items (controller bound to a live session),
+            // resume playback.
+            if (c.mediaItemCount > 0 && !c.isPlaying) c.play()
+            Log.i(TAG, "controller bound (items=${c.mediaItemCount}); service drives cold start")
         }, MoreExecutors.directExecutor())
     }
 
     private fun onPauseTapped() {
         controller?.let { c ->
-            if (c.isPlaying) c.pause() else c.play()
+            if (c.isPlaying) c.pause() else if (c.mediaItemCount > 0) c.play()
         }
     }
 
