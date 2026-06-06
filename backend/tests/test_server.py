@@ -44,6 +44,7 @@ def test_station_endpoints(tmp_path):
             self.advanced = []
             self.started = False
         def start(self): self.started = True
+        def reset(self): pass
         def advance(self, n): self.advanced.append(n)
         def get_block_meta(self, n): return self.meta
 
@@ -103,3 +104,82 @@ def test_station_settings(tmp_path):
     assert fake._renderer.talk_chance == 0.85
     assert fake._renderer.banter_chance == 0.40
     assert fake._renderer.max_silence == 2
+
+
+def test_station_moods_lists_presets(tmp_path):
+    class FakeEngine:
+        def start(self): pass
+        def advance(self, n): pass
+        def get_block_meta(self, n): return None
+
+    app = create_app(cache_dir=str(tmp_path), engine=FakeEngine())
+    c = TestClient(app)
+    r = c.get("/api/station/moods")
+    assert r.status_code == 200
+    moods = r.json()["moods"]
+    keys = [m["key"] for m in moods]
+    assert "party" in keys and "mix" in keys
+    for m in moods:
+        assert set(m.keys()) == {"key", "label", "emoji"}
+
+
+def test_station_mood_updates_planner_renderer_and_synth(tmp_path):
+    class FakeSynth:
+        _style = "old style"
+
+    class FakeVoice:
+        synth = FakeSynth()
+
+    class FakeRenderer:
+        talk_chance = 0.5
+        banter_chance = 0.2
+        max_silence = 4
+        voice = FakeVoice()
+
+    class FakePlanner:
+        mood = "mix"
+
+    class FakeEngine:
+        _renderer = FakeRenderer()
+        _planner = FakePlanner()
+        def start(self): pass
+        def advance(self, n): pass
+        def get_block_meta(self, n): return None
+
+    fake = FakeEngine()
+    app = create_app(cache_dir=str(tmp_path), engine=fake)
+    c = TestClient(app)
+
+    r = c.post("/api/station/mood", json={"mood": "party"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["mood"] == "party"
+    assert data["label"] == "מסיבה"
+    # renderer cadence reshaped to the party preset
+    assert fake._renderer.talk_chance == 0.7
+    assert fake._renderer.banter_chance == 0.4
+    assert fake._renderer.max_silence == 3
+    # planner carries the mood for future song selection
+    assert fake._planner.mood == "party"
+    # voice delivery restyled
+    assert "energy" in fake._renderer.voice.synth._style.lower()
+
+
+def test_station_mood_unknown_falls_back_to_default(tmp_path):
+    class FakePlanner:
+        mood = "mix"
+
+    class FakeEngine:
+        _planner = FakePlanner()
+        def start(self): pass
+        def advance(self, n): pass
+        def get_block_meta(self, n): return None
+
+    fake = FakeEngine()
+    app = create_app(cache_dir=str(tmp_path), engine=fake)
+    c = TestClient(app)
+    r = c.post("/api/station/mood", json={"mood": "does_not_exist"})
+    assert r.status_code == 200
+    # falls back to default preset label but keeps requested mood key on planner
+    assert r.json()["ok"] is True

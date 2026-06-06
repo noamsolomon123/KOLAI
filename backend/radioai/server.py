@@ -123,6 +123,7 @@ def create_app(cache_dir: str | None = None, engine=None) -> FastAPI:
     def station_start():
         eng = _engine()
         eng.start()
+        eng.reset()  # fresh, reshuffled queue on each app open/refresh
         return {"ok": True, "block": 0}
 
     @app.get("/api/station/block/{n}/meta")

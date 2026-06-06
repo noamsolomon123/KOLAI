@@ -6,7 +6,7 @@ class StationEngine:
     """Endless rolling block queue. Renders blocks strictly in order (continuity
     via a single rolling prev-track), keeps blocks [current .. current+buffer_ahead]
     ready, and PRUNES old block files + registry entries so it runs forever without
-    filling disk or RAM."""
+    filling disk or RAM. reset() restarts from a fresh, reshuffled queue."""
 
     def __init__(self, planner, block_renderer, *, songs_per_block=3,
                  buffer_ahead=2, keep_behind=2, blocks_dir="cache/blocks"):
@@ -19,6 +19,7 @@ class StationEngine:
         os.makedirs(blocks_dir, exist_ok=True)
         self._blocks = {}            # index -> {"meta": dict, "path": str}  (prunable)
         self._frontier = 0           # next index to render (monotonic; survives prune)
+        self._generation = 0         # bumped on reset(); discards in-flight renders
         self._prev_last_track = None # continuity: last_track of frontier-1
         self._prev_last_song = None  # continuity: last song of frontier-1 (planner seed)
         self._current = 0
@@ -33,12 +34,17 @@ class StationEngine:
             while True:
                 with self._lock:
                     i = self._frontier
+                    gen = self._generation
                 if i > target:
                     break
                 seed = self._prev_last_song
+                prev_track = self._prev_last_track
                 songs = self._planner.next_songs(self._songs_per_block, seed=seed)
-                res = self._renderer.render(songs, i, prev_track=self._prev_last_track)
+                res = self._renderer.render(songs, i, prev_track=prev_track)
                 with self._lock:
+                    if gen != self._generation:
+                        # reset() happened mid-render -> discard this stale block
+                        continue
                     self._blocks[i] = {"meta": res.meta, "path": res.path}
                     self._prev_last_track = res.last_track
                     self._prev_last_song = songs[-1] if songs else None
@@ -60,6 +66,33 @@ class StationEngine:
                 self._current = n
         self._wake.set()
         self._prune()
+
+    def reset(self):
+        """Restart from a fresh, reshuffled queue at block 0. Keeps the planner's
+        play-history so the new queue avoids recently-played songs (genuinely
+        different each refresh). Bumps the generation so any in-flight render is
+        discarded, and clears old block files + registry."""
+        with self._lock:
+            self._generation += 1
+            self._blocks = {}
+            self._frontier = 0
+            self._current = 0
+            self._prev_last_track = None
+            self._prev_last_song = None
+        self._delete_block_files()
+        self._wake.set()
+
+    def _delete_block_files(self):
+        try:
+            names = os.listdir(self._blocks_dir)
+        except OSError:
+            return
+        for f in names:
+            if f.startswith("block_") and f.endswith(".mp3"):
+                try:
+                    os.remove(os.path.join(self._blocks_dir, f))
+                except OSError:
+                    pass
 
     def _prune(self):
         """Delete block files + registry entries older than current-keep_behind."""

@@ -107,3 +107,19 @@ def test_frontier_advances_past_pruned(tmp_path):
     assert len(indices) == len(set(indices)), f"duplicate renders: {indices}"
     # block 4 was rendered
     assert 4 in indices
+
+
+def test_reset_starts_fresh_keeps_history(tmp_path):
+    eng = _engine(tmp_path)
+    eng.get_block_path(0)
+    eng.get_block_path(1)
+    first_songs = [c["songs"] for c in eng._renderer.calls]
+    eng.advance(1)
+    eng.reset()
+    assert eng.get_block_meta(0) is None      # registry cleared
+    assert eng.get_block_meta(1) is None
+    eng.get_block_path(0)                       # re-renders a fresh block 0
+    assert eng.get_block_meta(0) is not None
+    # fresh queue uses NEW songs (planner history preserved -> different picks)
+    new_block0 = eng._renderer.calls[-1]["songs"]
+    assert new_block0 != first_songs[0]
