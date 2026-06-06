@@ -10,6 +10,10 @@ android {
     defaultConfig {
         minSdk = 31
 
+        // Instrumented (androidTest) tests run on the connected device and load the
+        // real native :dsp lib (libkolaidsp.so, Essentia statically linked).
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -39,4 +43,10 @@ dependencies {
 
     // Pure-JVM unit tests; inject a fake analyzeJson seam (never the native lib).
     testImplementation("junit:junit:4.13.2")
+
+    // Instrumented (androidTest) tests: run on the device and exercise the REAL
+    // native lib via the default Analyzer seam. Literal versions on purpose: do
+    // NOT touch gradle/libs.versions.toml (parallel-module-safe).
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
