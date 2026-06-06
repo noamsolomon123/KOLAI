@@ -1,0 +1,139 @@
+package ai.kolai.app
+
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.unit.dp
+
+/**
+ * Lightweight liquid-glass primitives for KOLAI. Reproduces the web look
+ * (frontend/src/styles/global.css) using only translucency + gradient + thin
+ * border + soft shadow — NO real-time backdrop blur (the explicit perf rule).
+ */
+
+/**
+ * The living gradient-mesh background, ported from the web `.mesh`.
+ *
+ * The web draws 4 big blurred radial blobs (hsl from --hue-*) over a midnight
+ * canvas, blended like "screen", slowly drifting. To keep this 60fps-friendly
+ * and idle-cheap we:
+ *  - draw the blobs as static radial Brushes (drawBehind, no per-frame blur),
+ *  - animate only the HUE, SLOWLY, and only when the track changes
+ *    (animateFloatAsState with a multi-second tween) — not a continuous loop.
+ */
+@Composable
+fun MeshBackground(
+    palette: KolaiPalette,
+    modifier: Modifier = Modifier,
+) {
+    // Ease each hue toward the new track over ~2.4s. Idle = no animation frames.
+    val hueA by animateFloatAsState(palette.hueA, tween(2400), label = "hueA")
+    val hueB by animateFloatAsState(palette.hueB, tween(2400), label = "hueB")
+    val hueC by animateFloatAsState(palette.hueC, tween(2400), label = "hueC")
+
+    val a = hsl(hueA, 0.92f, 0.62f, 0.92f)
+    val b = hsl(hueB, 0.90f, 0.60f, 0.86f)
+    val c = hsl(hueC, 0.88f, 0.57f, 0.82f)
+    val a2 = hsl(hueA, 0.80f, 0.66f, 0.70f)
+
+    Box(
+        modifier
+            .fillMaxSize()
+            .background(KolaiColors.Bg)
+            .drawBehind {
+                val w = size.width
+                val h = size.height
+                // Big soft radial blobs (offscreen-ish centers, like the web's
+                // inset:-25% mesh) with generous radii -> the falloff reads as a
+                // soft blur without an actual blur pass.
+                drawRect(
+                    Brush.radialGradient(
+                        colors = listOf(a, Color.Transparent),
+                        center = Offset(w * -0.05f, h * 0.02f),
+                        radius = maxOf(w, h) * 0.95f,
+                    ),
+                )
+                drawRect(
+                    Brush.radialGradient(
+                        colors = listOf(b, Color.Transparent),
+                        center = Offset(w * 1.05f, h * 0.26f),
+                        radius = maxOf(w, h) * 0.85f,
+                    ),
+                )
+                drawRect(
+                    Brush.radialGradient(
+                        colors = listOf(c, Color.Transparent),
+                        center = Offset(w * 0.42f, h * 1.05f),
+                        radius = maxOf(w, h) * 0.85f,
+                    ),
+                )
+                drawRect(
+                    Brush.radialGradient(
+                        colors = listOf(a2, Color.Transparent),
+                        center = Offset(w * 0.92f, h * 0.96f),
+                        radius = maxOf(w, h) * 0.55f,
+                    ),
+                )
+                // vignette + top darkening (web .grain) for depth/legibility
+                drawRect(
+                    Brush.radialGradient(
+                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)),
+                        center = Offset(w * 0.5f, h * -0.05f),
+                        radius = maxOf(w, h) * 1.15f,
+                    ),
+                )
+                drawRect(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Black.copy(alpha = 0.28f), Color.Transparent),
+                        startY = 0f,
+                        endY = h * 0.26f,
+                    ),
+                )
+            },
+    )
+}
+
+/**
+ * Frosted-glass surface modifier — the web `.glass` primitive, cheaply.
+ * soft shadow + translucent fill + thin light border + a faint top specular
+ * highlight (drawn as a gradient, not a blur).
+ */
+fun Modifier.liquidGlass(
+    shape: Shape = RoundedCornerShape(KolaiRadii.LG.dp),
+    fill: Color = KolaiColors.Glass,
+    borderColor: Color = KolaiColors.GlassBorder,
+    shadowElevation: Int = 18,
+): Modifier = this
+    .shadow(shadowElevation.dp, shape, clip = false)
+    .clip(shape)
+    .background(
+        Brush.verticalGradient(
+            colors = listOf(fill, KolaiColors.Glass2),
+        ),
+    )
+    // top specular highlight sweep (web .glass::before), fades out by ~30%
+    .drawBehind {
+        drawRect(
+            Brush.verticalGradient(
+                colors = listOf(KolaiColors.Specular, Color.Transparent),
+                startY = 0f,
+                endY = size.height * 0.30f,
+            ),
+        )
+    }
+    .border(BorderStroke(1.dp, borderColor), shape)
