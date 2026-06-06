@@ -13,12 +13,14 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.net.toUri
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import ai.kolai.app.wiring.KolaiEngine
+import ai.kolai.station.BlockMeta
 import ai.kolai.station.RollingPlanner
 import ai.kolai.station.StationEngine
 import kotlinx.coroutines.CoroutineScope
@@ -31,6 +33,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * KOLAI playback service. A foreground [MediaSessionService] that owns ONE
@@ -38,51 +41,46 @@ import java.io.File
  * player's playlist so KOLAI plays back-to-back, gapless, with screen off / in
  * the car / from the lock screen.
  *
- * Architecture:
- *  - The engine (KolaiEngine.build) renders block_<n>.m4a files on a background
- *    coroutine. The "feed loop" pulls them in order (getBlockPath suspends until
- *    rendered) and appends each as a local-file MediaItem (mediaId = block index)
- *    on the player thread, staying ~bufferAhead ahead of the current item so the
- *    next block is always buffered for a gapless transition.
- *  - onMediaItemTransition -> parse the mediaId -> stationEngine.advance(index)
- *    (forward-only; triggers prune) -> remove now-stale played items from the
- *    player by mediaId (offset-safe: we look the index up by mediaId, never by a
- *    stored absolute position, so prune-shifting can't desync us).
- *  - Playback is LOCAL files, so nothing streams at playback time -- only the
- *    render is networked, and that runs ahead of playback.
+ * SEGMENT MODEL (the crux for now-playing + skip):
+ *  - Each ExoPlayer media item is a BLOCK (block_<n>.m4a) that stitches 2-3 songs
+ *    with crossfades + DJ talk. The block's [BlockMeta.segments] give each song's
+ *    startS/endS WITHIN the block; [BlockMeta.talk] gives each DJ talk span.
+ *  - "Current song" and "skip" are therefore about POSITION WITHIN THE BLOCK, not
+ *    the player's media-item index. A position poller maps
+ *    (currentBlockIndex, positionSec) -> active segment / active talk and
+ *    publishes the real current song + ON-AIR state to [KolaiState].
+ *  - Skip (prev/next, incl. lock-screen / car buttons) is handled by a
+ *    [SegmentSkipPlayer] ForwardingPlayer the MediaSession is built on: it seeks
+ *    between segments within the block and only crosses to an adjacent block at a
+ *    block boundary, mirroring the web onPrev/onNext.
  *
- * COLD-START LIFECYCLE (the crux):
- *  - KOLAI's FIRST block cold-renders for several minutes with NO playback yet.
- *    During that window the ExoPlayer playlist is EMPTY and the player stays
- *    IDLE. We NEVER call prepare()/play()/playWhenReady on the empty player --
- *    doing so makes ExoPlayer jump straight to STATE_ENDED, which makes the
- *    MediaSessionService look "done", drops its foreground/playing status, and
- *    lets the OS tear the service down mid-render (cancelling the render scope),
- *    so block 0 never finishes -> infinite "tuning". Instead we hold our OWN
- *    foreground notification ("connecting to the station") via startForeground()
- *    from onCreate, independent of player state, so the process survives the full
- *    cold render. ONLY when block 0 is actually added do we prepare()+play(),
- *    honoring the user's remembered "tap Listen" intent.
- *  - The render-ahead loop runs on [serviceScope] (SupervisorJob + Default),
- *    created in onCreate and cancelled ONLY in onDestroy, so it survives player
- *    state changes. We do NOT reset()/wipe the blocks dir on onCreate, so a
- *    genuine restart resumes from existing block files instead of re-rendering.
+ * COLD-START LIFECYCLE (unchanged, do not regress):
+ *  - The first block cold-renders for minutes with NO playback. The playlist is
+ *    EMPTY and the player stays IDLE. We NEVER prepare()/play() the empty player.
+ *    We hold our OWN foreground notification so the process survives, and only
+ *    prepare()+play() once block 0 is actually added.
  */
 class KolaiMediaService : MediaSessionService() {
 
     private lateinit var player: ExoPlayer
+    private lateinit var skipPlayer: SegmentSkipPlayer
     private var mediaSession: MediaSession? = null
 
     private lateinit var engine: KolaiEngine
     private lateinit var stationEngine: StationEngine
 
     // Service-owned scope: survives player state changes; cancelled ONLY in
-    // onDestroy. The render-ahead loop and feed loop run here.
+    // onDestroy. The render-ahead loop, feed loop, and position poller run here.
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var feedJob: Job? = null
+    private var posJob: Job? = null
 
     // Player ops must run on the player's application thread (main looper here).
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Block meta cache (index -> meta), populated off-thread and read by both the
+    // position poller and the segment-aware skip player. Thread-safe.
+    private val metaCache = ConcurrentHashMap<Int, BlockMeta>()
 
     @Volatile private var nextToAdd = 0
     @Volatile private var lastAdvanced = -1
@@ -96,6 +94,10 @@ class KolaiMediaService : MediaSessionService() {
 
         player = ExoPlayer.Builder(this).build()
         player.addListener(playerListener)
+        // Segment-aware skip wrapper. The MediaSession is built on THIS so the UI
+        // controller's seekToNext/Previous AND hardware/lock-screen NEXT/PREV all
+        // route through segment-aware logic.
+        skipPlayer = SegmentSkipPlayer(player)
 
         val sessionActivityPendingIntent = packageManager
             .getLaunchIntentForPackage(packageName)
@@ -105,7 +107,7 @@ class KolaiMediaService : MediaSessionService() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
                 )
             }
-        val builder = MediaSession.Builder(this, player)
+        val builder = MediaSession.Builder(this, skipPlayer)
         if (sessionActivityPendingIntent != null) {
             builder.setSessionActivity(sessionActivityPendingIntent)
         }
@@ -118,6 +120,7 @@ class KolaiMediaService : MediaSessionService() {
 
         buildEngine()
         startFeedLoop()
+        startPositionLoop()
     }
 
     /**
@@ -240,6 +243,10 @@ class KolaiMediaService : MediaSessionService() {
                     val path = withContext(Dispatchers.IO) { stationEngine.getBlockPath(idx) }
                     Log.i(TAG, "feed: block $idx ready -> $path")
 
+                    // Cache this block's meta so the poller + skip player can map
+                    // position -> segment synchronously.
+                    cacheMeta(idx)
+
                     val item = MediaItem.Builder()
                         .setMediaId(idx.toString())
                         .setUri(File(path).toUri())
@@ -251,9 +258,7 @@ class KolaiMediaService : MediaSessionService() {
                             // Block 0 just landed after the long cold render. The
                             // player has been IDLE/empty until now; ONLY NOW (with
                             // a real item present) do we prepare + start, applying
-                            // the user's remembered "tap Listen" intent. We never
-                            // drive an empty player, which would jump to STATE_ENDED
-                            // and let the service be torn down mid-render.
+                            // the user's remembered "tap Listen" intent.
                             player.prepare()
                             player.playWhenReady = true
                             player.play()
@@ -277,6 +282,59 @@ class KolaiMediaService : MediaSessionService() {
         }
     }
 
+    /**
+     * Position poller: while the player is playing, map the player's current
+     * position to the active segment + active talk of the CURRENT block and
+     * publish the real current song + ON-AIR state to [KolaiState]. Polls ~500ms
+     * while playing and idles (1s) while paused so it stays cheap.
+     */
+    private fun startPositionLoop() {
+        posJob = serviceScope.launch {
+            while (isActive) {
+                val playing = withContext(Dispatchers.Main) { player.isPlaying }
+                if (!playing) {
+                    delay(1000)
+                    continue
+                }
+                val (blockIndex, posSec) = withContext(Dispatchers.Main) {
+                    val id = player.currentMediaItem?.mediaId?.toIntOrNull() ?: -1
+                    id to (player.currentPosition / 1000.0)
+                }
+                if (blockIndex >= 0) {
+                    val meta = metaCache[blockIndex] ?: cacheMeta(blockIndex)
+                    if (meta != null) publishForPosition(meta, posSec)
+                }
+                delay(POLL_MS)
+            }
+        }
+    }
+
+    /** Find the active segment + talk for [posSec] and publish to the UI. */
+    private fun publishForPosition(meta: BlockMeta, posSec: Double) {
+        val seg = activeSegment(meta, posSec)
+        if (seg != null) {
+            KolaiState.setCurrentSong(seg.title, seg.artist.ifBlank { null })
+        }
+        val talk = meta.talk.firstOrNull { posSec >= it.startS && posSec < it.endS }
+        KolaiState.setDj(onAir = talk != null, beat = talk?.beat)
+    }
+
+    /** Segment whose [startS, endS) contains [posSec], clamped to first/last. */
+    private fun activeSegment(meta: BlockMeta, posSec: Double): ai.kolai.station.Segment? {
+        val segs = meta.segments
+        if (segs.isEmpty()) return null
+        for (s in segs) if (posSec >= s.startS && posSec < s.endS) return s
+        return if (posSec >= segs.last().endS) segs.last() else segs.first()
+    }
+
+    /** Fetch + cache a block's meta (idempotent). Returns the cached meta. */
+    private suspend fun cacheMeta(index: Int): BlockMeta? {
+        metaCache[index]?.let { return it }
+        val meta = try { stationEngine.getBlockMeta(index) } catch (e: Exception) { null }
+        if (meta != null) metaCache[index] = meta
+        return meta
+    }
+
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val idStr = mediaItem?.mediaId ?: return
@@ -289,6 +347,9 @@ class KolaiMediaService : MediaSessionService() {
                     stationEngine.advance(index)   // forward-only; triggers prune
                     Log.i(TAG, "advance($index) done")
                     prunePlayedItems(index)
+                    // drop stale metas below the keep window
+                    metaCache.keys.filter { it < index - KEEP_BEHIND }
+                        .forEach { metaCache.remove(it) }
                 }
             }
         }
@@ -325,16 +386,118 @@ class KolaiMediaService : MediaSessionService() {
         }
     }
 
+    /**
+     * Coarse now-playing update on a block transition: publish the FIRST segment
+     * of the block immediately (the position poller then refines it as playback
+     * crosses segment boundaries). Also refreshes the notification text.
+     */
     private fun updateNowPlaying(blockIndex: Int) {
         serviceScope.launch {
-            val meta = try { stationEngine.getBlockMeta(blockIndex) } catch (e: Exception) { null }
-            val title = meta?.segments?.firstOrNull()?.let { seg ->
-                if (seg.artist.isNotBlank()) "${seg.title} - ${seg.artist}" else seg.title
+            val meta = cacheMeta(blockIndex) ?: return@launch
+            val seg = meta.segments.firstOrNull() ?: return@launch
+            KolaiState.setCurrentSong(seg.title, seg.artist.ifBlank { null })
+            val text = if (seg.artist.isNotBlank()) "${seg.title} - ${seg.artist}" else seg.title
+            withContext(Dispatchers.Main) { promoteToForeground(text) }
+        }
+    }
+
+    // --- segment-aware skip ---------------------------------------------------
+
+    /**
+     * Wraps ExoPlayer so NEXT/PREV (UI controller, lock screen, car, headset)
+     * seek between SONG SEGMENTS within the current block, only crossing to an
+     * adjacent block at a boundary. Mirrors the web App.tsx onPrev/onNext.
+     */
+    private inner class SegmentSkipPlayer(player: Player) : ForwardingPlayer(player) {
+
+        override fun seekToNext() = doNext()
+        override fun seekToNextMediaItem() = doNext()
+        override fun seekToPrevious() = doPrev()
+        override fun seekToPreviousMediaItem() = doPrev()
+
+        // Advertise NEXT/PREV as always available so the session/UI enable them.
+        override fun getAvailableCommands(): Player.Commands =
+            super.getAvailableCommands().buildUpon()
+                .addAll(
+                    Player.COMMAND_SEEK_TO_NEXT,
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_PREVIOUS,
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                )
+                .build()
+
+        override fun isCommandAvailable(command: Int): Boolean = when (command) {
+            Player.COMMAND_SEEK_TO_NEXT,
+            Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+            Player.COMMAND_SEEK_TO_PREVIOUS,
+            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+            -> true
+            else -> super.isCommandAvailable(command)
+        }
+
+        private fun doNext() {
+            val blockIndex = currentMediaItem?.mediaId?.toIntOrNull() ?: return
+            val meta = metaCache[blockIndex]
+            val posSec = currentPosition / 1000.0
+            if (meta != null) {
+                val i = currentSegIndex(meta, posSec)
+                if (i >= 0 && i + 1 < meta.segments.size) {
+                    val next = meta.segments[i + 1]
+                    seekTo((next.startS * 1000).toLong())
+                    Log.i(TAG, "next -> segment ${i + 1} @ ${next.startS}s in block $blockIndex")
+                    return
+                }
             }
-            if (title != null) {
-                KolaiState.setNowPlaying(title)
-                withContext(Dispatchers.Main) { promoteToForeground(title) }
+            // last segment (or unknown meta): advance to the next block.
+            if (hasNextMediaItem()) {
+                seekToNextMediaItemRaw()
+                Log.i(TAG, "next -> next block")
             }
+        }
+
+        private fun doPrev() {
+            val blockIndex = currentMediaItem?.mediaId?.toIntOrNull() ?: return
+            val meta = metaCache[blockIndex]
+            val posSec = currentPosition / 1000.0
+            if (meta != null) {
+                val i = currentSegIndex(meta, posSec)
+                if (i >= 0) {
+                    val cur = meta.segments[i]
+                    // >3s into the song, or first segment -> restart current song.
+                    if (posSec - cur.startS > 3.0 || i == 0) {
+                        if (i == 0 && posSec - cur.startS <= 3.0 && hasPreviousMediaItem()) {
+                            // at the very start of the block's first song -> go to
+                            // the previous block.
+                            seekToPreviousMediaItemRaw()
+                            Log.i(TAG, "prev -> previous block")
+                            return
+                        }
+                        seekTo((cur.startS * 1000).toLong())
+                        Log.i(TAG, "prev -> restart segment $i @ ${cur.startS}s")
+                    } else {
+                        val prev = meta.segments[i - 1]
+                        seekTo((prev.startS * 1000).toLong())
+                        Log.i(TAG, "prev -> segment ${i - 1} @ ${prev.startS}s")
+                    }
+                    return
+                }
+            }
+            // unknown meta: restart current item.
+            seekTo(0)
+        }
+
+        // Use the wrapped player's real media-item seeks (not our overrides).
+        private fun seekToNextMediaItemRaw() = wrappedPlayer.seekToNextMediaItem()
+        private fun seekToPreviousMediaItemRaw() = wrappedPlayer.seekToPreviousMediaItem()
+
+        private fun currentSegIndex(meta: BlockMeta, posSec: Double): Int {
+            val segs = meta.segments
+            if (segs.isEmpty()) return -1
+            for (idx in segs.indices) {
+                val s = segs[idx]
+                if (posSec >= s.startS && posSec < s.endS) return idx
+            }
+            return if (posSec >= segs.last().endS) segs.size - 1 else 0
         }
     }
 
@@ -356,6 +519,7 @@ class KolaiMediaService : MediaSessionService() {
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
         feedJob?.cancel()
+        posJob?.cancel()
         try { stationEngine.stop() } catch (_: Exception) {}
         serviceScope.cancel()
         mediaSession?.run {
@@ -371,6 +535,7 @@ class KolaiMediaService : MediaSessionService() {
         private const val TAG = "KolaiService"
         private const val BUFFER_AHEAD = 2
         private const val KEEP_BEHIND = 2
+        private const val POLL_MS = 500L
         private const val CHANNEL_ID = "kolai_playback"
         private const val NOTIF_ID = 1001
     }

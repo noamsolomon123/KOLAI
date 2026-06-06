@@ -41,6 +41,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -99,8 +100,11 @@ class MainActivity : ComponentActivity() {
                     status = ui.status,
                     nowPlaying = ui.nowPlaying,
                     error = ui.error,
+                    dj = ui.dj,
                     onListen = ::onListenTapped,
                     onPause = ::onPauseTapped,
+                    onPrev = ::onPrevTapped,
+                    onNext = ::onNextTapped,
                 )
             }
         }
@@ -168,6 +172,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun onPrevTapped() { controller?.let { if (it.mediaItemCount > 0) it.seekToPrevious() } }
+    private fun onNextTapped() { controller?.let { if (it.mediaItemCount > 0) it.seekToNext() } }
+
     override fun onDestroy() {
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controllerFuture = null
@@ -200,6 +207,9 @@ fun KolaiScreen(
     error: String?,
     onListen: () -> Unit,
     onPause: () -> Unit,
+    dj: DjState = DjState(),
+    onPrev: () -> Unit = {},
+    onNext: () -> Unit = {},
 ) {
     val (title, artist) = splitNowPlaying(nowPlaying)
     // Hues follow the current track; fall back to the station name when idle.
@@ -236,6 +246,12 @@ fun KolaiScreen(
 
                 Spacer(Modifier.height(22.dp))
 
+                // DJ ON-AIR chip: shown only while a talk span is playing.
+                if (dj.onAir && status == StationStatus.PLAYING) {
+                    DjChip()
+                    Spacer(Modifier.height(14.dp))
+                }
+
                 AnimatedContent(
                     targetState = status to (title to artist),
                     transitionSpec = {
@@ -261,9 +277,37 @@ fun KolaiScreen(
                     status = status,
                     palette = palette,
                     onPrimary = if (playing) onPause else onListen,
+                    onPrev = onPrev,
+                    onNext = onNext,
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun DjChip() {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(KolaiRadii.PILL.dp))
+            .background(KolaiColors.LiveTint)
+            .border(1.dp, KolaiColors.LiveBorder, RoundedCornerShape(KolaiRadii.PILL.dp))
+            .padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(KolaiColors.Live),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "משדר עכשיו", // "on air"
+            color = KolaiColors.LiveText,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
     }
 }
 
@@ -388,6 +432,8 @@ private fun TransportRow(
     status: StationStatus,
     palette: KolaiPalette,
     onPrimary: () -> Unit,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
 ) {
     val playing = status == StationStatus.PLAYING
     val busy = status == StationStatus.TUNING || status == StationStatus.READY
@@ -397,8 +443,8 @@ private fun TransportRow(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // decorative prev
-        TransportGlyph(glyph = "⏮")
+        // prev: seeks to the previous song segment (enabled only while playing)
+        TransportGlyph(glyph = "⏮", enabled = playing, onClick = onPrev)
         Spacer(Modifier.width(28.dp))
         PlayPauseButton(
             playing = playing,
@@ -407,19 +453,25 @@ private fun TransportRow(
             onClick = onPrimary,
         )
         Spacer(Modifier.width(28.dp))
-        // decorative next
-        TransportGlyph(glyph = "⏭")
+        // next: seeks to the next song segment (enabled only while playing)
+        TransportGlyph(glyph = "⏭", enabled = playing, onClick = onNext)
     }
 }
 
 @Composable
-private fun TransportGlyph(glyph: String) {
+private fun TransportGlyph(
+    glyph: String,
+    enabled: Boolean = false,
+    onClick: () -> Unit = {},
+) {
     Box(
         modifier = Modifier
             .size(48.dp)
+            .alpha(if (enabled) 1f else 0.4f)
             .clip(CircleShape)
             .background(KolaiColors.Glass)
-            .border(1.dp, KolaiColors.GlassBorderSoft, CircleShape),
+            .border(1.dp, KolaiColors.GlassBorderSoft, CircleShape)
+            .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Text(text = glyph, color = KolaiColors.TextDim, fontSize = 18.sp)
