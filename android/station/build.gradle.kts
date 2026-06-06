@@ -10,6 +10,11 @@ android {
     defaultConfig {
         minSdk = 31
 
+        // On-device instrumentation runner for the androidTest source set
+        // (SetlistParsingDeviceTest proves the regex patterns load on Android's
+        // ICU engine). Literal here on purpose: do NOT touch libs.versions.toml.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -41,4 +46,9 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+
+    // On-device (androidTest) deps for SetlistParsingDeviceTest. Literal versions
+    // on purpose: do NOT touch the shared gradle/libs.versions.toml.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

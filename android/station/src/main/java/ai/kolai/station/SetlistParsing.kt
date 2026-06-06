@@ -15,10 +15,16 @@ import kotlinx.serialization.json.JsonPrimitive
  * serialization compiler plugin): [extractJsonArray] returns the parsed
  * List<JsonObject>, exactly like the Python returns a list of dicts.
  *
- * Unicode note: Python re matches \w against Unicode by default (so Hebrew
- * letters count as word chars). Kotlin/Java \w is ASCII-only unless the
- * UNICODE_CHARACTER_CLASS flag is on; we set it inline with (?U) everywhere a
- * \w is used so Hebrew titles normalize identically to the Python.
+ * Unicode note: Python re matches \w against Unicode by default, so Hebrew
+ * letters count as word chars. On the JVM, \w is ASCII-only by default, and BOTH
+ * the inline (?U) token and the Pattern.UNICODE_CHARACTER_CLASS flag are rejected
+ * by Android's ICU regex engine at class-load (PatternSyntaxException /
+ * "UNICODE_CHARACTER_CLASS flag not supported"). To stay Unicode-aware on the JVM
+ * AND load cleanly on Android, NON_WORD spells out the word class explicitly as
+ * \p{L}\p{N}_ (Unicode letters + numbers + underscore — the exact definition of
+ * Unicode \w), which both engines support with no flag. FEAT_SPLIT's \b
+ * boundaries only ever wrap the ASCII keywords feat/ft/featuring/with, so plain
+ * \b is identical on both engines for this case.
  */
 
 /** Lenient JSON reader so quirky LLM arrays still parse. */
@@ -88,11 +94,15 @@ val ALT_VERSION: Regex = Regex(
     RegexOption.IGNORE_CASE,
 )
 
-// _base_title sub-patterns (Unicode-aware where \w appears, via inline (?U)).
+// _base_title sub-patterns. NON_WORD must keep Unicode word chars (Hebrew): it
+// uses the explicit Unicode class \p{L}\p{N}_ instead of \w so it is Unicode-aware
+// on the JVM with no flag AND loads on Android's ICU engine (which rejects both
+// (?U) and the UNICODE_CHARACTER_CLASS flag). FEAT_SPLIT's \b only wraps ASCII
+// keywords, so plain \b behaves the same on both engines.
 private val BRACKETED = Regex("[\\(\\[\\{].*?[\\)\\]\\}]")
 private val DASH_SPLIT = Regex("\\s[-–—]\\s")
-private val FEAT_SPLIT = Regex("(?U)\\b(?:feat|ft|featuring|with)\\b\\.?")
-private val NON_WORD = Regex("(?U)[^\\w\\s]")
+private val FEAT_SPLIT = Regex("\\b(?:feat|ft|featuring|with)\\b\\.?")
+private val NON_WORD = Regex("[^\\p{L}\\p{N}_\\s]")
 private val WHITESPACE = Regex("\\s+")
 
 /**

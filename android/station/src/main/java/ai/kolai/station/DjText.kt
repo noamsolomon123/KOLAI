@@ -5,12 +5,12 @@ package ai.kolai.station
  * (words_for_seconds, _is_skip, _clean, _finish). DjBrain delegates all output
  * shaping here.
  *
- * Unicode note (critical): Python `re` matches \w / \b against Unicode by
- * default, so Hebrew letters count as word characters. Kotlin/Java regex \w is
- * ASCII-only unless UNICODE_CHARACTER_CLASS is on; we set it inline with (?U)
- * anywhere \w / \b appears so Hebrew behaves exactly like the Python. The latin
- * stripper [A-Za-z]+ is an explicit ASCII range on purpose (it removes leaked
- * English while leaving Hebrew + digits + punctuation untouched).
+ * Unicode note: the Python `re` patterns here do NOT rely on Unicode-aware \w/\b
+ * — the only character-class that distinguishes scripts is the latin stripper
+ * [A-Za-z]+, an explicit ASCII range on purpose (it removes leaked English while
+ * leaving Hebrew + digits + punctuation untouched). So none of these compiled
+ * regexes need (and none use) the inline (?U) flag, which is JDK-only and would
+ * crash Android's ICU regex engine at class-load.
  */
 
 private const val HEBREW_WORDS_PER_SEC = 2.5
