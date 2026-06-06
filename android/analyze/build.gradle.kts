@@ -26,4 +26,17 @@ android {
 }
 
 dependencies {
+    // Task 3.1: the Analyzer turns the native :dsp JSON into a :core TrackAnalysis.
+    implementation(project(":core"))
+    // :dsp provides KolaiDsp.analyzePcmJson, the DEFAULT JSON producer. Referenced
+    // only (compile-time); unit tests inject a fake seam and never load the .so.
+    implementation(project(":dsp"))
+
+    // kotlinx-serialization-json RUNTIME ONLY (no @Serializable / no compiler
+    // plugin) -- mirrors the :core taste layer convention. Literal version on
+    // purpose: do NOT touch gradle/libs.versions.toml (parallel-module-safe).
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    // Pure-JVM unit tests; inject a fake analyzeJson seam (never the native lib).
+    testImplementation("junit:junit:4.13.2")
 }
