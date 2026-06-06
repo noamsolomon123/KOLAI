@@ -10,3 +10,7 @@ local.properties
 .idea/
 *.iml
 captures/
+
+# KOLAI DEV-ONLY bundled Gemini keys -- NEVER COMMIT. Loaded from assets at
+# runtime for development only. Production uses on-device key entry instead.
+app/src/main/assets/kolai_dev.properties

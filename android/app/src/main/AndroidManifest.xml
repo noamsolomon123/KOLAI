@@ -4,6 +4,13 @@
     <!-- Real network to Gemini (LLM + TTS) and YouTube (NewPipe download). -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Foreground media-playback service: keeps KOLAI playing with the screen
+         off / in the car / from the lock screen. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- Android 13+ runtime notification permission (media notification). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:label="KOLAI"
@@ -26,6 +33,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- KOLAI foreground media service (Media3 MediaSessionService). The
+             media3 intent-filter lets MediaController/system media controls bind. -->
+        <service
+            android:name=".KolaiMediaService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

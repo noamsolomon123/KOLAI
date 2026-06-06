@@ -71,6 +71,15 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 
+    // Playback layer: AndroidX Media3 ExoPlayer + MediaSession (foreground media
+    // service, lock-screen controls, gapless local-file playlist). Literal
+    // versions on purpose -- do NOT touch gradle/libs.versions.toml.
+    implementation("androidx.media3:media3-exoplayer:1.4.1")
+    implementation("androidx.media3:media3-session:1.4.1")
+    // MediaController.buildAsync returns a Guava ListenableFuture (pulled in
+    // transitively by media3-session; declared explicitly for the direct import).
+    implementation("com.google.guava:guava:33.3.1-android")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
 
