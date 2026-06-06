@@ -1,0 +1,181 @@
+package ai.kolai.mix
+
+import kotlin.math.cos
+import kotlin.math.PI
+
+/**
+ * Pure-DSP FloatArray math ported 1:1 from backend/radioai/mixrenderer.py.
+ *
+ * All audio is in-memory PCM: mono, 44.1 kHz, samples in [-1, 1] as Float.
+ * No Android / I/O dependencies live here — MediaCodec decode (load_mono),
+ * the AAC encoder (write_mp3), and the deferred band-split / bass-swap /
+ * time-stretch helpers are intentionally NOT ported (they belong to later
+ * tasks or are post-MVP).
+ *
+ * Numpy parity notes:
+ *  - np.linspace(0, 1, n) == i / (n - 1) for i in [0, n).
+ *  - Equal-power ramps use float32 trig exactly as numpy does.
+ *  - int(x) truncates toward zero; all sample-index conversions here use
+ *    non-negative inputs, so Float.toInt() matches.
+ *  - Python 3 round() is round-half-to-even; we mirror it with Math.rint.
+ *  - dB -> linear gain is 10^(dB/20).
+ */
+object Dsp {
+
+    /** Working sample rate (Hz). Mirrors mixrenderer.SR. */
+    const val SR: Int = 44100
+
+    /**
+     * Clip every sample to [-1, 1]. Equivalent to np.clip(audio, -1, 1) used
+     * throughout mixrenderer. (mixrenderer performs no peak-normalisation, so
+     * this helper is just the clip.) Returns a new array; input is untouched.
+     */
+    fun peakNormalizeClip(audio: FloatArray): FloatArray {
+        val out = FloatArray(audio.size)
+        for (i in audio.indices) {
+            val v = audio[i]
+            out[i] = when {
+                v > 1.0f -> 1.0f
+                v < -1.0f -> -1.0f
+                else -> v
+            }
+        }
+        return out
+    }
+
+    /**
+     * Strip leading/trailing near-silence so speech starts immediately.
+     * Ports trim_silence: returns audio[first..last] inclusive where
+     * |sample| > threshold; unchanged if everything is sub-threshold.
+     */
+    fun trimSilence(audio: FloatArray, threshold: Float = 0.01f): FloatArray {
+        var first = -1
+        var last = -1
+        for (i in audio.indices) {
+            if (kotlin.math.abs(audio[i]) > threshold) {
+                if (first == -1) first = i
+                last = i
+            }
+        }
+        if (first == -1) return audio
+        return audio.copyOfRange(first, last + 1)
+    }
+
+    /**
+     * Cosine equal-power crossfade. Ports equal_power_crossfade.
+     * Output length is len(a) + len(b) - n where n is the clamped overlap.
+     * head = a[:-n]; mixed = a[-n:]*cos(t*pi/2) + b[:n]*cos((1-t)*pi/2);
+     * tail = b[n:]; result clipped to [-1, 1].
+     */
+    fun equalPowerCrossfade(a: FloatArray, b: FloatArray, overlapS: Float): FloatArray {
+        var n = (overlapS * SR).toInt()
+        n = minOf(n, a.size, b.size)
+        if (n <= 0) {
+            return peakNormalizeClip(a + b)
+        }
+
+        val headLen = a.size - n
+        val tailLen = b.size - n
+        val out = FloatArray(headLen + n + tailLen)
+
+        // head = a[:-n]
+        for (i in 0 until headLen) {
+            out[i] = a[i]
+        }
+
+        // mixed = a[-n:] * fade_out + b[:n] * fade_in
+        val halfPi = (PI / 2.0).toFloat()
+        for (i in 0 until n) {
+            val t = if (n == 1) 0.0f else i.toFloat() / (n - 1).toFloat() // linspace(0,1,n)
+            val fadeOut = cos(t * halfPi)
+            val fadeIn = cos((1.0f - t) * halfPi)
+            out[headLen + i] = a[headLen + i] * fadeOut + b[i] * fadeIn
+        }
+
+        // tail = b[n:]
+        for (i in 0 until tailLen) {
+            out[headLen + n + i] = b[n + i]
+        }
+
+        return peakNormalizeClip(out)
+    }
+
+    /**
+     * Duck the music bed under a voice clip. Ports duck.
+     * gain = 10^(attenuationDb/20). Over [start, start+ramp) the gain ramps
+     * linearly from 1.0 down to `gain`; [start+ramp, end) is steady `gain`;
+     * the voice is then overlaid onto [start, end); result clipped to [-1, 1].
+     * Operates on a copy — `music` is not mutated.
+     */
+    fun duck(
+        music: FloatArray,
+        voice: FloatArray,
+        startS: Float,
+        attenuationDb: Float = -7.0f,
+        rampS: Float = 0.3f,
+    ): FloatArray {
+        val out = music.copyOf()
+        val start = (startS * SR).toInt()
+        val end = minOf(out.size, start + voice.size)
+        val gain = Math.pow(10.0, attenuationDb / 20.0).toFloat()
+        val ramp = (rampS * SR).toInt()
+
+        // ramp down: for i in [start, min(start+ramp, end))
+        val rampEnd = minOf(start + ramp, end)
+        val rampDen = maxOf(1, ramp)
+        var i = start
+        while (i < rampEnd) {
+            val f = (i - start).toFloat() / rampDen.toFloat()
+            out[i] *= (1.0f - f) + f * gain
+            i++
+        }
+
+        // steady duck: out[min(start+ramp, end):end] *= gain
+        var j = rampEnd
+        while (j < end) {
+            out[j] *= gain
+            j++
+        }
+
+        // overlay voice: out[start:end] += voice[:vlen]
+        val vlen = end - start
+        var k = 0
+        while (k < vlen) {
+            out[start + k] += voice[k]
+            k++
+        }
+
+        return peakNormalizeClip(out)
+    }
+
+    /**
+     * Trim leading audio so the track starts on its first detected beat.
+     * Ports start_on_beat. No beats, or a first beat <= 0 or > maxSkipS,
+     * returns the audio unchanged. beatTimes are seconds (List<Double>,
+     * matching core's TrackAnalysis.beatTimes).
+     */
+    fun startOnBeat(
+        audio: FloatArray,
+        beatTimes: List<Double>,
+        sr: Int = SR,
+        maxSkipS: Float = 4.0f,
+    ): FloatArray {
+        if (beatTimes.isEmpty()) return audio
+        val first = beatTimes[0]
+        if (first <= 0.0 || first > maxSkipS) return audio
+        val start = (first * sr).toInt()
+        return if (start < audio.size) audio.copyOfRange(start, audio.size) else audio
+    }
+
+    /**
+     * Round an overlap length to a whole number of beats (min 1) at `bpm`.
+     * Ports snap_overlap_to_beats. Non-positive bpm returns overlap unchanged.
+     */
+    fun snapOverlapToBeats(overlapS: Float, bpm: Float): Float {
+        if (bpm <= 0.0f) return overlapS
+        val beat = 60.0 / bpm
+        // Python 3 round() is round-half-to-even -> Math.rint.
+        val n = maxOf(1L, Math.rint(overlapS / beat).toLong())
+        return (n * beat).toFloat()
+    }
+}

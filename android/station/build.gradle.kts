@@ -1,0 +1,44 @@
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.android)
+}
+
+android {
+    namespace = "ai.kolai.station"
+    compileSdk = 36
+
+    defaultConfig {
+        minSdk = 31
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    // Task 5.1 (SetlistPlanner half): port of backend/radioai/setlist.py.
+    // kotlinx-serialization-json is used at RUNTIME ONLY (tree navigation via
+    // Json.parseToJsonElement / jsonArray / jsonObject / jsonPrimitive) -- no
+    // @Serializable, no serialization compiler plugin.
+    // Literal versions on purpose: do NOT touch the shared gradle/libs.versions.toml
+    // (avoids conflicts with parallel module work).
+    implementation(project(":core"))
+    // Task 5.3 (BlockRenderer): the renderer calls Dsp.* (trimSilence, duck,
+    // equalPowerCrossfade, SR) from :mix instead of re-porting the DSP math.
+    implementation(project(":mix"))
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+}
