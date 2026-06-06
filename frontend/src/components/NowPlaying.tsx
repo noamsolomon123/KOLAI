@@ -2,7 +2,6 @@ import { motion } from 'framer-motion'
 import type { Segment, Talk } from '../lib/types'
 import CoverArt from './CoverArt'
 import DJChip from './DJChip'
-import Scrubber from './Scrubber'
 import TransportControls from './TransportControls'
 
 interface Props {
@@ -45,14 +44,6 @@ export default function NowPlaying(props: Props) {
       </motion.div>
 
       <DJChip talk={props.talk} />
-
-      <Scrubber
-        currentTime={props.currentTime}
-        duration={props.duration}
-        segments={props.segments}
-        onSeek={props.onSeek}
-        onScrub={props.onScrub}
-      />
 
       <TransportControls
         playing={props.playing}
