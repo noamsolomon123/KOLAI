@@ -101,8 +101,7 @@ class MainActivity : ComponentActivity() {
                     nowPlaying = ui.nowPlaying,
                     error = ui.error,
                     dj = ui.dj,
-                    onListen = ::onListenTapped,
-                    onPause = ::onPauseTapped,
+                    onPlayPause = ::onPlayPauseTapped,
                     onPrev = ::onPrevTapped,
                     onNext = ::onNextTapped,
                 )
@@ -166,9 +165,21 @@ class MainActivity : ComponentActivity() {
         }, MoreExecutors.directExecutor())
     }
 
-    private fun onPauseTapped() {
-        controller?.let { c ->
-            if (c.isPlaying) c.pause() else if (c.mediaItemCount > 0) c.play()
+    /**
+     * Single play/pause TOGGLE for the big transport button.
+     *  - Currently playing -> pause().
+     *  - Paused with items already loaded -> play() to RESUME. We deliberately do
+     *    NOT call [onListenTapped] here: that would re-enter the tuning flow and
+     *    flash the "מתחבר…" spinner even though block(s) are already buffered.
+     *  - No controller / no items yet -> [onListenTapped] for the initial cold
+     *    start only.
+     */
+    private fun onPlayPauseTapped() {
+        val c = controller
+        when {
+            c?.isPlaying == true -> c.pause()
+            c != null && c.mediaItemCount > 0 -> c.play()
+            else -> onListenTapped()
         }
     }
 
@@ -205,8 +216,7 @@ fun KolaiScreen(
     status: StationStatus,
     nowPlaying: String?,
     error: String?,
-    onListen: () -> Unit,
-    onPause: () -> Unit,
+    onPlayPause: () -> Unit,
     dj: DjState = DjState(),
     onPrev: () -> Unit = {},
     onNext: () -> Unit = {},
@@ -216,6 +226,7 @@ fun KolaiScreen(
     val hueSeed = if (nowPlaying.isNullOrBlank()) STATION_NAME else title
     val palette = paletteFor(hueSeed)
     val playing = status == StationStatus.PLAYING
+    val paused = status == StationStatus.PAUSED
 
     Box(modifier = Modifier.fillMaxSize()) {
         MeshBackground(palette = palette, modifier = Modifier.fillMaxSize())
@@ -263,7 +274,9 @@ fun KolaiScreen(
                     when (st) {
                         StationStatus.TUNING, StationStatus.READY -> TuningBlock()
                         StationStatus.ERROR -> ErrorBlock(error = error)
-                        StationStatus.PLAYING -> NowPlayingText(title = t, artist = ar)
+                        // PAUSED keeps the current song on screen exactly like
+                        // PLAYING -- only the transport glyph + glow change.
+                        StationStatus.PLAYING, StationStatus.PAUSED -> NowPlayingText(title = t, artist = ar)
                         StationStatus.IDLE -> NowPlayingText(
                             title = "הרדיו האישי שלך", // "your personal radio"
                             artist = "הקש כדי להתחיל", // "tap to start"
@@ -276,7 +289,7 @@ fun KolaiScreen(
                 TransportRow(
                     status = status,
                     palette = palette,
-                    onPrimary = if (playing) onPause else onListen,
+                    onPrimary = onPlayPause,
                     onPrev = onPrev,
                     onNext = onNext,
                 )
@@ -435,16 +448,19 @@ private fun TransportRow(
     onPrev: () -> Unit,
     onNext: () -> Unit,
 ) {
+    // The big button shows ❚❚ ONLY when truly playing; PAUSED shows ▶.
     val playing = status == StationStatus.PLAYING
     val busy = status == StationStatus.TUNING || status == StationStatus.READY
+    // Skip is available whenever there is a current song -- playing OR paused.
+    val canSkip = status == StationStatus.PLAYING || status == StationStatus.PAUSED
 
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // prev: seeks to the previous song segment (enabled only while playing)
-        TransportGlyph(glyph = "⏮", enabled = playing, onClick = onPrev)
+        // prev: seeks to the previous song segment (enabled while playing/paused)
+        TransportGlyph(glyph = "⏮", enabled = canSkip, onClick = onPrev)
         Spacer(Modifier.width(28.dp))
         PlayPauseButton(
             playing = playing,
@@ -453,8 +469,8 @@ private fun TransportRow(
             onClick = onPrimary,
         )
         Spacer(Modifier.width(28.dp))
-        // next: seeks to the next song segment (enabled only while playing)
-        TransportGlyph(glyph = "⏭", enabled = playing, onClick = onNext)
+        // next: seeks to the next song segment (enabled while playing/paused)
+        TransportGlyph(glyph = "⏭", enabled = canSkip, onClick = onNext)
     }
 }
 

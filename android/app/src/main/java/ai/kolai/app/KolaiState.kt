@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /** Coarse station status the UI renders. */
-enum class StationStatus { IDLE, TUNING, READY, PLAYING, ERROR }
+enum class StationStatus { IDLE, TUNING, READY, PLAYING, PAUSED, ERROR }
 
 /**
  * The DJ "ON AIR" state for the current playback position. [onAir] is true while
@@ -53,6 +53,17 @@ object KolaiState {
 
     fun setPlaying() {
         _state.value = _state.value.copy(status = StationStatus.PLAYING, error = null)
+    }
+
+    /**
+     * Flip to PAUSED, but ONLY from PLAYING. Guarding on PLAYING means a pause
+     * event that arrives during TUNING/READY/ERROR (e.g. a transient player
+     * state change before block 0 lands) never clobbers those states.
+     */
+    fun setPaused() {
+        if (_state.value.status == StationStatus.PLAYING) {
+            _state.value = _state.value.copy(status = StationStatus.PAUSED)
+        }
     }
 
     /**

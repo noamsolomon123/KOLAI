@@ -148,6 +148,7 @@ class KolaiMediaService : MediaSessionService() {
 
     private fun currentNotifText(): String = when (KolaiState.state.value.status) {
         StationStatus.PLAYING -> KolaiState.state.value.nowPlaying ?: "מתנגן עכשיו"
+        StationStatus.PAUSED -> KolaiState.state.value.nowPlaying ?: "מושהה"
         StationStatus.ERROR -> "תקלה בתחנה"
         else -> "מתחבר לתחנה…"
     }
@@ -356,7 +357,7 @@ class KolaiMediaService : MediaSessionService() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             Log.i(TAG, "onIsPlayingChanged=$isPlaying state=${player.playbackState}")
-            if (isPlaying) KolaiState.setPlaying()
+            if (isPlaying) KolaiState.setPlaying() else KolaiState.setPaused()
         }
 
         override fun onPlaybackStateChanged(state: Int) {
