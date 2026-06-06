@@ -1,0 +1,116 @@
+{
+  "top_tracks": [
+    {
+      "title": "בלילה",
+      "artist": "Moti Taka",
+      "duration_s": 198.13
+    },
+    {
+      "title": "The Middle",
+      "artist": "Zedd",
+      "duration_s": 184.732
+    },
+    {
+      "title": "Waiting For Love",
+      "artist": "Avicii",
+      "duration_s": 230.613
+    },
+    {
+      "title": "כולם גנבים",
+      "artist": "Osher Cohen",
+      "duration_s": 241.935
+    },
+    {
+      "title": "שתשרף האהבה",
+      "artist": "Assaf Amdursky",
+      "duration_s": 166.05
+    },
+    {
+      "title": "Good News",
+      "artist": "Shaboozey",
+      "duration_s": 199.209
+    },
+    {
+      "title": "אישהשלי",
+      "artist": "Tzukush",
+      "duration_s": 188.94
+    },
+    {
+      "title": "How Deep Is Your Love",
+      "artist": "Calvin Harris",
+      "duration_s": 212.495
+    },
+    {
+      "title": "How You Remind Me",
+      "artist": "Nickelback",
+      "duration_s": 223.84
+    },
+    {
+      "title": "Monsters (feat. blackbear)",
+      "artist": "All Time Low",
+      "duration_s": 174.067
+    },
+    {
+      "title": "What Is Jazz?",
+      "artist": "Jdr",
+      "duration_s": 164.0
+    },
+    {
+      "title": "Language",
+      "artist": "Paperboy Fabe",
+      "duration_s": 150.36
+    },
+    {
+      "title": "טרוריזם",
+      "artist": "יובי",
+      "duration_s": 121.739
+    },
+    {
+      "title": "לפני שחלמתי על ילד",
+      "artist": "E-Z",
+      "duration_s": 180.0
+    },
+    {
+      "title": "ילד מוזר",
+      "artist": "ליעם חכמון",
+      "duration_s": 160.0
+    },
+    {
+      "title": "Dream A Little Dream Of Me",
+      "artist": "The Mamas & The Papas",
+      "duration_s": 194.426
+    },
+    {
+      "title": "לטס גו!",
+      "artist": "יובי",
+      "duration_s": 155.158
+    },
+    {
+      "title": "They Don't Care About Us",
+      "artist": "Michael Jackson",
+      "duration_s": 284.31
+    },
+    {
+      "title": "עולם הבא",
+      "artist": "קפליו",
+      "duration_s": 157.974
+    },
+    {
+      "title": "סליים ( אינטרו)",
+      "artist": "יובי",
+      "duration_s": 109.835
+    }
+  ],
+  "top_artists": [
+    "Michael Jackson",
+    "Arik Einstein",
+    "יובי",
+    "Tzukush",
+    "ליעם חכמון",
+    "E-Z",
+    "Bruno Mars",
+    "Maor",
+    "Aviv Geffen",
+    "Vibe Ish"
+  ]
+}

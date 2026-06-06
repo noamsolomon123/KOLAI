@@ -1,11 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Real network to Gemini (LLM + TTS) and YouTube (NewPipe download). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <application
         android:allowBackup="true"
         android:label="KOLAI"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:largeHeap="true">
+        <!--
+          largeHeap: a block decodes up to 3 full songs to mono 44.1k FloatArrays
+          (~35 MB each) PLUS the growing mix timeline, so peak heap is ~150 MB.
+          KNOWN MEMORY COST to optimize later: decode/trim/mix incrementally
+          (stream a song in, crossfade, release it) instead of holding all three
+          decoded tracks resident at once.
+        -->
 
         <activity
             android:name=".MainActivity"
