@@ -62,24 +62,41 @@ class CandidateScoringTest {
     }
 
     @Test
-    fun goodKeyword_addsFiveOnce_noStacking() {
-        // Both titles fully cover "test song" -> coverage term is +45 for both;
-        // two good keywords ("official" + "audio") present -> still only +5.
-        val twoGood = Candidate(
-            title = "test song official audio", // ascii, no Hebrew, no duration/views
+    fun uploadTypeLadder_audioBeatsOfficialBeatsClip_firstMatchOnly() {
+        // All titles fully cover "test song" -> coverage term is +45 for all.
+        fun cand(t: String, id: String) =
+            Candidate(title = t, durationS = null, viewCount = null, id = id)
+        val audio = cand("test song official audio", "audio")    // audio tier
+        val officialOnly = cand("test song official", "off")     // official tier
+        val clip = cand("test song official music video", "clip") // video tier
+        val none = cand("test song xyz", "none")                  // no tier
+        // First matching tier only, no stacking: "official audio" -> +12 (not +17).
+        assertEquals(45.0 + 12.0, candidateScore(song, audio), 1e-9)
+        assertEquals(45.0 + 5.0, candidateScore(song, officialOnly), 1e-9)
+        assertEquals(45.0 + 3.0, candidateScore(song, clip), 1e-9)
+        assertEquals(45.0, candidateScore(song, none), 1e-9)
+    }
+
+    @Test
+    fun audioUpload_beatsMorePopularOfficialClip() {
+        // The user-reported preference: never fetch the music video (clip)
+        // when a matching audio upload exists -- even when the clip is far
+        // more popular (clips usually are).
+        val requested = Song(title = "Test Song", artist = "Some Artist")
+        val audio = Candidate(
+            title = "Some Artist - Test Song (Official Audio)",
             durationS = null,
-            viewCount = null,
-            id = "two",
+            viewCount = 8_000_000,
+            id = "audio",
         )
-        val noGood = Candidate(
-            title = "test song xyz",
+        val clip = Candidate(
+            title = "Some Artist - Test Song (Official Music Video)",
             durationS = null,
-            viewCount = null,
-            id = "none",
+            viewCount = 450_000_000,
+            id = "clip",
         )
-        // twoGood: +45 coverage +5 good = 50 ; noGood: +45 coverage = 45.
-        assertEquals(50.0, candidateScore(song, twoGood), 1e-9)
-        assertEquals(45.0, candidateScore(song, noGood), 1e-9)
+        val best = pickBestCandidate(requested, listOf(clip, audio))
+        assertEquals("audio", best!!.id)
     }
 
     @Test

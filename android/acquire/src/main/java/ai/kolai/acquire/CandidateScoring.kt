@@ -23,11 +23,27 @@ import kotlin.math.min
  * (NewPipeExtractor) is a later task and lives elsewhere in this module.
  */
 
-/** Verbatim port of Python `_GOOD_KEYWORDS` (incl. Hebrew). */
-internal val GOOD_KEYWORDS: List<String> = listOf(
-    "official audio", "official video", "official", "audio",
-    "הרשמי", "הקליפ הרשמי",
+/**
+ * Upload-type tiers (Android change, replacing Python's flat `_GOOD_KEYWORDS`
+ * +5): the station wants the clean AUDIO upload, not the music video (קליפ) --
+ * official videos often carry cinematic intros, dialogue and SFX that do not
+ * belong on the radio. Decision ladder, best single tier only (no stacking):
+ * audio-flavored +12  >  generic "official" +5  >  video/clip-flavored +3.
+ * A clip can therefore only win when no matching audio upload exists.
+ */
+internal val AUDIO_KEYWORDS: List<String> = listOf(
+    "official audio", "audio only", "audio", "אודיו",
 )
+internal val VIDEO_KEYWORDS: List<String> = listOf(
+    "official video", "official music video", "music video",
+    "הקליפ הרשמי", "קליפ רשמי", "קליפ",
+)
+internal val OFFICIAL_KEYWORDS: List<String> = listOf(
+    "official", "הרשמי",
+)
+internal const val AUDIO_BONUS = 12.0
+internal const val OFFICIAL_BONUS = 5.0
+internal const val VIDEO_BONUS = 3.0
 
 /**
  * Port of Python `_BAD_KEYWORDS`, extended with compilation/mix/long-form
@@ -93,7 +109,9 @@ private fun normalizedTokens(text: String): List<String> =
  *  - duration sanity: `-35` if `cand.durationS > 720` (12 min) -- almost
  *    certainly a mix/compilation, never a radio single (applies even when the
  *    requested duration is unknown)
- *  - `+5` if any good keyword appears in the lowercased title (once, no stacking)
+ *  - upload-type ladder (first match only): audio-flavored title +12, else
+ *    video/clip-flavored +3, else generic "official" +5 -- prefers the clean
+ *    audio upload over the music video
  *  - `-25` per distinct bad keyword present in the lowercased title
  *  - `+10` if the RAW (non-lowercased) title contains Hebrew
  *  - TITLE COVERAGE: `+coverage * 45`, where coverage = fraction of the
@@ -125,8 +143,14 @@ fun candidateScore(song: Song, cand: Candidate): Double {
         score -= 35.0
     }
 
-    if (GOOD_KEYWORDS.any { it in title }) { // count once, no stacking
-        score += 5.0
+    // Upload-type ladder: audio upload > generic official > video clip. The
+    // FIRST matching tier applies ("official audio" matches the audio tier
+    // before the official tier ever gets checked; no stacking).
+    score += when {
+        AUDIO_KEYWORDS.any { it in title } -> AUDIO_BONUS
+        VIDEO_KEYWORDS.any { it in title } -> VIDEO_BONUS
+        OFFICIAL_KEYWORDS.any { it in title } -> OFFICIAL_BONUS
+        else -> 0.0
     }
 
     for (kw in BAD_KEYWORDS) {
