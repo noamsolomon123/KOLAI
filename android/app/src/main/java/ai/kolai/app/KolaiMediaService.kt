@@ -20,6 +20,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import ai.kolai.app.wiring.KolaiEngine
+import ai.kolai.app.wiring.LiveDjContext
 import ai.kolai.station.BlockMeta
 import ai.kolai.station.RollingPlanner
 import ai.kolai.station.StationEngine
@@ -191,6 +192,12 @@ class KolaiMediaService : MediaSessionService() {
             cacheRoot.mkdirs()
             blocksDir.mkdirs()
 
+            // Live DJ context (time of day / weather / Hebrew headlines). The
+            // engine's HttpClient is created INSIDE build(), so build() hands it
+            // to this factory and we capture the provider for the eager warm-up
+            // below. BlockRenderer calls it once per rendered block, so the
+            // endless station always talks about the CURRENT time/weather/news.
+            var liveCtx: LiveDjContext? = null
             engine = KolaiEngine.build(
                 geminiKeys = cfg.geminiKeys,
                 llmModel = cfg.llmModel,
@@ -198,7 +205,16 @@ class KolaiMediaService : MediaSessionService() {
                 ttsVoice = cfg.ttsVoice,
                 cacheDir = cacheRoot,
                 blocksDir = blocksDir,
+                ctxFactory = { http ->
+                    val live = LiveDjContext(http = http, scope = serviceScope)
+                    liveCtx = live
+                    live::current
+                },
             )
+            // Eager async warm-up so the very first block's opening likely has
+            // real weather/news. Never blocks startup; failures just leave the
+            // context fields null (DjBrain falls back gracefully).
+            liveCtx?.refreshNow()
 
             val taste = SeededTasteSource(this)
             val rollingPlanner = RollingPlanner(

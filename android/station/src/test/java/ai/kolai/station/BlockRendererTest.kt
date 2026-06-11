@@ -4,6 +4,7 @@ import ai.kolai.core.DJSlot
 import ai.kolai.core.Song
 import ai.kolai.core.TrackAnalysis
 import ai.kolai.mix.Dsp
+import ai.kolai.mix.StationIdent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -20,16 +21,25 @@ import kotlin.random.Random
  * LlmClient. Determinism comes from a fixed-seed kotlin.random.Random(7) and
  * deterministic talk_chance values per test (0.0 to suppress coin-flips, 1.0 to
  * force them), so we assert the resulting event sequence exactly.
+ *
+ * Research deviations covered (2026-06-11): block 0 uses the session OPENING
+ * prompt (writeOpening), block 0 prepends the session IDENT (newRenderer
+ * passes ident = null by default so pre-ident timing assertions stay valid;
+ * ident tests inject a known fake), and nextBeat()'s hourly anchors
+ * (minuteOfHour is injected as a fixed { 15 } here so rotation tests stay
+ * minute-independent).
  */
 class BlockRendererTest {
 
     // ---- fakes -----------------------------------------------------------
 
-    /** Returns canned LLM responses in order (last reused); never SKIPs. */
+    /** Returns a canned LLM response; records prompts; never SKIPs. */
     private class FakeLlmClient(private val response: String = "ברוכים הבאים לשידור") : LlmClient {
         var calls = 0
+        val prompts = mutableListOf<String>()
         override suspend fun complete(prompt: String): String {
             calls++
+            prompts.add(prompt)
             return response
         }
     }
@@ -97,11 +107,13 @@ class BlockRendererTest {
         encoder: BlockEncoder? = null,
         write: Boolean = false,
         rng: Random = Random(7),
+        minuteOfHour: () -> Int = { 15 },
+        ident: (() -> FloatArray)? = null,
     ): BlockRenderer = BlockRenderer(
         fetcher = fetcher,
         brain = DjBrain(client, persona = "דני"),
         voice = voice,
-        ctx = ctx,
+        ctx = { ctx },
         blocksDir = "/tmp/blocks",
         voiceA = null,
         voiceB = null,
@@ -110,6 +122,8 @@ class BlockRendererTest {
         talkChance = talkChance,
         banterChance = banterChance,
         rng = rng,
+        minuteOfHour = minuteOfHour,
+        ident = ident,
         analyzeFn = ::fakeAnalyze,
         loadFn = ::fakeLoad,
         encoder = encoder,
@@ -122,7 +136,7 @@ class BlockRendererTest {
     // ---- _plan cadence ---------------------------------------------------
 
     @Test
-    fun plan_block0_opens_with_cold_intro_naming_song0() = runTest {
+    fun plan_block0_opens_with_session_opening_naming_song0() = runTest {
         val r = newRenderer(talkChance = 0.0)
         val tracks = loadTracks(r, songs(5))
         val events = r.planFor(tracks, prevTrack = null)
@@ -135,8 +149,30 @@ class BlockRendererTest {
     }
 
     @Test
+    fun plan_block0_uses_opening_prompt_with_opening_text() = runTest {
+        // Research deviation 3: block 0 goes through brain.writeOpening - the
+        // dedicated session-opening prompt - and the "open" event carries the
+        // opening text.
+        val client = FakeLlmClient()
+        val r = newRenderer(
+            client = client, talkChance = 0.0,
+            ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר"),
+        )
+        val tracks = loadTracks(r, songs(3))
+        val events = r.planFor(tracks, prevTrack = null)
+
+        assertEquals("open", events.first().kind)
+        assertEquals("ברוכים הבאים לשידור", events.first().text)
+        val p = client.prompts.first()
+        assertTrue("not the session opening prompt", p.contains("המילים הראשונות של השידור"))
+        assertTrue("part of day not passed to opening", p.contains("בוקר"))
+        assertTrue("one-listener fragment missing", p.contains("מאזין אחד"))
+    }
+
+    @Test
     fun plan_laterBlock_opens_with_back_announce() = runTest {
-        // A non-null prevTrack -> opening break announces the previous song.
+        // A non-null prevTrack -> opening break announces the previous song
+        // (NOT the session opening prompt).
         val client = FakeLlmClient()
         val r = newRenderer(client = client, talkChance = 0.0)
         val prevSong = Song(title = "PREV", artist = "PA")
@@ -145,6 +181,10 @@ class BlockRendererTest {
         val events = r.planFor(tracks, prevTrack = prevTrack)
         assertEquals("open", events.first().kind)
         assertEquals(0, events.first().i)
+        assertFalse(
+            "later blocks must not reuse the session opening prompt",
+            client.prompts.first().contains("המילים הראשונות של השידור"),
+        )
     }
 
     @Test
@@ -212,6 +252,64 @@ class BlockRendererTest {
             ),
             kinds,
         )
+    }
+
+    // ---- hourly anchors (research deviation 4) -----------------------------
+
+    @Test
+    fun plan_minute_anchor_prefers_news_at_top_of_hour() = runTest {
+        // minute 0 is inside the round-hour news window [55..59] + [0..5].
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 1.0, banterChance = 0.0,
+            minuteOfHour = { 0 },
+        )
+        val tracks = loadTracks(r, songs(5))
+        val events = r.planFor(tracks, prevTrack = null)
+        val firstBreak = events.first { it.kind == "break" }
+        assertEquals("news", firstBreak.beat)
+    }
+
+    @Test
+    fun plan_minute_anchor_prefers_weather_at_half_hour() = runTest {
+        // minute 30 is inside the mid-hour weather window [25..35].
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 1.0, banterChance = 0.0,
+            minuteOfHour = { 30 },
+        )
+        val tracks = loadTracks(r, songs(5))
+        val events = r.planFor(tracks, prevTrack = null)
+        val firstBreak = events.first { it.kind == "break" }
+        assertEquals("weather", firstBreak.beat)
+    }
+
+    @Test
+    fun plan_minute_anchor_normal_rotation_outside_windows() = runTest {
+        // minute 15 is in no anchor window -> standard rotation, first beat is
+        // beatForBreak(0) == "song".
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 1.0, banterChance = 0.0,
+            minuteOfHour = { 15 },
+        )
+        val tracks = loadTracks(r, songs(5))
+        val events = r.planFor(tracks, prevTrack = null)
+        val firstBreak = events.first { it.kind == "break" }
+        assertEquals("song", firstBreak.beat)
+    }
+
+    @Test
+    fun plan_minute_anchor_fires_once_per_window_without_advancing_rotation() = runTest {
+        // The clock is pinned to minute 0 for the whole block: only the FIRST
+        // break gets the news anchor; the rest resume the rotation from the
+        // start ("song", "weather", ...) because the anchor did not consume a
+        // rotation slot.
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 1.0, banterChance = 0.0,
+            minuteOfHour = { 0 },
+        )
+        val tracks = loadTracks(r, songs(7))
+        val events = r.planFor(tracks, prevTrack = null)
+        val beats = events.filter { it.kind == "break" }.map { it.beat }
+        assertEquals(listOf("news", "song", "weather"), beats)
     }
 
     // ---- render ----------------------------------------------------------
@@ -296,15 +394,84 @@ class BlockRendererTest {
 
     @Test
     fun render_allowSkip_break_returns_no_talk_entry_for_that_boundary() = runTest {
-        // SKIP client -> opening (allow_skip=false) still produces text, but any
+        // SKIP client -> opening (no skip option) still produces text, but any
         // eligible non-forced break (allow_skip=true) returns null and is dropped.
         // With talk_chance 1.0 + skip client + large maxSilence, no break events
         // survive; only the opening talk entry remains.
         val r = newRenderer(client = SkipLlmClient(), maxSilence = 100, talkChance = 1.0, banterChance = 0.0, write = false)
         val result = r.render(songs(5), index = 0, prevTrack = null)
-        // opening uses allow_skip=false in Python -> survives even as "SKIP"? No:
-        // open is finish("SKIP") -> "SKIP" cleaned text, still appended. So one
-        // talk entry (the open) at most; no boundary breaks.
+        // the opening has no SKIP escape -> finish("SKIP") is "SKIP" cleaned
+        // text, still appended. So one talk entry (the open) at most; no
+        // boundary breaks.
         assertTrue("no boundary breaks should survive skip", result.meta.talk.size <= 1)
+    }
+
+    // ---- session ident (research deviation 6) ------------------------------
+
+    /** 1.0 s fake ident at constant 0.3 - the length math is then exact. */
+    private val identSamples = Dsp.SR
+    private fun fakeIdent(): FloatArray = FloatArray(identSamples) { 0.3f }
+
+    @Test
+    fun render_block0_prepends_ident_lengthening_timeline_by_ident_minus_overlap() = runTest {
+        val withIdent = newRenderer(talkChance = 0.0, ident = ::fakeIdent)
+            .render(songs(3), index = 0, prevTrack = null)
+        val without = newRenderer(talkChance = 0.0, ident = null)
+            .render(songs(3), index = 0, prevTrack = null)
+        val overlapN = (BlockRenderer.IDENT_OVERLAP_S * Dsp.SR).toInt()
+        assertEquals(identSamples - overlapN, withIdent.audio.size - without.audio.size)
+    }
+
+    @Test
+    fun render_block0_opening_talk_starts_after_ident() = runTest {
+        // duck start = identDur - overlap + 0.5 = 1.0 - 0.4 + 0.5 = 1.1
+        val result = newRenderer(talkChance = 0.0, ident = ::fakeIdent)
+            .render(songs(3), index = 0, prevTrack = null)
+        assertEquals(1.1, result.meta.talk.first().startS, 0.001)
+    }
+
+    @Test
+    fun render_block0_song0_segment_still_starts_at_zero_with_ident() = runTest {
+        // The ident is part of the STATION opening, not a track: the UI's
+        // now-playing must show song 0 from second zero.
+        val result = newRenderer(talkChance = 0.0, ident = ::fakeIdent)
+            .render(songs(3), index = 0, prevTrack = null)
+        assertEquals(0.0, result.meta.segments.first().startS, 1e-9)
+    }
+
+    @Test
+    fun render_laterBlocks_do_not_get_ident() = runTest {
+        var identCalled = false
+        val r = newRenderer(talkChance = 0.0, ident = { identCalled = true; fakeIdent() })
+        val prevSong = Song(title = "PREV", artist = "PA")
+        val prevTrack = LoadedTrack(prevSong, fakeAnalyze("/fake/PREV.m4a"), fakeLoad("/fake/PREV.m4a"), "/fake/PREV.m4a")
+        val result = r.render(songs(3), index = 1, prevTrack = prevTrack)
+        assertFalse("ident must only play at session start", identCalled)
+        // and the opening duck stays at the pre-ident position
+        assertEquals(0.5, result.meta.talk.first().startS, 0.001)
+    }
+
+    @Test
+    fun render_default_ident_is_StationIdent() = runTest {
+        // Constructed WITHOUT the ident param: the default must be the real
+        // StationIdent, lengthening block 0 by (identLen - overlap) samples.
+        val r = BlockRenderer(
+            fetcher = FakeFetcher(),
+            brain = DjBrain(FakeLlmClient(), persona = "DJ"),
+            voice = FakeVoice(djSamples),
+            ctx = { DjContext() },
+            talkChance = 0.0,
+            rng = Random(7),
+            minuteOfHour = { 15 },
+            analyzeFn = ::fakeAnalyze,
+            loadFn = ::fakeLoad,
+            write = false,
+        )
+        val withDefault = r.render(songs(2), index = 0, prevTrack = null)
+        val without = newRenderer(talkChance = 0.0, ident = null)
+            .render(songs(2), index = 0, prevTrack = null)
+        val identN = (StationIdent.DURATION_S * Dsp.SR).toInt()
+        val overlapN = (BlockRenderer.IDENT_OVERLAP_S * Dsp.SR).toInt()
+        assertEquals(identN - overlapN, withDefault.audio.size - without.audio.size)
     }
 }

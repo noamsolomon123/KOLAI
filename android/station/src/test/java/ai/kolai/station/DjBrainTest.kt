@@ -13,6 +13,9 @@ import org.junit.Test
  * Tests for DjBrain, ported from backend/radioai/djbrain.py (DJBrain). Uses a
  * recording FakeLlmClient so we can assert on the prompt the model received as
  * well as the shaped output.
+ *
+ * Also covers the Android research deviations (2026-06-11): the one-listener
+ * fragment on every prompt and the writeOpening session opening.
  */
 class DjBrainTest {
 
@@ -32,6 +35,9 @@ class DjBrainTest {
 
     private val prev = Song(title = "Yesterday", artist = "The Beatles")
     private val nxt = Song(title = "Creep", artist = "Radiohead")
+
+    /** Stable marker of the one-listener fragment (oneListenerLine). */
+    private val oneListenerMarker = "מאזין אחד"
 
     @Test
     fun writeBreak_song_allowSkip_returns_null_on_skip() = runTest {
@@ -95,5 +101,72 @@ class DjBrainTest {
         assertTrue(out.contains("ברוכים הבאים"))
         // opening: prev == null -> "זו פתיחת השידור."
         assertTrue(client.prompts.first().contains("זו פתיחת השידור"))
+    }
+
+    // ---- one-listener fragment (research finding 1) -----------------------
+
+    @Test
+    fun every_prompt_contains_one_listener_fragment() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(
+            timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי",
+            generalHeadline = "כותרת כללית",
+            topicHeadlines = mapOf("ספורט" to "כותרת ספורט"),
+        )
+        brain.writeBreak(prev, nxt, beat = "song", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "news", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "topic", ctx = ctx, seconds = 8.0, topic = "ספורט")
+        brain.refine("שורת קישור כלשהי", budget = 20)
+        brain.writeOpening(nxt = nxt, ctx = ctx, seconds = 10.0)
+        assertEquals(6, client.prompts.size)
+        client.prompts.forEachIndexed { idx, p ->
+            assertTrue("prompt #$idx missing one-listener fragment", p.contains(oneListenerMarker))
+        }
+    }
+
+    // ---- writeOpening (research finding 3) --------------------------------
+
+    @Test
+    fun writeOpening_prompt_contains_partOfDay_time_song_and_one_listener() = runTest {
+        val client = FakeLlmClient(listOf("בוקר טוב"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר")
+        brain.writeOpening(nxt = nxt, ctx = ctx, seconds = 10.0)
+        val p = client.prompts.first()
+        assertTrue("part of day missing", p.contains("בוקר"))
+        assertTrue("time missing", p.contains("08:00"))
+        assertTrue("song title missing", p.contains("Creep"))
+        assertTrue("artist missing", p.contains("Radiohead"))
+        assertTrue("one-listener fragment missing", p.contains(oneListenerMarker))
+        // it is a real opening prompt, not the generic handoff
+        assertTrue(p.contains("המילים הראשונות של השידור"))
+        // an opening always speaks: no SKIP escape hatch
+        assertFalse("opening must not offer SKIP", p.contains(SKIP_TOKEN))
+    }
+
+    @Test
+    fun writeOpening_greets_generically_when_ctx_empty() = runTest {
+        val client = FakeLlmClient(listOf("שלום שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeOpening(nxt = nxt, ctx = DjContext(), seconds = 10.0)
+        val p = client.prompts.first()
+        assertTrue("generic greeting instruction missing", p.contains("ברכת שלום חמה וכללית"))
+        assertFalse("no time line expected", p.contains("השעה null"))
+        assertTrue(p.contains(oneListenerMarker))
+    }
+
+    @Test
+    fun writeOpening_output_is_finished_to_budget() = runTest {
+        // seconds = 10.0 -> budget = 25 words; feed 40 words with no sentence end
+        // so finish() must cap at the budget.
+        val long = (1..40).joinToString(" ") { "שלום" }
+        val client = FakeLlmClient(listOf(long))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeOpening(nxt = nxt, ctx = DjContext(partOfDay = "ערב"), seconds = 10.0)
+        val words = out.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        assertTrue("output exceeds budget: ${words.size}", words.size <= wordsForSeconds(10.0))
+        assertTrue(out.isNotEmpty())
     }
 }

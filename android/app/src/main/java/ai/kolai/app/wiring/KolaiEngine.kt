@@ -48,7 +48,12 @@ class KolaiEngine private constructor(
          * @param ttsVoice        prebuilt voice name (e.g. Algieba).
          * @param cacheDir        downloaded-track + voice cache root.
          * @param blocksDir       where block_<i>.m4a files are written.
-         * @param ctx             DJ context (clock/weather/news); defaults empty.
+         * @param ctxFactory      builds the per-block DJ-context PROVIDER from the
+         *                        engine's own [HttpClient] (the client is created
+         *                        INSIDE build, so a live provider - e.g.
+         *                        [LiveDjContext] - cannot be constructed by the
+         *                        caller beforehand; it receives the client here).
+         *                        Defaults to an empty-context provider.
          */
         fun build(
             geminiKeys: List<String>,
@@ -57,13 +62,17 @@ class KolaiEngine private constructor(
             ttsVoice: String,
             cacheDir: File,
             blocksDir: File,
-            ctx: DjContext = DjContext(),
+            ctxFactory: (HttpClient) -> (() -> DjContext) = { { DjContext() } },
         ): KolaiEngine {
             require(geminiKeys.isNotEmpty()) { "KolaiEngine needs at least one Gemini key" }
             cacheDir.mkdirs()
             blocksDir.mkdirs()
 
             val http = HttpClient(OkHttp)
+
+            // Per-block DJ context provider (clock/weather/news), built from the
+            // engine's HttpClient so live fetches reuse the one OkHttp engine.
+            val ctxProvider: () -> DjContext = ctxFactory(http)
 
             // --- Gemini clients (text + TTS) -------------------------------
             val textClient = GeminiTextClient(
@@ -101,7 +110,7 @@ class KolaiEngine private constructor(
                 fetcher = fetcher,
                 brain = brain,
                 voice = voiceAdapter,
-                ctx = ctx,
+                ctx = ctxProvider,
                 blocksDir = blocksDir.absolutePath,
                 voiceA = ttsVoice,
                 voiceB = null,
