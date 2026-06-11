@@ -35,6 +35,13 @@ import androidx.compose.ui.unit.dp
  *  - draw the blobs as static radial Brushes (drawBehind, no per-frame blur),
  *  - animate only the HUE, SLOWLY, and only when the track changes
  *    (animateFloatAsState with a multi-second tween) — not a continuous loop.
+ *
+ * Brightness calibration: on the web each blob renders at
+ * (gradient alpha x 0.6 element opacity) with mix-blend-mode:screen over
+ * #06060d, and the `.grain` overlay then crushes it with a rgba(0,0,0,0.6)
+ * vignette + top scrim. Net effect: a near-black canvas with soft edge glows.
+ * We bake that down here as low blob alphas + a global black scrim + a strong
+ * edge vignette (naive src-over alphas at the CSS values read FAR too bright).
  */
 @Composable
 fun MeshBackground(
@@ -46,10 +53,10 @@ fun MeshBackground(
     val hueB by animateFloatAsState(palette.hueB, tween(2400), label = "hueB")
     val hueC by animateFloatAsState(palette.hueC, tween(2400), label = "hueC")
 
-    val a = hsl(hueA, 0.92f, 0.62f, 0.92f)
-    val b = hsl(hueB, 0.90f, 0.60f, 0.86f)
-    val c = hsl(hueC, 0.88f, 0.57f, 0.82f)
-    val a2 = hsl(hueA, 0.80f, 0.66f, 0.70f)
+    val a = hsl(hueA, 0.92f, 0.60f, 0.44f)
+    val b = hsl(hueB, 0.90f, 0.58f, 0.40f)
+    val c = hsl(hueC, 0.88f, 0.55f, 0.36f)
+    val a2 = hsl(hueA, 0.80f, 0.64f, 0.26f)
 
     Box(
         modifier
@@ -58,48 +65,59 @@ fun MeshBackground(
             .drawBehind {
                 val w = size.width
                 val h = size.height
-                // Big soft radial blobs (offscreen-ish centers, like the web's
-                // inset:-25% mesh) with generous radii -> the falloff reads as a
-                // soft blur without an actual blur pass.
+                val dim = maxOf(w, h)
+                // Soft radial blobs. Radii sized like the web circles
+                // (62/56/54/40 vmax + 64px blur) — deliberately NOT
+                // full-screen, so the screen edges stay near-black.
                 drawRect(
                     Brush.radialGradient(
                         colors = listOf(a, Color.Transparent),
-                        center = Offset(w * -0.05f, h * 0.02f),
-                        radius = maxOf(w, h) * 0.95f,
+                        center = Offset(w * 0.06f, h * 0.10f),
+                        radius = dim * 0.52f,
                     ),
                 )
                 drawRect(
                     Brush.radialGradient(
                         colors = listOf(b, Color.Transparent),
-                        center = Offset(w * 1.05f, h * 0.26f),
-                        radius = maxOf(w, h) * 0.85f,
+                        center = Offset(w * 1.00f, h * 0.30f),
+                        radius = dim * 0.46f,
                     ),
                 )
+                // hue-c glow sits LOWER-RIGHT (faint + warm in the idle
+                // palette), the echo of hue-a fades in bottom-left.
                 drawRect(
                     Brush.radialGradient(
                         colors = listOf(c, Color.Transparent),
-                        center = Offset(w * 0.42f, h * 1.05f),
-                        radius = maxOf(w, h) * 0.85f,
+                        center = Offset(w * 0.84f, h * 0.92f),
+                        radius = dim * 0.42f,
                     ),
                 )
                 drawRect(
                     Brush.radialGradient(
                         colors = listOf(a2, Color.Transparent),
-                        center = Offset(w * 0.92f, h * 0.96f),
-                        radius = maxOf(w, h) * 0.55f,
+                        center = Offset(w * 0.12f, h * 1.00f),
+                        radius = dim * 0.34f,
                     ),
                 )
-                // vignette + top darkening (web .grain) for depth/legibility
+                // Global darkening — stands in for screen-blend math over
+                // near-black; keeps the whole field midnight-dark.
+                drawRect(Color.Black.copy(alpha = 0.32f))
+                // Edge vignette (web .grain): ellipse anchored above top
+                // center; bottom + side edges fall to deep black.
                 drawRect(
                     Brush.radialGradient(
-                        colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.6f)),
+                        colorStops = arrayOf(
+                            0.38f to Color.Transparent,
+                            1f to Color.Black.copy(alpha = 0.72f),
+                        ),
                         center = Offset(w * 0.5f, h * -0.05f),
-                        radius = maxOf(w, h) * 1.15f,
+                        radius = dim * 1.12f,
                     ),
                 )
+                // top scrim for status-bar legibility (web .grain linear part)
                 drawRect(
                     Brush.verticalGradient(
-                        colors = listOf(Color.Black.copy(alpha = 0.28f), Color.Transparent),
+                        colors = listOf(Color.Black.copy(alpha = 0.30f), Color.Transparent),
                         startY = 0f,
                         endY = h * 0.26f,
                     ),
