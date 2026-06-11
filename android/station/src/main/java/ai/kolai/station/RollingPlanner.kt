@@ -8,7 +8,8 @@ import java.io.File
  * Endless, taste-refreshing, non-repeating song selection.
  *
  * Ported 1:1 from `backend/radioai/planner_rolling.py` class `RollingPlanner`.
- * Wraps a [TasteSource] (Spotify taste) and a [SetlistPlanner] (LLM). Re-pulls
+ * Wraps a [TasteSource] (Spotify taste) and a [SetlistSource] (LLM
+ * [SetlistPlanner] or pure-code [TastePoolPlanner]). Re-pulls
  * the taste every [refreshEvery] songs OR after [refreshTtlS] seconds so the
  * station keeps learning, and excludes the last [noRepeatWindow] titles so the
  * station does not repeat itself; it relaxes (accepts the planner's picks)
@@ -43,14 +44,14 @@ import java.io.File
  *  - The exclude list is the TAIL of history (last [noRepeatWindow] keys);
  *    relax-when-starved keeps all picks if fewer than [n] are fresh.
  *
- * @param mood MVP: passed through to [SetlistPlanner.plan] unchanged; the moods
+ * @param mood MVP: passed through to [SetlistSource.plan] unchanged; the moods
  *   table is not ported, so the planner currently ignores it (see moodBlock).
  * @param nowMs injectable clock returning epoch millis; defaults to the real one.
  * @param persistFile optional cross-launch history file (see class doc).
  */
 class RollingPlanner(
     private val tasteSource: TasteSource,
-    private val setlistPlanner: SetlistPlanner,
+    private val setlistPlanner: SetlistSource,
     private val refreshEvery: Int = 5,
     private val refreshTtlS: Long = 600,
     private val noRepeatWindow: Int = 50,

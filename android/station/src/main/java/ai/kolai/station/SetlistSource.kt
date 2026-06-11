@@ -1,0 +1,34 @@
+package ai.kolai.station
+
+import ai.kolai.core.Song
+import ai.kolai.core.taste.TasteProfile
+
+/**
+ * Seam over "pick the next songs for the station" so [RollingPlanner] does not
+ * care HOW the setlist is produced. Two implementations exist:
+ *
+ *  - [SetlistPlanner]: the original LLM (Gemini) curator, kept as the reference
+ *    implementation. The LLM invents setlists from prose, which means it can
+ *    (and did) hallucinate songs that do not exist.
+ *  - [TastePoolPlanner]: pure-code picking from the listener's taste pool, with
+ *    optional real-catalog discovery via a [DiscoverySource]. This is the
+ *    production direction: code cannot hallucinate a song.
+ *
+ * @param taste the listener's taste profile (topTracks ordered by rank).
+ * @param n how many songs to return.
+ * @param exclude recently played no-repeat keys; each entry is
+ *   `baseTitle(title)` (the same key [RollingPlanner] keeps in its history).
+ * @param seed the song the station just played, for continuity (the first pick
+ *   should flow out of it).
+ * @param mood optional station vibe (MVP: ignored by both implementations; the
+ *   moods table is deferred).
+ */
+interface SetlistSource {
+    suspend fun plan(
+        taste: TasteProfile,
+        n: Int,
+        exclude: List<String>? = null,
+        seed: Song? = null,
+        mood: String? = null,
+    ): List<Song>
+}

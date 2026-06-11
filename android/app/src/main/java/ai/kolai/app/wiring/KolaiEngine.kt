@@ -3,7 +3,8 @@ package ai.kolai.app.wiring
 import ai.kolai.station.BlockRenderer
 import ai.kolai.station.DjBrain
 import ai.kolai.station.DjContext
-import ai.kolai.station.SetlistPlanner
+import ai.kolai.station.SetlistSource
+import ai.kolai.station.TastePoolPlanner
 import ai.kolai.voice.GeminiTextClient
 import ai.kolai.voice.GeminiTtsSynth
 import ai.kolai.voice.VoiceRenderer as VoiceVoiceRenderer
@@ -13,10 +14,15 @@ import java.io.File
 
 /**
  * KolaiEngine -- the composition root that wires the engine modules into a ready
- * [BlockRenderer] (+ the [SetlistPlanner] / [GeminiTextClient] callers need).
+ * [BlockRenderer] (+ the [SetlistSource] / [GeminiTextClient] callers need).
  * This is the on-device counterpart of the Python StationEngine bootstrap: it
  * builds the Gemini text/TTS clients, the :voice VoiceRenderer, all the
- * [Adapters], DjBrain(persona), SetlistPlanner, and the BlockRenderer.
+ * [Adapters], DjBrain(persona), the song picker, and the BlockRenderer.
+ *
+ * Song picking is CODE-BASED: [TastePoolPlanner] samples the listener's real
+ * taste pool and sprinkles real-catalog discoveries via [DeezerDiscovery]
+ * (zero LLM, so it cannot hallucinate a song). Gemini is used ONLY to write
+ * and voice the DJ ([DjBrain] + TTS).
  *
  * Keys/models/voice are passed in (never hardcoded). The Ktor [HttpClient] uses
  * the production OkHttp engine.
@@ -25,7 +31,7 @@ class KolaiEngine private constructor(
     val httpClient: HttpClient,
     val textClient: GeminiTextClient,
     val llm: GeminiLlmClient,
-    val planner: SetlistPlanner,
+    val planner: SetlistSource,
     val blockRenderer: BlockRenderer,
     val blocksDir: File,
     val cacheDir: File,
@@ -104,7 +110,8 @@ class KolaiEngine private constructor(
 
             // --- brains -----------------------------------------------------
             val brain = DjBrain(client = llm, persona = PERSONA)
-            val planner = SetlistPlanner(llm)
+            val discovery = DeezerDiscovery(http)
+            val planner: SetlistSource = TastePoolPlanner(discovery = discovery)
 
             val blockRenderer = BlockRenderer(
                 fetcher = fetcher,

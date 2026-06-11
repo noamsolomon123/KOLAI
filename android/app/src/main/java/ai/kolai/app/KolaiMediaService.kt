@@ -220,9 +220,9 @@ class KolaiMediaService : MediaSessionService() {
             val rollingPlanner = RollingPlanner(
                 tasteSource = taste,
                 setlistPlanner = engine.planner,
-                // Cross-launch no-repeat history: the LLM keeps being told what
-                // recently played, so a relaunch does NOT re-open with the
-                // planner's default favourites.
+                // Cross-launch no-repeat history: the planner keeps being told
+                // what recently played, so a relaunch does NOT re-open with the
+                // same favourite picks.
                 persistFile = File(cacheRoot, "history.txt"),
             )
 

@@ -35,7 +35,7 @@ import kotlinx.serialization.json.put
 class SetlistPlanner(
     private val client: LlmClient,
     private val rng: kotlin.random.Random = kotlin.random.Random.Default,
-) {
+) : SetlistSource {
 
     /** em dash used in "Title - Artist" lines (Python _EM). */
     private val em = "—"
@@ -233,4 +233,18 @@ class SetlistPlanner(
         }
         return draft
     }
+
+    /**
+     * [SetlistSource] entry point: the `refine` knob is a detail of THIS
+     * implementation (the two-pass LLM loop), so the interface seam stays
+     * clean; callers through the seam always get the full draft -> refine
+     * pipeline.
+     */
+    override suspend fun plan(
+        taste: TasteProfile,
+        n: Int,
+        exclude: List<String>?,
+        seed: Song?,
+        mood: String?,
+    ): List<Song> = plan(taste, n, exclude = exclude, seed = seed, refine = true, mood = mood)
 }

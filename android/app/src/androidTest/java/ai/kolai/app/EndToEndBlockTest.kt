@@ -34,13 +34,11 @@ import java.io.File
  *
  * Real network + 3 full songs => this can run for SEVERAL MINUTES.
  *
- * NOTE: SetlistPlanner.plan crashes on-device with a PatternSyntaxException from
- * :station SetlistParsing.kt (the `(?U)` inline regex flag is JDK-only; Android's
- * ICU regex engine rejects it). That is a :station ENGINE bug, out of :app scope
- * to fix. To still prove the block-render composition (the climax of this task),
- * we TRY the planner and, on failure, fall back to building the Song list
- * directly from the taste -- BlockRenderer.render itself does NOT touch
- * SetlistParsing, so the end-to-end render is fully exercised either way.
+ * NOTE: the engine's planner is now the code-based TastePoolPlanner (+ Deezer
+ * discovery) -- no LLM in song picking. To still prove the block-render
+ * composition (the climax of this test) even if planning fails, we TRY the
+ * planner and, on failure, fall back to building the Song list directly from
+ * the taste -- BlockRenderer.render is fully exercised either way.
  */
 @RunWith(AndroidJUnit4::class)
 class EndToEndBlockTest {
@@ -92,17 +90,17 @@ class EndToEndBlockTest {
     )
 
     /**
-     * Plan the setlist via the LLM SetlistPlanner; if that throws (e.g. the
-     * known on-device :station SetlistParsing `(?U)` regex bug), fall back to the
-     * first 3 taste tracks so the block-render composition still gets proven.
+     * Plan the setlist via the engine's code-based planner (TastePoolPlanner +
+     * Deezer discovery); if that throws, fall back to the first 3 taste tracks
+     * so the block-render composition still gets proven.
      */
     private fun planSongs(engine: KolaiEngine, taste: TasteProfile): List<Song> {
         return try {
-            val songs = runBlocking { engine.planner.plan(taste, n = 3, refine = true) }
-            Log.i(tag, "SetlistPlanner OK: ${songs.size} songs")
+            val songs = runBlocking { engine.planner.plan(taste, n = 3) }
+            Log.i(tag, "planner OK: ${songs.size} songs")
             songs
         } catch (e: Throwable) {
-            Log.e(tag, "SetlistPlanner FAILED (engine bug?) -> taste fallback: ${e}")
+            Log.e(tag, "planner FAILED (engine bug?) -> taste fallback: ${e}")
             taste.topTracks.take(3).map { Song(title = it.title, artist = it.artist, durationS = it.durationS) }
         }
     }
