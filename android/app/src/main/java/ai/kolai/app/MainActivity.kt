@@ -55,15 +55,26 @@ import com.google.common.util.concurrent.MoreExecutors
  * Edge-to-edge: the mesh fills behind the system bars; content is inset with
  * statusBars/navigationBars padding. RTL is forced regardless of device language.
  *
- * Cold-start lifecycle (do not regress): the first tap starts + binds the
- * [KolaiMediaService]; the service renders block 0 for minutes and starts playback
- * itself once block 0 lands. We never play()/prepare() the empty player from here.
+ * Controller lifecycle: [bindController] runs from onCreate, so the activity is
+ * always connected to the (possibly already-playing) [KolaiMediaService] session --
+ * binding alone never starts the service or playback, it just makes prev/next and
+ * play/pause work immediately when the app is reopened over a backgrounded station.
+ * The first "listen" tap is what starts the foreground service; the service renders
+ * block 0 for minutes and starts playback itself once block 0 lands.
+ *
+ * Cold-start invariant (do not regress): we never play()/prepare() the empty
+ * player from here -- every resume is guarded by mediaItemCount > 0, and the bind
+ * listener only resumes when an explicit user tap set [playWhenBound].
  */
 class MainActivity : ComponentActivity() {
 
     private var controllerFuture: ListenableFuture<MediaController>? = null
     @Volatile private var controller: MediaController? = null
     @Volatile private var autoStart = false
+
+    /** Set by an explicit user tap while a bind is in flight; consumed exactly once
+     *  by the bind listener (resume-if-items). Never set by onCreate's always-bind. */
+    @Volatile private var playWhenBound = false
 
     private val notifPermLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* play regardless */ }
@@ -98,6 +109,10 @@ class MainActivity : ComponentActivity() {
         }
 
         ensureNotifPermission()
+        // Always bind to the session so the transport buttons work immediately when
+        // the activity is (re)opened while the service already plays in the
+        // background. Binding alone starts neither the service nor playback.
+        bindController()
         if (autoStart) {
             Log.i(TAG, "auto_start extra set -> starting playback")
             onListenTapped()
@@ -113,15 +128,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun onListenTapped() {
-        KolaiState.setTuning()
-        val intent = Intent(this, KolaiMediaService::class.java)
-        ContextCompat.startForegroundService(this, intent)
-
-        controller?.let { c ->
-            if (c.mediaItemCount > 0) c.play()
-            return
-        }
+    /**
+     * Builds + binds a MediaController to the service session. Safe to call at any
+     * time: binding starts neither the foreground service nor playback. The listener
+     * only stores the controller; it resumes a paused queue solely when an explicit
+     * user tap set [playWhenBound] while the bind was in flight (consumed exactly
+     * once), and it never touches an empty player (mediaItemCount == 0 stays a
+     * service-driven cold start).
+     */
+    private fun bindController() {
+        if (controller != null) return
         if (controllerFuture != null) return // bind in progress
 
         val token = SessionToken(this, ComponentName(this, KolaiMediaService::class.java))
@@ -132,9 +148,26 @@ class MainActivity : ComponentActivity() {
                 Log.e(TAG, "controller bind failed", e); KolaiState.setError("bind failed: ${e.message}"); return@addListener
             }
             controller = c
-            if (c.mediaItemCount > 0 && !c.isPlaying) c.play()
+            if (playWhenBound) { // explicit tap while binding -> resume-if-items
+                playWhenBound = false
+                if (c.mediaItemCount > 0 && !c.isPlaying) c.play()
+            }
             Log.i(TAG, "controller bound (items=${c.mediaItemCount}); service drives cold start")
         }, MoreExecutors.directExecutor())
+    }
+
+    /** Explicit "listen" tap: tune, start the station service, resume once bound. */
+    private fun onListenTapped() {
+        KolaiState.setTuning()
+        val intent = Intent(this, KolaiMediaService::class.java)
+        ContextCompat.startForegroundService(this, intent)
+
+        controller?.let { c ->
+            if (c.mediaItemCount > 0 && !c.isPlaying) c.play()
+            return
+        }
+        playWhenBound = true // the bind listener consumes this exactly once
+        bindController()
     }
 
     /** play/pause toggle: pause if playing; resume if paused-with-items; else cold start. */
