@@ -14,10 +14,11 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -29,6 +30,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -56,24 +58,23 @@ import androidx.compose.runtime.CompositionLocalProvider
 // ---------------------------------------------------------------------------
 
 @Composable
-internal fun CoverArtHero(palette: KolaiPalette, glyph: String, playing: Boolean) {
+internal fun CoverArtHero(palette: KolaiPalette, seed: String, playing: Boolean) {
     val shape = RoundedCornerShape(28.dp)
     val glowAlpha by animateFloatAsState(
         targetValue = if (playing) 0.6f else 0.32f,
         animationSpec = tween(600),
         label = "coverGlow",
     )
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 8.dp, bottom = 2.dp),
+    // The screen column hands this slot ALL leftover vertical space (weight),
+    // and the square cover sizes itself to the smaller of width/height -- so
+    // the whole screen always fits with no scrolling, on any display.
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier.fillMaxWidth(0.94f).aspectRatio(1f),
-            contentAlignment = Alignment.Center,
-        ) {
-            Canvas(modifier = Modifier.fillMaxWidth(1f).aspectRatio(1f)) {
+        val side = if (maxWidth < maxHeight) maxWidth else maxHeight
+        Box(modifier = Modifier.size(side), contentAlignment = Alignment.Center) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
                 drawRect(
                     Brush.radialGradient(
                         colors = listOf(palette.glow.copy(alpha = glowAlpha), Color.Transparent),
@@ -84,22 +85,64 @@ internal fun CoverArtHero(palette: KolaiPalette, glyph: String, playing: Boolean
             }
             Box(
                 modifier = Modifier
-                    .fillMaxWidth(0.88f)
-                    .aspectRatio(1f)
+                    .fillMaxSize(0.9f)
                     .clip(shape)
                     .drawBehind { drawCover(palette) }
                     .border(1.dp, Color.White.copy(alpha = 0.12f), shape),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = glyph,
-                    color = Color.White.copy(alpha = 0.94f),
-                    fontFamily = Display,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 104.sp,
-                )
+                Waveform(seed = seed, modifier = Modifier.fillMaxSize())
             }
         }
+    }
+}
+
+/**
+ * Deterministic decorative waveform drawn from a seed string (the song title):
+ * same song -> same wave, every render. Mirrored rounded bars around the
+ * vertical center, like a track's amplitude view. STATIC by design (no
+ * per-frame animation -- the lightweight perf rule); motion comes from the
+ * hue/glow transitions around it.
+ */
+@Composable
+private fun Waveform(seed: String, modifier: Modifier = Modifier) {
+    val heights = remember(seed) { waveformHeights(kolaiHash(seed), bars = 44) }
+    val color = Color.White.copy(alpha = 0.92f)
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val n = heights.size
+        val span = w * 0.78f               // bars occupy the middle 78% width
+        val slot = span / n
+        val barW = slot * 0.55f
+        val x0 = (w - span) / 2f
+        val minHalf = h * 0.025f
+        val maxHalf = h * 0.21f            // tallest bar = 42% of cover height
+        for (i in 0 until n) {
+            val half = minHalf + (maxHalf - minHalf) * heights[i]
+            drawRoundRect(
+                color = color,
+                topLeft = Offset(x0 + slot * i + (slot - barW) / 2f, h / 2f - half),
+                size = Size(barW, half * 2f),
+                cornerRadius = CornerRadius(barW / 2f, barW / 2f),
+            )
+        }
+    }
+}
+
+/** LCG-derived pseudo-random bar heights in [0,1], neighbor-smoothed. */
+private fun waveformHeights(seed: Int, bars: Int): FloatArray {
+    var s = seed
+    fun next(): Float {
+        s = s * 1103515245 + 12345
+        return ((s ushr 8) and 0xFFFF) / 65535f
+    }
+    val raw = FloatArray(bars) { next() }
+    return FloatArray(bars) { i ->
+        val a = raw[(i - 1 + bars) % bars]
+        val b = raw[i]
+        val c = raw[(i + 1) % bars]
+        (a + b * 2f + c) / 4f
     }
 }
 

@@ -24,9 +24,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -252,11 +249,6 @@ internal fun splitNowPlaying(nowPlaying: String?): Pair<String?, String?> {
     }
 }
 
-/** First non-blank character of a title, for the cover glyph (web cover__glyph). */
-internal fun glyphOf(title: String?): String {
-    val t = title?.trim().orEmpty()
-    return if (t.isEmpty()) "♪" else t.substring(0, 1)
-}
 
 // ---------------------------------------------------------------------------
 //  Screen
@@ -275,7 +267,6 @@ fun KolaiScreen(
     val (songTitle, songArtist) = splitNowPlaying(nowPlaying)
 
     val playing = status == StationStatus.PLAYING
-    val paused = status == StationStatus.PAUSED
     val displayTitle: String
     val displayArtist: String?
     when (status) {
@@ -298,59 +289,61 @@ fun KolaiScreen(
     Box(modifier = Modifier.fillMaxSize()) {
         MeshBackground(palette = palette, modifier = Modifier.fillMaxSize())
 
+        // Single fixed-height column: NO scrolling. The cover absorbs whatever
+        // vertical space remains (weight slot), so every component always fits
+        // on screen, on any display.
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
+                .statusBarsPadding()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp)
+                .padding(top = 12.dp, bottom = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Column(
+            StationRow(palette = palette)
+
+            MoodBar()
+
+            Box(
                 modifier = Modifier
-                    .widthIn(max = 460.dp)
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(horizontal = 20.dp)
-                    .padding(top = 14.dp, bottom = 28.dp)
-                    .navigationBarsPadding(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center,
             ) {
-                StationRow(palette = palette)
-
-                MoodBar()
-
                 CoverArtHero(
                     palette = palette,
-                    glyph = if (playing || paused) glyphOf(songTitle) else "♪",
+                    seed = songTitle ?: WORDMARK,
                     playing = playing,
                 )
-
-                AnimatedContent(
-                    targetState = status to (displayTitle to displayArtist),
-                    transitionSpec = { fadeIn(tween(420)) togetherWith fadeOut(tween(240)) },
-                    label = "meta",
-                ) { (st, ta) ->
-                    val (t, ar) = ta
-                    if (st == StationStatus.TUNING || st == StationStatus.READY) {
-                        TuningMeta()
-                    } else {
-                        MetaText(title = t, artist = ar, error = st == StationStatus.ERROR)
-                    }
-                }
-
-                DjOnAirCard(
-                    palette = palette,
-                    active = dj.onAir && status == StationStatus.PLAYING,
-                    beat = dj.beat,
-                )
-
-                TransportRow(
-                    status = status,
-                    onPrimary = onPlayPause,
-                    onPrev = onPrev,
-                    onNext = onNext,
-                )
             }
+
+            AnimatedContent(
+                targetState = status to (displayTitle to displayArtist),
+                transitionSpec = { fadeIn(tween(420)) togetherWith fadeOut(tween(240)) },
+                label = "meta",
+            ) { (st, ta) ->
+                val (t, ar) = ta
+                if (st == StationStatus.TUNING || st == StationStatus.READY) {
+                    TuningMeta()
+                } else {
+                    MetaText(title = t, artist = ar, error = st == StationStatus.ERROR)
+                }
+            }
+
+            DjOnAirCard(
+                palette = palette,
+                active = dj.onAir && status == StationStatus.PLAYING,
+                beat = dj.beat,
+            )
+
+            TransportRow(
+                status = status,
+                onPrimary = onPlayPause,
+                onPrev = onPrev,
+                onNext = onNext,
+            )
         }
     }
 }
