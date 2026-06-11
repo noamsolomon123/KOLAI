@@ -101,6 +101,21 @@ private fun normalizedTokens(text: String): List<String> =
         .filter { it.isNotEmpty() }
 
 /**
+ * Fraction of the requested song-title's normalized tokens that appear in the
+ * candidate title's normalized token set. Returns 1.0 when the requested title
+ * normalizes to no tokens (nothing to match against -- vacuously full coverage).
+ *
+ * Used both as a scoring term in [candidateScore] and as a hard verification
+ * gate in [pickBestCandidate].
+ */
+internal fun titleCoverage(song: Song, cand: Candidate): Double {
+    val requestedTokens = normalizedTokens(song.title)
+    if (requestedTokens.isEmpty()) return 1.0
+    val candTokens = normalizedTokens(cand.title).toSet()
+    val matched = requestedTokens.count { it in candTokens }
+    return matched.toDouble() / requestedTokens.size
+}
+/**
  * Score one YouTube search candidate for a requested [Song]. Full formula:
  *
  *  - duration closeness: `max(0, 30 - |candDur - song.durationS|)` (only when
@@ -169,10 +184,8 @@ fun candidateScore(song: Song, cand: Candidate): Double {
     // dominates the popularity cap (20), so an artist's most-popular-but-wrong
     // video can never beat a candidate that matches the requested title.
     val candTokens = normalizedTokens(rawTitle).toSet()
-    val requestedTokens = normalizedTokens(song.title)
-    if (requestedTokens.isNotEmpty()) {
-        val matched = requestedTokens.count { it in candTokens }
-        val coverage = matched.toDouble() / requestedTokens.size
+    if (normalizedTokens(song.title).isNotEmpty()) {
+        val coverage = titleCoverage(song, cand)
         score += coverage * 45.0
         if (coverage < 0.5) {
             score -= 45.0
@@ -197,10 +210,23 @@ fun candidateScore(song: Song, cand: Candidate): Double {
 }
 
 /**
- * Port of Python `pick_best_candidate`: returns the highest-scoring candidate,
- * or `null` if the list is empty.
+ * Port of Python `pick_best_candidate`, hardened into a VERIFIED pick: returns
+ * the highest-scoring candidate, or `null` if the list is empty OR the best
+ * candidate's [titleCoverage] is below 0.5.
+ *
+ * Why the verification gate: the LLM setlist sometimes invents songs that do
+ * not exist (hallucinated "discovery" picks). The YouTube search then returns
+ * the artist's OTHER songs plus unrelated junk -- every candidate already
+ * carries the low-coverage -45 penalty, but max-by would still hand back the
+ * least-bad WRONG video. A candidate missing half the requested title's words
+ * is almost certainly the wrong song, so we reject it: returning null makes
+ * NewPipeSource throw FetchException("no candidate ..."), which makes
+ * BlockRenderer skip the song. A skipped song is invisible to the listener;
+ * playing the WRONG song (label says X, audio plays Y) destroys trust.
  */
 fun pickBestCandidate(song: Song, candidates: List<Candidate>): Candidate? {
     if (candidates.isEmpty()) return null
-    return candidates.maxByOrNull { candidateScore(song, it) }
+    val best = candidates.maxByOrNull { candidateScore(song, it) } ?: return null
+    if (titleCoverage(song, best) < 0.5) return null
+    return best
 }

@@ -138,7 +138,35 @@ class NewPipeSource(
         }
 
         val best = pickBestCandidate(song, candidates)
-            ?: throw FetchException("no candidate found for '${song.artist} - ${song.title}' (query='$query')")
+        if (best == null) {
+            if (candidates.isEmpty()) {
+                throw FetchException(
+                    "no candidate: search returned nothing for " +
+                        "'${song.artist} - ${song.title}' (query='$query')",
+                )
+            }
+            // Results existed but none matched the requested title: this is the
+            // hallucinated/unfindable-song path (verified pick rejected them all).
+            val top3 = candidates
+                .sortedByDescending { candidateScore(song, it) }
+                .take(3)
+                .joinToString(" | ") { it.title }
+            logW(
+                "rejected all ${candidates.size} results for " +
+                    "'${song.artist} - ${song.title}' -- none matched the requested " +
+                    "title (probable hallucinated/unfindable song); top-3: $top3",
+            )
+            throw FetchException(
+                "no candidate: ${candidates.size} results for '${song.artist} - ${song.title}' " +
+                    "(query='$query') but none matched the requested title " +
+                    "(probable hallucinated/unfindable song)",
+            )
+        }
+        logI(
+            "picked '${best.title}' " +
+                "(score=${"%.1f".format(candidateScore(song, best))}) " +
+                "for '${song.artist} - ${song.title}'",
+        )
 
         // candidate.id is the StreamInfoItem url (already a full watch URL).
         return if (best.id.startsWith("http")) {
@@ -247,7 +275,21 @@ class NewPipeSource(
         }
     }
 
+    // android.util.Log is a no-op stub that THROWS on the plain JVM. Today only
+    // androidTest exercises this class (CandidateScoringTest tests pure
+    // functions), but guard anyway so a future JVM unit test cannot crash on a
+    // log line.
+    private fun logI(msg: String) {
+        try { android.util.Log.i(LOG_TAG, msg) } catch (_: Throwable) { }
+    }
+
+    private fun logW(msg: String) {
+        try { android.util.Log.w(LOG_TAG, msg) } catch (_: Throwable) { }
+    }
+
     private companion object {
+        const val LOG_TAG = "KolaiAcquire"
+
         @Volatile
         private var initialized = false
 

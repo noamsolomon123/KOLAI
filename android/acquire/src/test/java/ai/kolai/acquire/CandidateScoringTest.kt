@@ -302,4 +302,58 @@ class CandidateScoringTest {
         )
         assertEquals(53.0, candidateScore(requestedWithFeat, plainCand), 1e-9)
     }
+
+    // ---- verified pick: hallucinated / unfindable songs -------------------
+
+    @Test
+    fun pickBest_rejectsWhenNoCandidateMatchesTitle() {
+        // THE bug (reproduced on device 2026-06-11): the LLM invented
+        // "מרגישים את זה" by E-Z; YouTube search returned his OTHER songs plus
+        // unrelated junk, and max-by still picked the least-bad WRONG video.
+        // The verified pick must return null so the song gets skipped instead.
+        val requested = Song(title = "מרגישים את זה", artist = "E-Z")
+        val candidates = listOf(
+            Candidate(title = "E-Z - כמו כישוף", durationS = 190.0, viewCount = 2_400_000L, id = "a"),
+            Candidate(title = "E-Z - גושפנקא (קליפ רשמי)", durationS = 205.0, viewCount = 5_100_000L, id = "b"),
+            Candidate(title = "E-Z - פרוע", durationS = 178.0, viewCount = 1_300_000L, id = "c"),
+            Candidate(title = "E-Z - מציאות אחרת", durationS = 212.0, viewCount = 900_000L, id = "d"),
+            Candidate(title = "מיקס מזרחית 2026 כל הלהיטים", durationS = 3900.0, viewCount = 12_000_000L, id = "e"),
+        )
+        assertNull(pickBestCandidate(requested, candidates))
+    }
+
+    @Test
+    fun pickBest_acceptsExactMatchEvenLowViews() {
+        // The gate must only reject when NOTHING matches: a correct candidate
+        // hiding among the artist's wrong-but-popular songs is still returned.
+        val requested = Song(title = "מרגישים את זה", artist = "E-Z")
+        val correct = Candidate(
+            title = "E-Z - מרגישים את זה (Official Audio)",
+            durationS = 195.0,
+            viewCount = 40_000L,
+            id = "correct",
+        )
+        val wrongPopular = Candidate(
+            title = "E-Z - גושפנקא (קליפ רשמי)",
+            durationS = 205.0,
+            viewCount = 5_100_000L,
+            id = "wrong",
+        )
+        val best = pickBestCandidate(requested, listOf(wrongPopular, correct))
+        assertNotNull(best)
+        assertEquals("correct", best!!.id)
+    }
+
+    @Test
+    fun pickBest_acceptsCoverageExactlyHalf() {
+        // 2-token title, candidate carries 1 of the 2 tokens -> coverage is
+        // exactly 0.5, ON the boundary, and must PASS (>= 0.5 is accepted).
+        val requested = Song(title = "alpha beta", artist = "someone")
+        val half = Candidate(
+            title = "someone alpha", durationS = null, viewCount = null, id = "half",
+        )
+        val best = pickBestCandidate(requested, listOf(half))
+        assertNotNull(best)
+        assertEquals("half", best!!.id)
+    }
 }
