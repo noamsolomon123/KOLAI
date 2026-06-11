@@ -8,6 +8,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.nio.file.Files
 
 /**
  * Tests for RollingPlanner, ported from backend/radioai/planner_rolling.py.
@@ -274,5 +276,106 @@ class RollingPlannerTest {
             setlistPlanner = SetlistPlanner(client),
         )
         assertEquals(null, rolling.mood)
+    }
+
+    // --- cross-launch history persistence (persistFile) ---------------------
+
+    private fun newHistoryFile(): File =
+        File(Files.createTempDirectory("rolling-test").toFile(), "history.txt")
+
+    @Test
+    fun history_persists_across_planner_instances_sharing_a_file() = runTest {
+        val file = newHistoryFile()
+
+        val client1 = FakeLlmClient(listOf(reply("Creep", "Yesterday"), reply("Creep", "Yesterday")))
+        val p1 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(client1),
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        p1.nextSongs(n = 2)
+        assertTrue(file.exists())
+
+        // a SECOND planner instance over the same file restores the history...
+        val client2 = FakeLlmClient(listOf(reply("Karma Police"), reply("Karma Police")))
+        val p2 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(client2),
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        assertEquals(listOf(baseTitle("Creep"), baseTitle("Yesterday")), p2.history)
+
+        // ...and its very FIRST prompt already hard-excludes the prior
+        // launch's songs -- this is exactly what stops every app launch from
+        // re-opening with the planner's default favourite track.
+        p2.nextSongs(n = 1)
+        val draft = client2.prompts[0]
+        assertTrue(draft.contains("HARD EXCLUDE"))
+        assertTrue(draft.contains(baseTitle("Creep")))
+        assertTrue(draft.contains(baseTitle("Yesterday")))
+    }
+
+    @Test
+    fun history_file_is_bounded_to_twice_the_noRepeatWindow() = runTest {
+        val file = newHistoryFile()
+        val replies = (0 until 6).flatMap { listOf(reply("T$it"), reply("T$it")) }
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(FakeLlmClient(replies)),
+            refreshEvery = 100,
+            noRepeatWindow = 2,
+            persistFile = file,
+        )
+
+        repeat(6) { rolling.nextSongs(n = 1) } // history t0..t5
+
+        // in-memory history keeps everything; the FILE keeps only the last 2*2
+        assertEquals(listOf("t0", "t1", "t2", "t3", "t4", "t5"), rolling.history)
+        val lines = file.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(listOf("t2", "t3", "t4", "t5"), lines)
+    }
+
+    @Test
+    fun corrupt_history_file_is_tolerated() = runTest {
+        val file = newHistoryFile()
+        // binary junk + blank lines: construction must not throw
+        file.writeBytes(byteArrayOf(0, 1, 2, -1, -2) + "\n\n   \n".toByteArray())
+
+        val client = FakeLlmClient(listOf(reply("T"), reply("T")))
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(client),
+            refreshEvery = 100,
+            persistFile = file,
+        )
+
+        // ...and the planner keeps working + persisting from here on
+        rolling.nextSongs(n = 1)
+        assertTrue(rolling.history.contains(baseTitle("T")))
+        val lines = file.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertTrue(lines.contains(baseTitle("T")))
+    }
+
+    @Test
+    fun missing_history_file_and_null_persistFile_start_empty() = runTest {
+        // null persistFile: in-memory only (the default; existing behavior)
+        val rollingNull = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(FakeLlmClient(listOf(reply("T"), reply("T")))),
+            refreshEvery = 100,
+        )
+        assertTrue(rollingNull.history.isEmpty())
+
+        // persistFile that does not exist yet: also starts empty, no crash
+        val file = newHistoryFile()
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = SetlistPlanner(FakeLlmClient(listOf(reply("T"), reply("T")))),
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        assertTrue(rolling.history.isEmpty())
     }
 }

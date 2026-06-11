@@ -38,11 +38,31 @@ import java.io.File
  *    sender.
  *  - Block files are `.m4a` (AAC), matching BlockRenderer's Android output, NOT
  *    Python's `.mp3`.
+ *
+ * DISK PERSISTENCE (Android addition, not in the Python):
+ *  - Alongside every committed `block_N.m4a` the engine writes
+ *    `block_N.meta.json` (the full [BlockMeta]), and after every commit /
+ *    [advance] it writes `state.json` ({frontier, current, prevTitle,
+ *    prevArtist}) -- both atomically (tmp + rename, see
+ *    [StationPersistence.writeAtomic]).
+ *  - On construction the engine RESTORES from blocksDir: every block_N.m4a
+ *    with a parseable meta json goes back into the registry, so a process
+ *    restart resumes from already-rendered blocks instead of cold-rendering
+ *    from zero. prevLastTrack (decoded PCM continuity) is NOT persistable, so
+ *    the first post-restart render gets prevTrack = null (no crossfade across
+ *    a restart -- the renderer already tolerates this, exactly like block 0).
+ *    The planner seed DOES survive (prevTitle/prevArtist in state.json).
+ *  - Corrupt/missing persistence NEVER crashes: a bad state.json falls back to
+ *    a fresh engine (stale files deleted best-effort); a bad meta json drops
+ *    just that block.
+ *
+ * @param songsPerBlock songs to plan for a given block INDEX. Per-index so the
+ *   very first block can be smaller (faster first tune-in) than steady-state.
  */
 class StationEngine(
     private val nextSongs: suspend (n: Int, seed: Song?) -> List<Song>,
     private val renderBlock: suspend (songs: List<Song>, index: Int, prevTrack: LoadedTrack?) -> BlockResult,
-    private val songsPerBlock: Int = 3,
+    private val songsPerBlock: (index: Int) -> Int = { 3 },
     private val bufferAhead: Int = 2,
     private val keepBehind: Int = 2,
     private val blocksDir: String,
@@ -67,19 +87,113 @@ class StationEngine(
 
     init {
         File(blocksDir).mkdirs() // Python os.makedirs(exist_ok=True)
+        restoreFromDisk()        // resume from any blocks already rendered on disk
+    }
+
+    /**
+     * Restore the registry + state from blocksDir (constructor-time, so no
+     * locking needed -- nothing else can observe the engine yet).
+     *
+     *  - No/corrupt state.json -> fresh engine; stale block files are deleted
+     *    best-effort (we cannot trust them without state).
+     *  - Otherwise every block_N.m4a with a PARSEABLE block_N.meta.json is
+     *    restored; an unusable pair is deleted best-effort.
+     *  - current = state.current (>= 0); frontier = the first index >= current
+     *    that is NOT restored. This contiguity guard (rather than blindly
+     *    trusting state.frontier) guarantees every index in [current, frontier)
+     *    is actually servable, so getBlockPath can never hit a hole.
+     *  - prevLastSong is rebuilt from the persisted title/artist (the planner
+     *    seed only needs those); prevLastTrack stays null (see class doc).
+     */
+    private fun restoreFromDisk() {
+        val stateFile = File(blocksDir, STATE_FILE)
+        val stateText = try {
+            if (stateFile.exists()) stateFile.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+        val state = stateText?.let { StationPersistence.stateFromJson(it) }
+        if (state == null) {
+            // Missing or corrupt state -> fresh engine. Clear stale files so a
+            // later render at index N never collides with an orphaned file.
+            deleteBlockFiles()
+            return
+        }
+
+        val names = try {
+            File(blocksDir).list() ?: emptyArray()
+        } catch (e: Exception) {
+            emptyArray<String>()
+        }
+        for (f in names) {
+            val m = BLOCK_FILE_RE.matchEntire(f) ?: continue
+            val idx = m.groupValues[1].toIntOrNull() ?: continue
+            val metaFile = File(blocksDir, "block_$idx.meta.json")
+            val metaText = try {
+                if (metaFile.exists()) metaFile.readText() else null
+            } catch (e: Exception) {
+                null
+            }
+            val meta = metaText?.let { StationPersistence.metaFromJson(it) }
+            if (meta == null) {
+                // unusable block (no/corrupt meta): drop the pair best-effort
+                try { File(blocksDir, f).delete() } catch (ignored: Exception) {}
+                try { metaFile.delete() } catch (ignored: Exception) {}
+                continue
+            }
+            blocks[idx] = meta to "$blocksDir/block_$idx.m4a"
+        }
+
+        current = state.current.coerceAtLeast(0)
+        // contiguity guard: frontier = first non-restored index >= current
+        var f = current
+        while (blocks.containsKey(f)) f += 1
+        frontier = f
+        prevLastSong = state.prevTitle?.let {
+            Song(title = it, artist = state.prevArtist ?: "")
+        }
+        prevLastTrack = null // PCM continuity cannot survive a restart
+    }
+
+    /** Persist {frontier, current, prev song} -- MUST be called holding [stateMutex]. */
+    private fun saveStateLocked() {
+        try {
+            StationPersistence.writeAtomic(
+                File(blocksDir, STATE_FILE),
+                StationPersistence.stateToJson(
+                    StationPersistence.EngineState(
+                        frontier = frontier,
+                        current = current,
+                        prevTitle = prevLastSong?.title,
+                        prevArtist = prevLastSong?.artist,
+                    ),
+                ),
+            )
+        } catch (e: Exception) {
+            // persistence is best-effort; never fail playback over it
+        }
     }
 
     /**
      * Python `_ensure_through`. Render strictly in order until frontier > target.
-     * Serialized by [renderMutex] so concurrent callers don't double-render. The
-     * frontier/generation are snapshotted under [stateMutex]; the render runs
-     * WITHOUT the state mutex; results are committed under [stateMutex] only if
-     * the generation still matches (else the render was made stale by a [reset]
-     * and is discarded -- the loop then re-snapshots the post-reset frontier).
+     * Renders are serialized by [renderMutex] (no double-render: the frontier is
+     * re-snapshotted under the lock each iteration), but the lock is held PER
+     * BLOCK, not across the whole sweep. [Mutex] is fair (FIFO), so a waiter
+     * with a small target -- the player feed asking for block 0 during the cold
+     * start -- acquires right after the current block commits instead of
+     * stalling behind the run loop's full buffer-ahead sweep. This is what lets
+     * playback begin the moment block 0 exists (~1 song render) rather than
+     * after bufferAhead+1 blocks.
+     *
+     * The frontier/generation are snapshotted under [stateMutex]; the render
+     * runs WITHOUT the state mutex; results are committed under [stateMutex]
+     * only if the generation still matches (else the render was made stale by a
+     * [reset] and is discarded -- the loop then re-snapshots the post-reset
+     * frontier). Every commit also persists the block's meta json + state.json.
      */
     suspend fun ensureThrough(target: Int) {
-        renderMutex.withLock {
-            while (true) {
+        while (true) {
+            val done = renderMutex.withLock {
                 val i: Int
                 val gen: Int
                 val seed: Song?
@@ -90,9 +204,9 @@ class StationEngine(
                     seed = prevLastSong
                     prevTrack = prevLastTrack
                 }
-                if (i > target) break
+                if (i > target) return@withLock true
 
-                val songs = nextSongs(songsPerBlock, seed)
+                val songs = nextSongs(songsPerBlock(i), seed)
                 val res = renderBlock(songs, i, prevTrack)
 
                 stateMutex.withLock {
@@ -104,8 +218,19 @@ class StationEngine(
                     prevLastTrack = res.lastTrack
                     prevLastSong = songs.lastOrNull()
                     frontier = i + 1
+                    try {
+                        StationPersistence.writeAtomic(
+                            File(blocksDir, "block_$i.meta.json"),
+                            StationPersistence.metaToJson(res.meta),
+                        )
+                    } catch (e: Exception) {
+                        // best-effort: a failed meta write only costs a restore
+                    }
+                    saveStateLocked()
                 }
+                false
             }
+            if (done) break
         }
     }
 
@@ -119,10 +244,22 @@ class StationEngine(
         return stateMutex.withLock { blocks.getValue(n).second }
     }
 
+    /**
+     * Where playback should START feeding from: the lowest ready (restored or
+     * already-rendered) block index at/after [current] if any, else the
+     * frontier. On a warm relaunch this points at the restored blocks so the
+     * service can enqueue them instantly instead of waiting on a cold render.
+     */
+    suspend fun firstPlayableIndex(): Int = stateMutex.withLock {
+        blocks.keys.filter { it >= current }.minOrNull() ?: frontier
+    }
     /** Python `advance`: monotonically bump current, wake the loop, prune. */
     suspend fun advance(n: Int) {
         stateMutex.withLock {
-            if (n > current) current = n
+            if (n > current) {
+                current = n
+                saveStateLocked() // current changed -> persist the new resume point
+            }
         }
         wakeChannel.trySend(Unit)
         prune()
@@ -131,7 +268,9 @@ class StationEngine(
     /**
      * Python `reset`: restart from a fresh, reshuffled queue at block 0. Bumps
      * [generation] so any in-flight render is discarded, clears the registry +
-     * continuity, and deletes old block files. Wakes the loop.
+     * continuity, and deletes old block files (including every meta json and
+     * state.json, so a later process start does NOT restore pre-reset state).
+     * Wakes the loop.
      */
     suspend fun reset() {
         stateMutex.withLock {
@@ -146,7 +285,11 @@ class StationEngine(
         wakeChannel.trySend(Unit)
     }
 
-    /** Python `_delete_block_files`: remove every block_*.m4a in blocksDir. */
+    /**
+     * Python `_delete_block_files`: remove every block_*.m4a in blocksDir --
+     * plus (Android persistence) every block_*.meta.json and state.json (and
+     * their .tmp leftovers). Anything else in the dir is left alone.
+     */
     private fun deleteBlockFiles() {
         val names = try {
             File(blocksDir).list() ?: return
@@ -154,7 +297,11 @@ class StationEngine(
             return
         }
         for (f in names) {
-            if (f.startsWith("block_") && f.endsWith(".m4a")) {
+            val isBlockMedia = f.startsWith("block_") && f.endsWith(".m4a")
+            val isBlockMeta = f.startsWith("block_") &&
+                (f.endsWith(".meta.json") || f.endsWith(".meta.json.tmp"))
+            val isState = f == STATE_FILE || f == "$STATE_FILE.tmp"
+            if (isBlockMedia || isBlockMeta || isState) {
                 try {
                     File(blocksDir, f).delete()
                 } catch (e: Exception) {
@@ -164,7 +311,8 @@ class StationEngine(
         }
     }
 
-    /** Python `_prune`: delete files + registry entries older than current-keepBehind. */
+    /** Python `_prune`: delete files (.m4a + .meta.json) + registry entries
+     *  older than current-keepBehind. */
     suspend fun prune() {
         val stale: List<Int>
         val low: Int
@@ -173,10 +321,15 @@ class StationEngine(
             stale = blocks.keys.filter { it < low }
         }
         for (i in stale) {
-            val path = "$blocksDir/block_$i.m4a"
             try {
-                val file = File(path)
+                val file = File("$blocksDir/block_$i.m4a")
                 if (file.exists()) file.delete()
+            } catch (e: Exception) {
+                // tolerate IO errors
+            }
+            try {
+                val metaFile = File("$blocksDir/block_$i.meta.json")
+                if (metaFile.exists()) metaFile.delete()
             } catch (e: Exception) {
                 // tolerate IO errors
             }
@@ -224,4 +377,9 @@ class StationEngine(
     internal suspend fun frontierForTest(): Int = stateMutex.withLock { frontier }
     internal suspend fun generationForTest(): Int = stateMutex.withLock { generation }
     internal suspend fun currentForTest(): Int = stateMutex.withLock { current }
+
+    companion object {
+        private const val STATE_FILE = "state.json"
+        private val BLOCK_FILE_RE = Regex("""block_(\d+)\.m4a""")
+    }
 }

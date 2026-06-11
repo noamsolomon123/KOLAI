@@ -55,10 +55,13 @@ import java.util.concurrent.ConcurrentHashMap
  *    block boundary, mirroring the web onPrev/onNext.
  *
  * COLD-START LIFECYCLE (unchanged, do not regress):
- *  - The first block cold-renders for minutes with NO playback. The playlist is
- *    EMPTY and the player stays IDLE. We NEVER prepare()/play() the empty player.
- *    We hold our OWN foreground notification so the process survives, and only
- *    prepare()+play() once block 0 is actually added.
+ *  - On a TRUE first launch the first block cold-renders for minutes with NO
+ *    playback. The playlist is EMPTY and the player stays IDLE. We NEVER
+ *    prepare()/play() the empty player. We hold our OWN foreground notification
+ *    so the process survives, and only prepare()+play() once the FIRST FED
+ *    block is actually added. (On a warm relaunch the engine restores rendered
+ *    blocks from disk, the first fed block is ready instantly, and the same
+ *    rule starts playback within seconds.)
  */
 class KolaiMediaService : MediaSessionService() {
 
@@ -201,19 +204,28 @@ class KolaiMediaService : MediaSessionService() {
             val rollingPlanner = RollingPlanner(
                 tasteSource = taste,
                 setlistPlanner = engine.planner,
+                // Cross-launch no-repeat history: the LLM keeps being told what
+                // recently played, so a relaunch does NOT re-open with the
+                // planner's default favourites.
+                persistFile = File(cacheRoot, "history.txt"),
             )
 
             stationEngine = StationEngine(
                 nextSongs = rollingPlanner::nextSongs,
                 renderBlock = engine.blockRenderer::render,
-                songsPerBlock = 2,   // smaller blocks -> snappier cold start + more DJ
+                // First-ever block is a SINGLE song so a true cold start tunes
+                // in roughly twice as fast; steady state stays at 2 (smaller
+                // blocks -> snappier renders + more DJ).
+                songsPerBlock = { idx -> if (idx == 0) 1 else 2 },
                 bufferAhead = 2,
                 keepBehind = 2,
                 blocksDir = blocksDir.absolutePath,
                 scope = serviceScope,
             )
-            // NOTE: deliberately NO reset() here -- a restart resumes from any
-            // block files already on disk instead of re-rendering from zero.
+            // NOTE: deliberately NO reset() here -- the engine restores blocks
+            // + state (block_N.meta.json + state.json) from disk, so a restart
+            // resumes from already-rendered block files instead of re-rendering
+            // from zero.
             stationEngine.start()
             Log.i(TAG, "engine built; blocksDir=${blocksDir.absolutePath}")
         } catch (e: Throwable) {
@@ -224,23 +236,39 @@ class KolaiMediaService : MediaSessionService() {
 
     /**
      * Feed loop: keep the player playlist fed from the engine, staying
-     * ~bufferAhead items ahead of the current item so the next block is buffered.
-     * The player is left IDLE/empty until block 0 is actually ready; only then do
-     * we prepare()+play() (see the COLD-START LIFECYCLE note above).
+     * ~BUFFER_AHEAD blocks ahead of the currently playing block. The loop's
+     * START index comes from the engine: on a warm relaunch
+     * [StationEngine.firstPlayableIndex] points at the blocks restored from
+     * disk, so they enqueue instantly (no render) and playback starts in
+     * seconds; on a true first launch it is the frontier (0) and the player is
+     * left IDLE/empty through the long cold render -- only when the FIRST FED
+     * block actually lands do we prepare()+play() (see the COLD-START
+     * LIFECYCLE note above).
      */
     private fun startFeedLoop() {
         feedJob = serviceScope.launch {
             try {
+                // Resume point: lowest already-rendered block at/after the
+                // engine's current position, else the render frontier.
+                val first = stationEngine.firstPlayableIndex()
+                nextToAdd = first
+                lastAdvanced = first - 1
+                Log.i(TAG, "feed: starting at block $first")
                 while (isActive) {
-                    val currentItem = currentMediaIndexOnMain()
-                    if (nextToAdd - currentItem > BUFFER_AHEAD) {
+                    // Compare BLOCK ids (mediaId), not playlist positions:
+                    // pruning removes leading items and a restored start is
+                    // offset, so positions would desync the buffer window.
+                    val currentBlock = withContext(Dispatchers.Main) {
+                        player.currentMediaItem?.mediaId?.toIntOrNull() ?: first
+                    }
+                    if (nextToAdd - currentBlock > BUFFER_AHEAD) {
                         delay(300)
                         continue
                     }
 
                     val idx = nextToAdd
-                    if (idx == 0) KolaiState.setTuning()
-                    Log.i(TAG, "feed: requesting block $idx (cold render if first)")
+                    if (idx == first) KolaiState.setTuning()
+                    Log.i(TAG, "feed: requesting block $idx (cold render if not on disk)")
                     val path = withContext(Dispatchers.IO) { stationEngine.getBlockPath(idx) }
                     Log.i(TAG, "feed: block $idx ready -> $path")
 
@@ -255,23 +283,25 @@ class KolaiMediaService : MediaSessionService() {
 
                     runOnPlayer {
                         player.addMediaItem(item)
-                        if (idx == 0) {
-                            // Block 0 just landed after the long cold render. The
-                            // player has been IDLE/empty until now; ONLY NOW (with
-                            // a real item present) do we prepare + start, applying
-                            // the user's remembered "tap Listen" intent.
+                        if (idx == first) {
+                            // The FIRST FED block just landed (block 0 after the
+                            // long cold render, or a restored block instantly on
+                            // a warm relaunch). The player has been IDLE/empty
+                            // until now; ONLY NOW (with a real item present) do
+                            // we prepare + start, applying the user's remembered
+                            // "tap Listen" intent.
                             player.prepare()
                             player.playWhenReady = true
                             player.play()
-                            Log.i(TAG, "block 0 added -> prepare()+play() (honoring tap)")
+                            Log.i(TAG, "block $idx (first fed) added -> prepare()+play() (honoring tap)")
                         } else if (player.playbackState == Player.STATE_IDLE) {
                             // Defensive: never force play on a later block.
                             player.prepare()
                         }
                     }
-                    if (idx == 0) {
+                    if (idx == first) {
                         KolaiState.setReady()
-                        updateNowPlaying(0)
+                        updateNowPlaying(first)
                     }
                     nextToAdd = idx + 1
                 }
@@ -508,9 +538,6 @@ class KolaiMediaService : MediaSessionService() {
         if (Looper.myLooper() == Looper.getMainLooper()) block()
         else mainHandler.post(block)
     }
-
-    private suspend fun currentMediaIndexOnMain(): Int =
-        withContext(Dispatchers.Main) { player.currentMediaItemIndex.coerceAtLeast(0) }
 
     // --- MediaSessionService lifecycle ---------------------------------------
 

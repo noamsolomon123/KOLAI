@@ -2,6 +2,7 @@ package ai.kolai.station
 
 import ai.kolai.core.Song
 import ai.kolai.core.taste.TasteProfile
+import java.io.File
 
 /**
  * Endless, taste-refreshing, non-repeating song selection.
@@ -21,6 +22,13 @@ import ai.kolai.core.taste.TasteProfile
  *  - The clock is injected via [nowMs] (epoch millis) instead of Python's
  *    `time.monotonic` (seconds), so refresh-by-TTL is testable without real
  *    time. TTL is therefore compared in milliseconds ([refreshTtlS] * 1000).
+ *  - CROSS-LAUNCH HISTORY (Android addition): when [persistFile] is set, the
+ *    no-repeat history is loaded from it on construction and re-saved (last
+ *    [noRepeatWindow] * 2 keys, one per line, atomic tmp+rename) after every
+ *    [nextSongs]. A fresh process therefore still hands the LLM the recently
+ *    played exclude list, so every launch does not re-open with the planner's
+ *    default favourites. Corrupt/unreadable files never crash (worst case the
+ *    history starts empty); persistence failures are swallowed.
  *
  * Faithfully preserved from the Python:
  *  - First profile load uses cache (`getProfile(useCache=true)`); periodic
@@ -38,6 +46,7 @@ import ai.kolai.core.taste.TasteProfile
  * @param mood MVP: passed through to [SetlistPlanner.plan] unchanged; the moods
  *   table is not ported, so the planner currently ignores it (see moodBlock).
  * @param nowMs injectable clock returning epoch millis; defaults to the real one.
+ * @param persistFile optional cross-launch history file (see class doc).
  */
 class RollingPlanner(
     private val tasteSource: TasteSource,
@@ -47,6 +56,7 @@ class RollingPlanner(
     private val noRepeatWindow: Int = 50,
     mood: String? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
+    private val persistFile: File? = null,
 ) {
     /** Current station vibe; affects FUTURE song selection. Public like Python. */
     var mood: String? = mood
@@ -59,6 +69,10 @@ class RollingPlanner(
     /** Rolling no-repeat history of recently played keys ([baseTitle] of title). */
     val history: MutableList<String> = mutableListOf()
 
+    init {
+        loadHistory()
+    }
+
     /** Switch the station's vibe; affects FUTURE song selection. */
     fun setMood(mood: String?) {
         this.mood = mood
@@ -66,6 +80,34 @@ class RollingPlanner(
 
     /** No-repeat key for a song: base title (matches SetlistPlanner dedup). */
     private fun key(song: Song): String = baseTitle(song.title)
+
+    /** Load persisted history (one key per line). Corruption-tolerant: any IO
+     *  or decode problem just leaves the history empty. */
+    private fun loadHistory() {
+        val f = persistFile ?: return
+        try {
+            if (!f.exists()) return
+            f.readLines()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .forEach { history.add(it) }
+        } catch (e: Exception) {
+            // corrupt/unreadable history -> start empty, never crash
+            history.clear()
+        }
+    }
+
+    /** Persist the last [noRepeatWindow] * 2 history keys (bounds file growth).
+     *  Best-effort: failures are swallowed. */
+    private fun saveHistory() {
+        val f = persistFile ?: return
+        try {
+            val keep = history.takeLast(noRepeatWindow * 2)
+            StationPersistence.writeAtomic(f, keep.joinToString("\n"))
+        } catch (e: Exception) {
+            // best-effort persistence; never fail song selection over it
+        }
+    }
 
     /**
      * Load the profile, forcing a fresh re-learn when a refresh is due. Mirrors
@@ -96,7 +138,7 @@ class RollingPlanner(
      * Pick the next [n] songs, optionally flowing out of [seed]. Mirrors Python
      * `next_songs`: excludes the last [noRepeatWindow] played keys, relaxes
      * (accepts the planner's picks) if too few are fresh, then records the chosen
-     * keys in history.
+     * keys in history (and persists them when [persistFile] is set).
      */
     suspend fun nextSongs(n: Int, seed: Song? = null): List<Song> {
         val profile = ensureProfile()
@@ -115,6 +157,7 @@ class RollingPlanner(
         for (s in chosen) {
             history.add(key(s))
         }
+        saveHistory()
         songsSinceRefresh += chosen.size
         return chosen
     }

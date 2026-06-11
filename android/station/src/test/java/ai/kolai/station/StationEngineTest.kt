@@ -13,7 +13,9 @@ import java.nio.file.Files
 
 /**
  * TDD for Task 5.4 (StationEngine), ported 1:1 from
- * backend/radioai/station.py class StationEngine.
+ * backend/radioai/station.py class StationEngine -- plus the Android-only disk
+ * persistence layer (block_N.meta.json + state.json restore across engine
+ * instances; see the "DISK PERSISTENCE" tests at the bottom).
  *
  * No real planner/renderer/audio: both seams are faked. The engine is
  * constructed with function-typed seams (nextSongs / renderBlock) so the
@@ -44,7 +46,9 @@ class StationEngineTest {
     private fun loadedTrack(s: Song, path: String): LoadedTrack =
         LoadedTrack(song = s, analysis = analysis(), audio = FloatArray(0), path = path)
 
-    /** Records each render call's (index, prevTrack); writes the .m4a file. */
+    /** Records each render call's (index, prevTrack); writes the .m4a file.
+     *  The meta carries a real segment + talk entry so the persistence tests
+     *  can assert a FULL BlockMeta round-trip through the meta json. */
     private class FakeRender(private val blocksDir: String) {
         val callIndices = mutableListOf<Int>()
         val callPrevTracks = mutableListOf<LoadedTrack?>()
@@ -59,19 +63,33 @@ class StationEngineTest {
             val path = "$blocksDir/block_$index.m4a"
             File(path).writeText("block-$index")
             val last = songs.last()
-            val meta = BlockMeta(index = index, durationS = 10.0, segments = emptyList(), talk = emptyList())
+            val meta = metaFor(index)
             val lastTrack = LoadedTrack(song = last, analysis = TrackAnalysis(
                 path = path, durationS = 10.0, bpm = 120.0, beatTimes = listOf(0.0),
                 keyCamelot = "8A", energy = 0.5, introEndS = 1.0, outroStartS = 9.0, vocalOnsetS = 1.0,
             ), audio = FloatArray(0), path = path)
             return BlockResult(audio = FloatArray(0), meta = meta, path = path, lastTrack = lastTrack)
         }
+
+        companion object {
+            /** Deterministic meta for [index] (same shape every FakeRender). */
+            fun metaFor(index: Int): BlockMeta = BlockMeta(
+                index = index,
+                durationS = 10.0,
+                segments = listOf(
+                    Segment(index = 0, title = "t$index", artist = "a$index", startS = 0.0, endS = 10.0),
+                ),
+                talk = listOf(
+                    TalkEntry(beat = "intro", text = "talk-$index", startS = 0.5, endS = 1.5),
+                ),
+            )
+        }
     }
 
     /**
-     * Deterministic planner seam. Each call returns songsPerBlock fresh songs
-     * named by a global counter so blocks have distinct last-songs; records the
-     * seed it was handed.
+     * Deterministic planner seam. Each call returns n fresh songs named by a
+     * global counter so blocks have distinct last-songs; records the seed it
+     * was handed.
      */
     private class FakeNextSongs(private val perBlock: Int) {
         val seeds = mutableListOf<Song?>()
@@ -86,6 +104,21 @@ class StationEngineTest {
         Files.createTempDirectory("station-test").toFile().absolutePath
 
     private fun blockFile(dir: String, i: Int): File = File("$dir/block_$i.m4a")
+    private fun metaFile(dir: String, i: Int): File = File("$dir/block_$i.meta.json")
+    private fun stateFile(dir: String): File = File("$dir/state.json")
+
+    private fun newEngine(
+        planner: FakeNextSongs,
+        render: FakeRender,
+        dir: String,
+    ): StationEngine = StationEngine(
+        nextSongs = planner::nextSongs,
+        renderBlock = render::render,
+        songsPerBlock = { 3 },
+        bufferAhead = 2,
+        keepBehind = 2,
+        blocksDir = dir,
+    )
 
     // ---- ensureThrough: ordered render + continuity ----------------------
 
@@ -94,14 +127,7 @@ class StationEngineTest {
         val dir = newTempDir()
         val planner = FakeNextSongs(3)
         val render = FakeRender(dir)
-        val engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        val engine = newEngine(planner, render, dir)
 
         engine.ensureThrough(2)
 
@@ -129,6 +155,33 @@ class StationEngineTest {
         assertEquals(render.callPrevTracks[2]?.song, planner.seeds[2])
     }
 
+    // ---- per-index songsPerBlock ------------------------------------------
+
+    @Test
+    fun songsPerBlock_isCalledPerIndex_firstBlockCanBeSmaller() = runTest {
+        val dir = newTempDir()
+        val render = FakeRender(dir)
+        val askedCounts = mutableListOf<Int>()
+        var counter = 0
+        val engine = StationEngine(
+            nextSongs = { n, _ ->
+                askedCounts.add(n)
+                (0 until n).map { Song(title = "s${counter++}", artist = "a") }
+            },
+            renderBlock = render::render,
+            songsPerBlock = { idx -> if (idx == 0) 1 else 2 },
+            bufferAhead = 2,
+            keepBehind = 2,
+            blocksDir = dir,
+        )
+
+        engine.ensureThrough(2)
+
+        // block 0 planned with ONE song (fast first tune-in), later blocks with 2
+        assertEquals(listOf(1, 2, 2), askedCounts)
+        assertEquals(listOf(0, 1, 2), render.callIndices)
+    }
+
     // ---- stale-generation discard ---------------------------------------
 
     @Test
@@ -146,14 +199,7 @@ class StationEngineTest {
                 engine.reset()
             }
         }
-        engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        engine = newEngine(planner, render, dir)
 
         engine.ensureThrough(0)
 
@@ -175,14 +221,7 @@ class StationEngineTest {
         val dir = newTempDir()
         val planner = FakeNextSongs(3)
         val render = FakeRender(dir)
-        val engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        val engine = newEngine(planner, render, dir)
 
         // render blocks 0..5 so there is history to prune
         engine.ensureThrough(5)
@@ -206,7 +245,6 @@ class StationEngineTest {
         assertEquals(5, engine.currentForTest())
         for (i in 3..5) assertTrue(blockFile(dir, i).exists())
     }
-
     // ---- reset -----------------------------------------------------------
 
     @Test
@@ -214,14 +252,7 @@ class StationEngineTest {
         val dir = newTempDir()
         val planner = FakeNextSongs(3)
         val render = FakeRender(dir)
-        val engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        val engine = newEngine(planner, render, dir)
 
         engine.ensureThrough(2)
         engine.advance(2)
@@ -250,14 +281,7 @@ class StationEngineTest {
         val dir = newTempDir()
         val planner = FakeNextSongs(3)
         val render = FakeRender(dir)
-        val engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        val engine = newEngine(planner, render, dir)
 
         // nothing rendered yet; getBlockPath(2) must render 0..2 then return path
         val path = engine.getBlockPath(2)
@@ -273,14 +297,7 @@ class StationEngineTest {
         val dir = newTempDir()
         val planner = FakeNextSongs(3)
         val render = FakeRender(dir)
-        val engine = StationEngine(
-            nextSongs = planner::nextSongs,
-            renderBlock = render::render,
-            songsPerBlock = 3,
-            bufferAhead = 2,
-            keepBehind = 2,
-            blocksDir = dir,
-        )
+        val engine = newEngine(planner, render, dir)
         // a non-block file and a block_*.mp3 (wrong ext) must survive reset
         File("$dir/keep.txt").writeText("x")
         File("$dir/block_9.mp3").writeText("x")
@@ -292,5 +309,161 @@ class StationEngineTest {
         assertTrue(File("$dir/block_9.mp3").exists())
         assertFalse(blockFile(dir, 0).exists())
         assertFalse(blockFile(dir, 1).exists())
+    }
+
+    // ======================================================================
+    // DISK PERSISTENCE (Android addition): meta jsons + state.json + restore
+    // ======================================================================
+
+    @Test
+    fun persistence_writesMetaJsonAndStateJson_alongsideEveryBlock() = runTest {
+        val dir = newTempDir()
+        val engine = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+
+        engine.ensureThrough(2)
+
+        for (i in 0..2) assertTrue("meta json $i written", metaFile(dir, i).exists())
+        assertTrue("state.json written", stateFile(dir).exists())
+    }
+
+    @Test
+    fun persistence_secondEngineRestoresBlocks_withoutReRendering() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(2)
+
+        // a SECOND engine over the same blocksDir restores the registry
+        val planner2 = FakeNextSongs(3)
+        val render2 = FakeRender(dir)
+        val engine2 = newEngine(planner2, render2, dir)
+
+        assertEquals(3, engine2.frontierForTest())
+        assertEquals(0, engine2.currentForTest())
+
+        // serving a restored block does NOT render anything
+        val path = engine2.getBlockPath(2)
+        assertEquals("$dir/block_2.m4a", path)
+        assertTrue(render2.callIndices.isEmpty())
+
+        // the meta survived the json round-trip FULLY (segments + talk)
+        assertEquals(FakeRender.metaFor(2), engine2.getBlockMeta(2))
+        assertEquals(FakeRender.metaFor(0), engine2.getBlockMeta(0))
+    }
+
+    @Test
+    fun persistence_restoredEngineContinuesAtFrontier_withPersistedSeed_nullPrevTrack() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(2) // songs s0..s8; last song of block 2 is s8
+
+        val planner2 = FakeNextSongs(3)
+        val render2 = FakeRender(dir)
+        val engine2 = newEngine(planner2, render2, dir)
+
+        engine2.ensureThrough(3) // only block 3 is missing
+
+        assertEquals(listOf(3), render2.callIndices)
+        // PCM continuity cannot survive a restart -> null prevTrack (renderer
+        // tolerates it, like block 0) ...
+        assertNull(render2.callPrevTracks[0])
+        // ... but the PLANNER seed does survive via state.json title/artist.
+        assertEquals(Song(title = "s8", artist = "a"), planner2.seeds[0])
+    }
+
+    @Test
+    fun firstPlayableIndex_freshEngine_returnsFrontierZero() = runTest {
+        val dir = newTempDir()
+        val engine = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        assertEquals(0, engine.firstPlayableIndex())
+    }
+
+    @Test
+    fun firstPlayableIndex_afterRestore_returnsLowestRestoredAtOrAfterCurrent() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(5)
+        engine1.advance(4) // current=4; prune < 2 -> blocks 2..5 remain on disk
+
+        val engine2 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+
+        assertEquals(4, engine2.currentForTest())
+        assertEquals(6, engine2.frontierForTest())
+        // restored blocks 2..5; lowest at/after current(4) -> 4
+        assertEquals(4, engine2.firstPlayableIndex())
+        // the kept-behind blocks below current are restored too (prev-block nav)
+        assertEquals(2, engine2.getBlockMeta(2)?.index)
+    }
+
+    @Test
+    fun reset_wipesPersistence_nextEngineStartsFresh() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(1)
+        assertTrue(stateFile(dir).exists())
+
+        engine1.reset()
+
+        assertFalse("state.json wiped by reset", stateFile(dir).exists())
+        for (i in 0..1) {
+            assertFalse("block $i m4a wiped", blockFile(dir, i).exists())
+            assertFalse("block $i meta wiped", metaFile(dir, i).exists())
+        }
+
+        val render2 = FakeRender(dir)
+        val engine2 = newEngine(FakeNextSongs(3), render2, dir)
+        assertEquals(0, engine2.frontierForTest())
+        assertEquals(0, engine2.firstPlayableIndex())
+        assertNull(engine2.getBlockMeta(0))
+    }
+
+    @Test
+    fun prune_alsoDeletesMetaJsons() = runTest {
+        val dir = newTempDir()
+        val engine = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine.ensureThrough(5)
+        for (i in 0..5) assertTrue(metaFile(dir, i).exists())
+
+        engine.advance(5) // prune < 3
+
+        for (i in 0..2) assertFalse("meta $i pruned", metaFile(dir, i).exists())
+        for (i in 3..5) assertTrue("meta $i kept", metaFile(dir, i).exists())
+    }
+
+    @Test
+    fun corruptStateJson_fallsBackToFreshEngine_withoutCrashing() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(1)
+        stateFile(dir).writeText("{this is not json!!")
+
+        val engine2 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+
+        assertEquals(0, engine2.frontierForTest())
+        assertEquals(0, engine2.currentForTest())
+        assertEquals(0, engine2.firstPlayableIndex())
+        assertNull(engine2.getBlockMeta(0))
+        // stale files were cleared best-effort so re-renders never collide
+        assertFalse(blockFile(dir, 0).exists())
+        assertFalse(metaFile(dir, 0).exists())
+    }
+
+    @Test
+    fun corruptMetaJson_dropsOnlyThatBlock_onRestore() = runTest {
+        val dir = newTempDir()
+        val engine1 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+        engine1.ensureThrough(2)
+        metaFile(dir, 1).writeText("garbage")
+
+        val engine2 = newEngine(FakeNextSongs(3), FakeRender(dir), dir)
+
+        // block 0 restored; block 1 unusable -> the contiguity guard stops the
+        // frontier at the hole so block 1 will simply be re-rendered.
+        assertEquals(0, engine2.getBlockMeta(0)?.index)
+        assertNull(engine2.getBlockMeta(1))
+        assertEquals(1, engine2.frontierForTest())
+        assertEquals(0, engine2.firstPlayableIndex())
+        // the unusable pair was deleted best-effort
+        assertFalse(blockFile(dir, 1).exists())
+        assertFalse(metaFile(dir, 1).exists())
     }
 }
