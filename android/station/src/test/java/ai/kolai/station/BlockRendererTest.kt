@@ -12,6 +12,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.math.abs
 import kotlin.random.Random
 
 /**
@@ -548,5 +549,77 @@ class BlockRendererTest {
         r.render(songs(3), index = 0, prevTrack = null)
         assertTrue(voice.styles.isNotEmpty())
         voice.styles.forEach { assertNull("style must be null without a mood", it) }
+    }
+
+    // ---- audio quality: loudness normalization, limiter, segues, fades ------
+
+    @Test
+    fun render_normalizes_song_bed_to_target_rms() = runTest {
+        // fakeLoad songs are constant 0.3 -> middle-60% RMS = 0.3 -> gain
+        // 0.08/0.3 (inside +/-4x) -> the bed sits at SONG_TARGET_RMS. Sample
+        // at 4.5 s: after the opening talk-over (ends ~2.5 s) and before the
+        // 4 s musical crossfade region (starts at 6 s of the 10 s song).
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        val idx = (4.5 * Dsp.SR).toInt()
+        assertEquals(BlockRenderer.SONG_TARGET_RMS, result.audio[idx], 1e-3f)
+    }
+
+    @Test
+    fun render_voice_sits_clearly_above_ducked_bed() = runTest {
+        // Steady talk-over region (duck 0.5..2.5 s, 0.3 s ramp): the bed is
+        // SONG_TARGET_RMS * 10^(-15/20) ~= 0.0142 and the DJ voice (constant
+        // 0.5) is normalized to VOICE_TARGET_RMS = 0.15 -> the voice rides
+        // ~20 dB above the bed.
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        val idx = (1.5 * Dsp.SR).toInt()
+        val bed = BlockRenderer.SONG_TARGET_RMS * Math.pow(10.0, -15.0 / 20.0).toFloat()
+        assertEquals(bed + BlockRenderer.VOICE_TARGET_RMS, result.audio[idx], 1e-3f)
+        assertTrue(
+            "voice must dominate the ducked bed",
+            BlockRenderer.VOICE_TARGET_RMS > 4.0f * bed,
+        )
+    }
+
+    @Test
+    fun render_musical_segue_is_longer_when_no_talk_at_boundary() = runTest {
+        // 2 songs x 10 s, no boundary talk -> ONE musical crossfade of
+        // MUSIC_SEGUE_S (4 s) -> total 10 + 10 - 4 = 16 s.
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(16.0, result.meta.durationS, 0.01)
+    }
+
+    @Test
+    fun render_talk_boundary_keeps_short_segue() = runTest {
+        // maxSilence = 1 forces a break at boundary 1 -> that boundary keeps
+        // the tight talk-over segue (1.5 s) so DJ timing is untouched ->
+        // total 10 + 10 - 1.5 = 18.5 s.
+        val result = newRenderer(talkChance = 0.0, maxSilence = 1)
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(18.5, result.meta.durationS, 0.01)
+    }
+
+    @Test
+    fun render_timeline_starts_and_ends_at_silence() = runTest {
+        // Micro-fades: with no ident, the block's very first sample is song
+        // 0's faded-in first sample and the very last is the final song's
+        // faded-out tail -> both exactly 0, no edge clicks.
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(0.0f, result.audio.first(), 1e-6f)
+        assertEquals(0.0f, result.audio.last(), 1e-6f)
+    }
+
+    @Test
+    fun render_final_block_stays_within_unity() = runTest {
+        // The final assembled block is soft-limited: no sample may exceed
+        // full scale (with ident + opening talk-over + a forced break).
+        val result = newRenderer(talkChance = 0.0, maxSilence = 1, ident = ::fakeIdent)
+            .render(songs(3), index = 0, prevTrack = null)
+        for (v in result.audio) {
+            assertTrue("sample must stay within [-1, 1]", abs(v) <= 1.0f)
+        }
     }
 }

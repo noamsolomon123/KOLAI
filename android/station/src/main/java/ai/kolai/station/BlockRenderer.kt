@@ -79,6 +79,10 @@ class BlockRenderer(
     private val loadFn: LoadFn,
     private val encoder: BlockEncoder? = null,
     private val write: Boolean = true,
+    // ---- audio-quality knobs (defaults documented on the companion consts) --
+    private val musicSegueS: Float = MUSIC_SEGUE_S,
+    private val songTargetRms: Float = SONG_TARGET_RMS,
+    private val voiceTargetRms: Float = VOICE_TARGET_RMS,
 ) {
     // CROSS-BLOCK cadence state. Start "since talk" high so block 0 opens with a
     // DJ intro and the first real boundary is eligible to talk. Python uses
@@ -145,7 +149,13 @@ class BlockRenderer(
         for (song in songs) {
             try {
                 val path = fetcher.fetch(song)
-                tracks.add(LoadedTrack(song, analyzeFn(path), loadFn(path), path))
+                // Loudness-normalize EVERY song (YouTube masters differ by
+                // many dB; radio is loudness-consistent) and micro-fade the
+                // edges so decoded-AAC boundaries never click.
+                val audio = Dsp.microFadeEdges(
+                    Dsp.normalizeLoudness(loadFn(path), targetRms = songTargetRms, maxGain = LOUDNESS_MAX_GAIN)
+                )
+                tracks.add(LoadedTrack(song, analyzeFn(path), audio, path))
             } catch (e: Exception) {
                 // Python prints "  [skip] ..."; we silently drop (no stdout in lib).
             }
@@ -294,7 +304,12 @@ class BlockRenderer(
         val opening = events.firstOrNull { it.kind == "open" }
         if (opening != null) {
             val slot = voice.render(opening.text!!, style = blockTtsStyle)
-            val djAudio = Dsp.trimSilence(loadFn(slot.audioPath))
+            val djAudio = Dsp.microFadeEdges(
+                Dsp.normalizeLoudness(
+                    Dsp.trimSilence(loadFn(slot.audioPath)),
+                    targetRms = voiceTargetRms, maxGain = LOUDNESS_MAX_GAIN,
+                )
+            )
             val djDur = djAudio.size.toDouble() / Dsp.SR
             val startS = openingDuckStartS
             timeline = Dsp.duck(timeline, djAudio, startS = startS.toFloat(), attenuationDb = duckDb)
@@ -327,7 +342,12 @@ class BlockRenderer(
             if (talkEvent != null) {
                 // BANTER substitution: a single-voice break (see planFor TODO).
                 val slot = voice.render(talkEvent.text!!, style = blockTtsStyle)
-                val djAudio = Dsp.trimSilence(loadFn(slot.audioPath))
+                val djAudio = Dsp.microFadeEdges(
+                Dsp.normalizeLoudness(
+                    Dsp.trimSilence(loadFn(slot.audioPath)),
+                    targetRms = voiceTargetRms, maxGain = LOUDNESS_MAX_GAIN,
+                )
+            )
                 val djDur = djAudio.size.toDouble() / Dsp.SR
                 // duck the DJ over the TAIL of the current timeline (talkover),
                 // then crossfade into the next song.
@@ -343,14 +363,22 @@ class BlockRenderer(
                 )
             }
 
-            // musical (or post-talkover) segue into the next song
-            timeline = Dsp.equalPowerCrossfade(timeline, audio, overlapS = segueS)
+            // segue into the next song: pure MUSICAL boundaries breathe with
+            // the longer radio crossfade [musicSegueS]; talk-over boundaries
+            // keep the tight [segueS] so the duckStart math above (which
+            // reserves segueS + 0.3 s after the DJ) stays untouched.
+            val overlap = if (talkEvent != null) segueS else musicSegueS
+            timeline = Dsp.equalPowerCrossfade(timeline, audio, overlapS = overlap)
             songEvents.add(
                 SongEvent(title = song.title, artist = song.artist, startS = boundary)
             )
         }
 
-        // 4. write the block (.m4a / AAC) + build meta
+        // 4. soft-limit the assembled block: crossfade overlaps + ducked
+        // voice + normalization gain can push instantaneous peaks past 1.0
+        // (hard clip = audible crackle). softClip is bit-exact below 0.95 and
+        // tanh-knees only the overshoot. Then write (.m4a / AAC) + meta.
+        timeline = Dsp.softClip(timeline)
         val totalS = round2(timeline.size.toDouble() / Dsp.SR)
         val path = "$blocksDir/block_$index.m4a"
         if (write && encoder != null) {
@@ -366,5 +394,29 @@ class BlockRenderer(
     companion object {
         /** Equal-power overlap (s) between the session ident and song 0. */
         const val IDENT_OVERLAP_S: Float = 0.4f
+
+        /**
+         * Song->song MUSICAL crossfade (s) for boundaries with no talk break.
+         * Longer than the talk-over segue [segueS] (1.5 s default): pure
+         * musical segues breathe at radio pace, while talk boundaries keep
+         * the original tight overlap so DJ talk-over timing is untouched.
+         */
+        const val MUSIC_SEGUE_S: Float = 4.0f
+
+        /**
+         * Loudness targets (chosen 2026-06-12, audio-quality pass):
+         *  - SONG_TARGET_RMS 0.08 (~ -22 dBFS RMS): every song's middle-60%
+         *    RMS lands here - a comfortable streaming level that leaves
+         *    crossfade/limiter headroom above it.
+         *  - VOICE_TARGET_RMS 0.15 (~ -16.5 dBFS RMS): with the music bed
+         *    ducked by duckDb (-15 dB default) to ~0.014 RMS, the DJ voice
+         *    sits ~20 dB above the bed - classic intelligible radio
+         *    talk-over, so duckDb itself needs no change.
+         *  - LOUDNESS_MAX_GAIN 4 (+/-12 dB): bounds correction so broken or
+         *    near-silent sources can't be boosted into mush.
+         */
+        const val SONG_TARGET_RMS: Float = 0.08f
+        const val VOICE_TARGET_RMS: Float = 0.15f
+        const val LOUDNESS_MAX_GAIN: Float = 4.0f
     }
 }

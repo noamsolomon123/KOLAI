@@ -1,7 +1,10 @@
 package ai.kolai.mix
 
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.PI
+import kotlin.math.sqrt
+import kotlin.math.tanh
 
 /**
  * Pure-DSP FloatArray math ported 1:1 from backend/radioai/mixrenderer.py.
@@ -167,6 +170,84 @@ object Dsp {
         return if (start < audio.size) audio.copyOfRange(start, audio.size) else audio
     }
 
+    // ------------------------------------------------------------- loudness
+
+    /**
+     * Soft-knee safety limiter. Samples whose |value| <= [threshold] pass
+     * BIT-EXACT (identity), so in-range audio is never recolored. Above the
+     * threshold the overshoot is mapped through tanh, asymptotically
+     * approaching threshold + (1 - threshold) == 1.0 (float rounding may land
+     * exactly ON 1.0 for huge overshoots, never beyond) - no hard-clip
+     * crackle. The mapping is continuous in value AND slope at
+     * the knee (tanh(0) == 0, tanh'(0) == 1), monotonic, and symmetric.
+     * Returns a new array; input untouched.
+     */
+    fun softClip(audio: FloatArray, threshold: Float = 0.95f): FloatArray {
+        if (threshold >= 1.0f) return peakNormalizeClip(audio)
+        val knee = 1.0f - threshold
+        val out = FloatArray(audio.size)
+        for (i in audio.indices) {
+            val v = audio[i]
+            val a = abs(v)
+            out[i] = if (a <= threshold) {
+                v
+            } else {
+                val shaped = threshold + knee * tanh(((a - threshold) / knee).toDouble()).toFloat()
+                if (v > 0.0f) shaped else -shaped
+            }
+        }
+        return out
+    }
+
+    /**
+     * RMS loudness normalization. YouTube-sourced masters differ by many dB;
+     * real radio is loudness-consistent, so every clip is gained toward
+     * [targetRms].
+     *
+     * RMS is measured over the MIDDLE 60% of the clip (the first/last 20% are
+     * skipped) so quiet intros/outros don't skew the level of the song body.
+     * gain = clamp(targetRms / rms, 1/maxGain, maxGain); the gained signal
+     * then runs through the [softClip] soft-knee safety so boosted peaks can
+     * never hard-clip. All-silence input (rms ~ 0) returns an unmodified copy
+     * (gain 1 - no NaN / Inf). Returns a new array; input untouched.
+     */
+    fun normalizeLoudness(
+        audio: FloatArray,
+        targetRms: Float = 0.08f,
+        maxGain: Float = 4.0f,
+    ): FloatArray {
+        if (audio.isEmpty()) return FloatArray(0)
+        val start = (audio.size * 0.2f).toInt()
+        val end = maxOf(start + 1, (audio.size * 0.8f).toInt()).coerceAtMost(audio.size)
+        var sumSq = 0.0
+        for (i in start until end) {
+            val v = audio[i].toDouble()
+            sumSq += v * v
+        }
+        val rms = sqrt(sumSq / (end - start))
+        if (rms < 1e-8) return audio.copyOf()
+        val gain = (targetRms / rms).toFloat().coerceIn(1.0f / maxGain, maxGain)
+        val out = FloatArray(audio.size) { audio[it] * gain }
+        return softClip(out)
+    }
+
+    /**
+     * ~10 ms linear micro-fades at BOTH edges so decoded-AAC segment
+     * boundaries never click: the very first and last samples land exactly at
+     * zero. The fade window clamps to half the clip so in/out never overlap;
+     * a fade of <= 0 samples is a plain copy. Returns a new array.
+     */
+    fun microFadeEdges(audio: FloatArray, fadeS: Float = 0.010f, sr: Int = SR): FloatArray {
+        val out = audio.copyOf()
+        val n = minOf((fadeS * sr).toInt(), out.size / 2)
+        if (n <= 0) return out
+        for (i in 0 until n) {
+            val g = i.toFloat() / n
+            out[i] *= g
+            out[out.size - 1 - i] *= g
+        }
+        return out
+    }
     /**
      * Round an overlap length to a whole number of beats (min 1) at `bpm`.
      * Ports snap_overlap_to_beats. Non-positive bpm returns overlap unchanged.
