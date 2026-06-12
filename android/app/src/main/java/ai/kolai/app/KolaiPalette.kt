@@ -24,13 +24,56 @@ data class KolaiPalette(
     val hueA: Float,
     val hueB: Float,
     val hueC: Float,
+    /** Mood saturation multiplier (1 = the web-exact palette). */
+    val sat: Float = 1f,
 ) {
     // a: hsl(hueA 85% 62%) ; b: hsl(hueB 80% 58%) ; c: hsl(hueC 78% 55%)
-    val a: Color get() = hsl(hueA, 0.85f, 0.62f)
-    val b: Color get() = hsl(hueB, 0.80f, 0.58f)
-    val c: Color get() = hsl(hueC, 0.78f, 0.55f)
+    val a: Color get() = hsl(hueA, (0.85f * sat).coerceIn(0f, 1f), 0.62f)
+    val b: Color get() = hsl(hueB, (0.80f * sat).coerceIn(0f, 1f), 0.58f)
+    val c: Color get() = hsl(hueC, (0.78f * sat).coerceIn(0f, 1f), 0.55f)
     // soft glow color: hsl(hueA 90% 60%)
-    val glow: Color get() = hsl(hueA, 0.90f, 0.60f)
+    val glow: Color get() = hsl(hueA, (0.90f * sat).coerceIn(0f, 1f), 0.60f)
+}
+
+// ---------------------------------------------------------------------------
+//  Mood-reactive tinting -- the mood chips subtly steer the ambiance by easing
+//  the track-derived hues toward a mood "anchor" hue and scaling saturation.
+//  Pure math here; the SLOW transition happens where the values are consumed
+//  (MeshBackground / cover glow animate toward the new targets).
+// ---------------------------------------------------------------------------
+
+private class MoodTint(val anchor: Float, val blend: Float, val sat: Float)
+
+private val MOOD_TINTS = mapOf(
+    // party: hot pink/red, extra saturated
+    "party" to MoodTint(anchor = 350f, blend = 0.40f, sat = 1.15f),
+    // late night: deep blues
+    "late_night" to MoodTint(anchor = 228f, blend = 0.52f, sat = 0.92f),
+    // focus: muted, cool and quiet
+    "focus" to MoodTint(anchor = 215f, blend = 0.30f, sat = 0.55f),
+    // morning: golden hour
+    "morning" to MoodTint(anchor = 42f, blend = 0.46f, sat = 1.05f),
+    // "mix" (and anything unknown) keeps the pure track palette
+)
+
+/** Shortest-path hue interpolation on the 0..360 color wheel. */
+fun lerpHue(from: Float, to: Float, t: Float): Float {
+    var d = (to - from) % 360f
+    if (d > 180f) d -= 360f
+    if (d < -180f) d += 360f
+    return ((from + d * t) % 360f + 360f) % 360f
+}
+
+/** Tint this palette toward the active mood (no-op for "mix"/unknown). */
+fun KolaiPalette.forMood(mood: String): KolaiPalette {
+    val tint = MOOD_TINTS[mood] ?: return this
+    return copy(
+        hueA = lerpHue(hueA, tint.anchor, tint.blend),
+        // secondary hues follow more loosely so the mesh keeps its variety
+        hueB = lerpHue(hueB, tint.anchor, tint.blend * 0.75f),
+        hueC = lerpHue(hueC, tint.anchor, tint.blend * 0.55f),
+        sat = tint.sat,
+    )
 }
 
 fun paletteFor(title: String): KolaiPalette {

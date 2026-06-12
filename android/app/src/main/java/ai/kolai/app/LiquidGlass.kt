@@ -1,8 +1,12 @@
 package ai.kolai.app
 
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
@@ -11,6 +15,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
@@ -48,15 +53,19 @@ fun MeshBackground(
     palette: KolaiPalette,
     modifier: Modifier = Modifier,
 ) {
-    // Ease each hue toward the new track over ~2.4s. Idle = no animation frames.
+    // Ease each hue toward the new track/mood over ~2.4s. Idle = no animation
+    // frames -- these only run on a state change, never continuously.
     val hueA by animateFloatAsState(palette.hueA, tween(2400), label = "hueA")
     val hueB by animateFloatAsState(palette.hueB, tween(2400), label = "hueB")
     val hueC by animateFloatAsState(palette.hueC, tween(2400), label = "hueC")
+    // Mood saturation drifts even slower, so a chip tap feels like the room
+    // light changing, not a repaint.
+    val sat by animateFloatAsState(palette.sat, tween(3200), label = "meshSat")
 
-    val a = hsl(hueA, 0.92f, 0.60f, 0.44f)
-    val b = hsl(hueB, 0.90f, 0.58f, 0.40f)
-    val c = hsl(hueC, 0.88f, 0.55f, 0.36f)
-    val a2 = hsl(hueA, 0.80f, 0.64f, 0.26f)
+    val a = hsl(hueA, (0.92f * sat).coerceIn(0f, 1f), 0.60f, 0.44f)
+    val b = hsl(hueB, (0.90f * sat).coerceIn(0f, 1f), 0.58f, 0.40f)
+    val c = hsl(hueC, (0.88f * sat).coerceIn(0f, 1f), 0.55f, 0.36f)
+    val a2 = hsl(hueA, (0.80f * sat).coerceIn(0f, 1f), 0.64f, 0.26f)
 
     Box(
         modifier
@@ -155,3 +164,26 @@ fun Modifier.liquidGlass(
         )
     }
     .border(BorderStroke(1.dp, borderColor), shape)
+
+/**
+ * Springy press feedback for tappable glass elements. Pass the SAME
+ * interaction source to `clickable(interactionSource = ...)`. Cheap: a single
+ * spring that only runs on press/release; scale applies in the draw layer
+ * (graphicsLayer), so no relayout per frame.
+ */
+@Composable
+fun Modifier.pressScale(
+    interaction: MutableInteractionSource,
+    pressedScale: Float = 0.94f,
+): Modifier {
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) pressedScale else 1f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "pressScale",
+    )
+    return this.graphicsLayer {
+        scaleX = scale
+        scaleY = scale
+    }
+}

@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -125,12 +126,14 @@ private fun LivePill() {
 
 @Composable
 private fun GhostButton(text: String, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
+            .pressScale(interaction)
             .clip(RoundedCornerShape(KolaiRadii.PILL.dp))
             .background(KolaiColors.GlassStrong)
             .border(1.dp, KolaiColors.GlassBorderSoft, RoundedCornerShape(KolaiRadii.PILL.dp))
-            .clickable(onClick = onClick)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -140,12 +143,14 @@ private fun GhostButton(text: String, onClick: () -> Unit) {
 
 @Composable
 private fun GhostIconButton(glyph: String, onClick: () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
+            .pressScale(interaction)
             .clip(RoundedCornerShape(KolaiRadii.PILL.dp))
             .background(KolaiColors.GlassStrong)
             .border(1.dp, KolaiColors.GlassBorderSoft, RoundedCornerShape(KolaiRadii.PILL.dp))
-            .clickable(onClick = onClick)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
             .padding(horizontal = 11.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -215,9 +220,11 @@ internal fun MoodBar() {
 @Composable
 private fun MoodChip(mood: Mood, selected: Boolean, onClick: () -> Unit) {
     val shape = RoundedCornerShape(KolaiRadii.PILL.dp)
+    val interaction = remember { MutableInteractionSource() }
     val base = Modifier
+        .pressScale(interaction, pressedScale = 0.93f)
         .clip(shape)
-        .clickable(onClick = onClick)
+        .clickable(interactionSource = interaction, indication = null, onClick = onClick)
     val styled = if (selected) {
         base
             .background(

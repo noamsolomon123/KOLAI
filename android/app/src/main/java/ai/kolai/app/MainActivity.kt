@@ -288,7 +288,11 @@ fun KolaiScreen(
         }
     }
 
-    val palette = if (songTitle != null) paletteFor(songTitle) else IdlePalette
+    // Mood-reactive ambiance: the active mood chip subtly steers the
+    // track-derived hues (party warmer, late-night deep blue, focus muted,
+    // morning golden). Consumers animate toward the new values slowly.
+    val moodKey by KolaiMood.mood.collectAsState()
+    val palette = (if (songTitle != null) paletteFor(songTitle) else IdlePalette).forMood(moodKey)
 
     Box(modifier = Modifier.fillMaxSize()) {
         MeshBackground(palette = palette, modifier = Modifier.fillMaxSize())

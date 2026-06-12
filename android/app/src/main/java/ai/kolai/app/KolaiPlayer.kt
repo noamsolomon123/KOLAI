@@ -53,8 +53,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.CompositionLocalProvider
 import ai.kolai.app.wiring.CoverArt
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -98,6 +109,18 @@ internal fun CoverArtHero(
         animationSpec = tween(600),
         label = "coverGlow",
     )
+    // Ambient glow eases toward the mood-tinted track hue -- no palette
+    // extraction, just the cheap radial gradient recolored slowly.
+    val glowColor by animateColorAsState(palette.glow, tween(1800), label = "coverGlowColor")
+    // Entrance: a small scale+fade every time the song changes. One-shot
+    // animation on state change, nothing runs while a song plays.
+    val entrance = remember { Animatable(1f) }
+    LaunchedEffect(title) {
+        if (!title.isNullOrBlank()) {
+            entrance.snapTo(0f)
+            entrance.animateTo(1f, tween(650, easing = FastOutSlowInEasing))
+        }
+    }
     // The screen column hands this slot ALL leftover vertical space (weight),
     // and the square cover sizes itself to the smaller of width/height -- so
     // the whole screen always fits with no scrolling, on any display.
@@ -110,7 +133,7 @@ internal fun CoverArtHero(
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawRect(
                     Brush.radialGradient(
-                        colors = listOf(palette.glow.copy(alpha = glowAlpha), Color.Transparent),
+                        colors = listOf(glowColor.copy(alpha = glowAlpha), Color.Transparent),
                         center = Offset(size.width / 2f, size.height / 2f),
                         radius = size.minDimension * 0.62f,
                     ),
@@ -119,6 +142,13 @@ internal fun CoverArtHero(
             Box(
                 modifier = Modifier
                     .fillMaxSize(0.9f)
+                    .graphicsLayer {
+                        val e = entrance.value
+                        val sc = 0.96f + 0.04f * e
+                        scaleX = sc
+                        scaleY = sc
+                        alpha = 0.5f + 0.5f * e
+                    }
                     .clip(shape)
                     .drawBehind { drawCover(palette) }
                     .border(1.dp, Color.White.copy(alpha = 0.12f), shape),
@@ -285,25 +315,29 @@ internal fun MetaText(title: String, artist: String?, error: Boolean) {
         modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        // Single line + marquee: long Hebrew/English titles glide instead of
+        // clipping (the marquee only animates when text actually overflows;
+        // short titles stay static and centered by the column).
         Text(
             text = title,
-            color = if (error) KolaiColors.Live else KolaiColors.Text,
+            color = if (error) KolaiColors.LiveText else KolaiColors.Text,
             fontFamily = Display,
             fontWeight = FontWeight.SemiBold,
-            fontSize = 30.sp,
+            fontSize = 29.sp,
             textAlign = TextAlign.Center,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
+            maxLines = 1,
+            modifier = Modifier.basicMarquee(),
         )
         if (!artist.isNullOrBlank()) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
                 text = artist,
-                color = KolaiColors.TextDim,
-                fontSize = 15.sp,
+                // error detail reads calm: faint + small, never alarming red
+                color = if (error) KolaiColors.TextFaint else KolaiColors.TextDim,
+                fontSize = if (error) 12.5.sp else 15.sp,
                 textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+                maxLines = 1,
+                modifier = Modifier.basicMarquee(),
             )
         }
     }
@@ -324,12 +358,46 @@ internal fun TuningMeta() {
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(10.dp))
-        Text(
-            text = "מתכוונן לשידור החי",
-            color = KolaiColors.TextDim,
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "מתכוונן לשידור החי",
+                color = KolaiColors.TextDim,
+                fontSize = 14.sp,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.width(8.dp))
+            BreathingDots()
+        }
+    }
+}
+
+/**
+ * Three softly breathing dots for the tuning state -- a traveling sine over a
+ * single infinite float; the phase is read only inside the draw lambda, so
+ * each frame is a redraw, never a recomposition.
+ */
+@Composable
+private fun BreathingDots() {
+    val inf = rememberInfiniteTransition(label = "tuningDots")
+    val phase by inf.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1500, easing = LinearEasing)),
+        label = "dotPhase",
+    )
+    val color = KolaiColors.TextDim
+    Canvas(modifier = Modifier.width(26.dp).height(8.dp)) {
+        val r = size.height * 0.32f
+        val step = size.width / 3f
+        for (i in 0 until 3) {
+            val t = sin(2f * PI.toFloat() * (phase - i * 0.18f))
+            val a = 0.25f + 0.55f * (0.5f + 0.5f * t)
+            drawCircle(
+                color = color.copy(alpha = a),
+                radius = r,
+                center = Offset(step * (i + 0.5f), size.height / 2f),
+            )
+        }
     }
 }
 
@@ -343,6 +411,25 @@ internal fun DjOnAirCard(palette: KolaiPalette, active: Boolean, beat: String?) 
     val icon = if (active) (BEAT_ICONS[beat] ?: "🎙️") else "🎙️"
     val bodyText = if (active) (BEAT_LABELS[beat] ?: "שידור חי") else "מתנגן עכשיו"
 
+    // Broadcast feel: the chip leans live-red while the DJ is actually
+    // speaking and relaxes back to the cool accent between links -- colors
+    // crossfade on the state change instead of snapping.
+    val tileBg by animateColorAsState(
+        targetValue = if (active) KolaiColors.LiveTint else hsl(ACCENT_HUE_A, 0.70f, 0.55f, 0.22f),
+        animationSpec = tween(600),
+        label = "djTileBg",
+    )
+    val tileBorder by animateColorAsState(
+        targetValue = if (active) KolaiColors.LiveBorder else hsl(ACCENT_HUE_A, 0.80f, 0.70f, 0.40f),
+        animationSpec = tween(600),
+        label = "djTileBorder",
+    )
+    val onAirColor by animateColorAsState(
+        targetValue = if (active) KolaiColors.LiveText else hsl(ACCENT_HUE_B, 0.80f, 0.80f),
+        animationSpec = tween(600),
+        label = "djOnAirColor",
+    )
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -354,21 +441,28 @@ internal fun DjOnAirCard(palette: KolaiPalette, active: Boolean, beat: String?) 
             modifier = Modifier
                 .size(40.dp)
                 .clip(RoundedCornerShape(13.dp))
-                .background(hsl(ACCENT_HUE_A, 0.70f, 0.55f, 0.22f))
-                .border(1.dp, hsl(ACCENT_HUE_A, 0.80f, 0.70f, 0.40f), RoundedCornerShape(13.dp)),
+                .background(tileBg)
+                .border(1.dp, tileBorder, RoundedCornerShape(13.dp)),
             contentAlignment = Alignment.Center,
         ) {
             Text(text = icon, fontSize = 18.sp)
         }
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "ON AIR",
-                color = hsl(ACCENT_HUE_B, 0.80f, 0.80f),
-                fontSize = 10.5.sp,
-                fontWeight = FontWeight.SemiBold,
-                letterSpacing = 1.6.sp,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                AnimatedVisibility(
+                    visible = active,
+                    enter = fadeIn(tween(400)) + expandHorizontally(tween(400)),
+                    exit = fadeOut(tween(300)) + shrinkHorizontally(tween(300)),
+                ) { OnAirDot() }
+                Text(
+                    text = "ON AIR",
+                    color = onAirColor,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 1.6.sp,
+                )
+            }
             Spacer(Modifier.height(2.dp))
             Text(
                 text = bodyText,
@@ -379,11 +473,37 @@ internal fun DjOnAirCard(palette: KolaiPalette, active: Boolean, beat: String?) 
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (!active) {
-            Spacer(Modifier.width(10.dp))
-            Equalizer()
+        AnimatedVisibility(
+            visible = !active,
+            enter = fadeIn(tween(450)) + expandHorizontally(tween(450)),
+            exit = fadeOut(tween(300)) + shrinkHorizontally(tween(300)),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Spacer(Modifier.width(10.dp))
+                Equalizer()
+            }
         }
     }
+}
+
+/** Gently pulsing live dot -- only composed while the DJ is on air. */
+@Composable
+private fun OnAirDot() {
+    val inf = rememberInfiniteTransition(label = "onAir")
+    val pulse by inf.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(800), RepeatMode.Reverse),
+        label = "onAirPulse",
+    )
+    Box(
+        modifier = Modifier
+            .padding(end = 6.dp)
+            .size(7.dp)
+            .graphicsLayer { alpha = pulse }
+            .clip(CircleShape)
+            .background(KolaiColors.Live),
+    )
 }
 
 @Composable
@@ -444,14 +564,16 @@ internal fun TransportRow(
 
 @Composable
 private fun TransportCircle(enabled: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
+    val interaction = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
             .size(56.dp)
+            .pressScale(interaction)
             .alpha(if (enabled) 1f else 0.4f)
             .clip(CircleShape)
             .background(KolaiColors.GlassStrong)
             .border(1.dp, KolaiColors.GlassBorderSoft, CircleShape)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { content() }
 }
@@ -511,13 +633,15 @@ private fun PlayPauseButton(playing: Boolean, busy: Boolean, onClick: () -> Unit
                     )
                 },
         )
+        val interaction = remember { MutableInteractionSource() }
         Box(
             modifier = Modifier
                 .size(78.dp)
+                .pressScale(interaction, pressedScale = 0.92f)
                 .clip(CircleShape)
                 .background(Brush.linearGradient(listOf(KolaiColors.Green, KolaiColors.GreenDeep)))
                 .border(1.dp, Color.White.copy(alpha = 0.40f), CircleShape)
-                .clickable(onClick = onClick),
+                .clickable(interactionSource = interaction, indication = null, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
             when {
