@@ -31,6 +31,8 @@ import com.google.common.util.concurrent.ListenableFuture
 import ai.kolai.app.wiring.KolaiEngine
 import ai.kolai.app.wiring.CoverArt
 import ai.kolai.app.wiring.LiveDjContext
+import ai.kolai.app.wiring.PoTokenRegistry
+import ai.kolai.app.wiring.WebViewPoTokenGenerator
 import ai.kolai.station.BlockMeta
 import ai.kolai.station.RollingPlanner
 import ai.kolai.station.StationEngine
@@ -127,6 +129,11 @@ class KolaiMediaService : MediaLibraryService() {
 
         createNotificationChannel()
 
+        // The service can start without the activity (media resumption /
+        // START_STICKY restart): load the persisted mood + auto flag here too
+        // so the planner never runs on defaults the user already changed.
+        KolaiMood.load(this)
+
         player = ExoPlayer.Builder(this)
             // Car-grade audio focus: declare ourselves as MEDIA/MUSIC and let
             // ExoPlayer handle focus, so KOLAI ducks for navigation prompts and
@@ -173,6 +180,12 @@ class KolaiMediaService : MediaLibraryService() {
         // cold render even though nothing is playing yet (player stays IDLE until
         // block 0 lands). This is what keeps the OS/Media3 from killing us.
         promoteToForeground("מתחבר לתחנה…")
+
+        // ADAPTIVE AUDIO (wave 4): install the WebView-based PoToken generator
+        // BEFORE the engine is built, so NewPipeSource can attempt best-effort
+        // adaptive audio-only streams. Strictly additive: any token failure
+        // falls back to the guaranteed muxed-360p path.
+        PoTokenRegistry.source = WebViewPoTokenGenerator(applicationContext)
 
         buildEngine()
         startFeedLoop()
@@ -255,14 +268,23 @@ class KolaiMediaService : MediaLibraryService() {
                 llmModel = cfg.llmModel,
                 ttsModel = cfg.ttsModel,
                 ttsVoice = cfg.ttsVoice,
+                ttsVoiceB = cfg.ttsVoiceB,
                 cacheDir = cacheRoot,
                 blocksDir = blocksDir,
                 ctxFactory = { http ->
-                    val live = LiveDjContext(http = http, scope = serviceScope)
+                    val live = LiveDjContext(
+                        http = http,
+                        scope = serviceScope,
+                        // Friday-recap substrate: the SAME aired log this
+                        // service appends to in logAired (service cacheDir,
+                        // AiredLog resolves <cacheDir>/kolai/aired.jsonl).
+                        recapLog = AiredLog.file(cacheDir),
+                    )
                     // Per-block mood for the DJ prompts/cadence/TTS. "mix" is
                     // mapped to null INSIDE LiveDjContext so default-mood
-                    // blocks keep the exact pre-mood behaviour.
-                    live.moodProvider = { KolaiMood.mood.value }
+                    // blocks keep the exact pre-mood behaviour. EFFECTIVE mood:
+                    // the broadcast clock while auto is on, else the chip pick.
+                    live.moodProvider = { KolaiMood.effectiveMood.value }
                     liveCtx = live
                     live::current
                 },
@@ -432,13 +454,17 @@ class KolaiMediaService : MediaLibraryService() {
     // --- mood + retune bridges -------------------------------------------------
 
     /**
-     * Keep the planner's mood in sync with the UI chips. The key is passed
-     * AS-IS ("mix" included): [RollingPlanner] forwards it to the setlist
-     * planner, which ignores null/"mix", so the default mood costs nothing.
+     * Keep the planner's mood in sync with the EFFECTIVE mood (the broadcast
+     * clock while auto is on, else the chip pick). [KolaiMood.effectiveMood]
+     * is already distinct-until-changed, so the clock's 10-min ticker only
+     * reaches the planner on a REAL mood boundary; setMood affects FUTURE
+     * planning only (no retune is ever triggered from here). The key is
+     * passed AS-IS ("mix" included): [RollingPlanner] forwards it to the
+     * setlist planner, which ignores null/"mix", so the default costs nothing.
      */
     private fun startMoodCollector() {
         serviceScope.launch {
-            KolaiMood.mood.collect { value ->
+            KolaiMood.effectiveMood.collect { value ->
                 Log.i(TAG, "mood -> $value")
                 rollingPlanner.setMood(value)
             }
@@ -606,6 +632,7 @@ class KolaiMediaService : MediaLibraryService() {
         val key = "$blockIndex|${seg.title}|${seg.artist}"
         if (key == lastMetaSong) return
         lastMetaSong = key
+        logAired(seg)
         // Publish immediately with whatever cover is already cached; when the
         // cover is unknown, fetch it async and re-publish ONLY if this segment
         // is still the live one (lastMetaSong unchanged).
@@ -631,6 +658,27 @@ class KolaiMediaService : MediaLibraryService() {
                 .setMediaMetadata(songMetadata(seg.title, seg.artist, artworkUrl))
                 .build()
             player.replaceMediaItem(player.currentMediaItemIndex, updated)
+        }
+    }
+
+    /**
+     * Append the song that just went ON AIR to the aired log (the Friday
+     * recap substrate). Called exactly on [lastMetaSong] song-change edges,
+     * so each aired song is logged once. Fire-and-forget on IO; [AiredLog]
+     * itself never throws. `discovery` stays false until Song carries a
+     * taste-pool-vs-discovery flag.
+     */
+    private fun logAired(seg: ai.kolai.station.Segment) {
+        val logFile = AiredLog.file(cacheDir)
+        val mood = KolaiMood.effectiveMood.value
+        serviceScope.launch(Dispatchers.IO) {
+            AiredLog.append(
+                file = logFile,
+                ts = System.currentTimeMillis(),
+                title = seg.title,
+                artist = seg.artist.ifBlank { null },
+                mood = mood,
+            )
         }
     }
 

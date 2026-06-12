@@ -1,5 +1,7 @@
 package ai.kolai.app.wiring
 
+import ai.kolai.app.AiredLog
+import ai.kolai.app.KolaiCalendar
 import ai.kolai.station.DjClock
 import ai.kolai.station.DjContext
 import ai.kolai.station.Moods
@@ -19,6 +21,8 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
+import java.time.DayOfWeek
 import java.util.Calendar
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -48,6 +52,12 @@ class LiveDjContext(
     private val city: String = "Tel Aviv",
     private val topics: List<String> = listOf("טכנולוגיה", "מוזיקה"),
     private val scope: CoroutineScope,
+    /**
+     * The aired-songs JSONL log ([AiredLog.file]) feeding the Friday weekly
+     * recap. Null (the default) disables the recap entirely - existing
+     * constructions keep their exact pre-wave-4 behavior.
+     */
+    private val recapLog: File? = null,
 ) {
     // Cached live fields + their fetch timestamps (0 = never fetched).
     @Volatile private var weather: String? = null
@@ -57,6 +67,12 @@ class LiveDjContext(
     @Volatile private var newsAtMs: Long = 0
 
     private val refreshing = AtomicBoolean(false)
+
+    // Friday-recap cache (same @Volatile + TTL pattern as the weather above):
+    // the brief is recomputed from the aired log at most once per 30 min, so
+    // the per-block [current] calls stay cheap all Friday afternoon.
+    @Volatile private var recapBriefCache: String? = null
+    @Volatile private var recapAtMs: Long = 0
 
     /**
      * Current mood key supplier (set by the service to read [KolaiMood]).
@@ -71,6 +87,9 @@ class LiveDjContext(
         val (timeStr, partOfDay) =
             DjClock.nowParts(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
         maybeRefresh(force = false)
+        // Israeli-calendar awareness: pure on-device clock math (no I/O), so
+        // it is recomputed fresh for every rendered block like the time is.
+        val (calendarNote, somber) = KolaiCalendar.calendarNote(java.time.ZonedDateTime.now())
         return DjContext(
             timeStr = timeStr,
             partOfDay = partOfDay,
@@ -78,7 +97,35 @@ class LiveDjContext(
             generalHeadline = generalHeadline,
             topicHeadlines = topicHeadlines,
             mood = moodProvider()?.takeIf { it != Moods.DEFAULT },
+            calendarNote = calendarNote,
+            somber = somber,
+            recapBrief = currentRecapBrief(),
         )
+    }
+
+    /**
+     * Friday weekly-recap brief (feature 12 gate): non-null ONLY on Fridays
+     * 12:00-19:59 local, when [recapLog] is configured and the week's stats
+     * clear [AiredLog.weeklyStats]'s minimum (null stats -> null brief).
+     *
+     * Unlike weather/news this is computed SYNCHRONOUSLY (a small local file
+     * read, never network): BlockRenderer only uses the brief on a session's
+     * FIRST block, so an async fill would usually miss the one block that
+     * matters on a Friday-afternoon cold start. The 30-min TTL keeps every
+     * later per-block call a pair of volatile reads.
+     */
+    private fun currentRecapBrief(): String? {
+        val log = recapLog ?: return null
+        val nowDt = java.time.ZonedDateTime.now()
+        if (nowDt.dayOfWeek != DayOfWeek.FRIDAY || nowDt.hour !in 12..19) return null
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - recapAtMs <= RECAP_TTL_MS) return recapBriefCache
+        // Claim the slot BEFORE computing so a concurrent current() call does
+        // not duplicate the file read (a stale-by-one-block brief is fine).
+        recapAtMs = nowMs
+        recapBriefCache = AiredLog.weeklyStats(log)?.let { AiredLog.recapBrief(it) }
+        Log.i(TAG, "friday recap brief refreshed: ${recapBriefCache != null}")
+        return recapBriefCache
     }
 
     /** Eager warm-up (service start): kick an async fetch without blocking. */
@@ -184,6 +231,7 @@ class LiveDjContext(
         private const val FETCH_TIMEOUT_MS = 10_000L
         private const val WEATHER_TTL_MS = 30L * 60 * 1000
         private const val NEWS_TTL_MS = 20L * 60 * 1000
+        private const val RECAP_TTL_MS = 30L * 60 * 1000
 
         // Python: weather._GEO_URL / _FORECAST_URL, news._BASE / _TAIL.
         private const val GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"

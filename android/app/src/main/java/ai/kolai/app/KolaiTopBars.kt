@@ -166,7 +166,12 @@ private fun GhostIconButton(glyph: String, onClick: () -> Unit) {
 internal fun MoodBar() {
     // Single source of truth: the chips render whatever KolaiMood holds (the
     // service + planner read the same flow), so UI and engine can never drift.
-    val active by KolaiMood.mood.collectAsState()
+    // auto on  -> the "אוטו" chip is selected and the CLOCK-derived mood's chip
+    //             gets a subtle secondary highlight (hinted).
+    // auto off -> the manual pick is selected, exactly the pre-auto behavior.
+    val auto by KolaiMood.auto.collectAsState()
+    val manual by KolaiMood.mood.collectAsState()
+    val effective by KolaiMood.effectiveMood.collectAsState()
     val context = LocalContext.current
     var toastTick by remember { mutableIntStateOf(0) }
     var toastVisible by remember { mutableStateOf(false) }
@@ -193,12 +198,24 @@ internal fun MoodBar() {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            // FIRST chip (rightmost in RTL): re-enable the broadcast clock.
+            MoodChip(
+                mood = AUTO_CHIP,
+                selected = auto,
+                onClick = {
+                    if (!auto) {
+                        KolaiMood.setAutoAndPersist(context, true)
+                        toastTick += 1
+                    }
+                },
+            )
             MOODS.forEach { mood ->
                 MoodChip(
                     mood = mood,
-                    selected = active == mood.key,
+                    selected = !auto && manual == mood.key,
+                    hinted = auto && effective == mood.key,
                     onClick = {
-                        if (active != mood.key) {
+                        if (auto || manual != mood.key) {
                             KolaiMood.setAndPersist(context, mood.key)
                             toastTick += 1
                         }
@@ -217,16 +234,24 @@ internal fun MoodBar() {
     }
 }
 
+/** The auto ("broadcast clock") chip, rendered before the mood chips. */
+private val AUTO_CHIP = Mood("auto", "אוטו", "✨")
+
 @Composable
-private fun MoodChip(mood: Mood, selected: Boolean, onClick: () -> Unit) {
+private fun MoodChip(
+    mood: Mood,
+    selected: Boolean,
+    hinted: Boolean = false,
+    onClick: () -> Unit,
+) {
     val shape = RoundedCornerShape(KolaiRadii.PILL.dp)
     val interaction = remember { MutableInteractionSource() }
     val base = Modifier
         .pressScale(interaction, pressedScale = 0.93f)
         .clip(shape)
         .clickable(interactionSource = interaction, indication = null, onClick = onClick)
-    val styled = if (selected) {
-        base
+    val styled = when {
+        selected -> base
             .background(
                 Brush.linearGradient(
                     listOf(
@@ -236,8 +261,13 @@ private fun MoodChip(mood: Mood, selected: Boolean, onClick: () -> Unit) {
                 ),
             )
             .border(1.dp, hsl(ACCENT_HUE_B, 0.75f, 0.65f, 0.45f), shape)
-    } else {
-        base
+        // Subtle secondary highlight: while auto is on, the chip of the
+        // CLOCK-derived mood glows faintly so the listener sees what the
+        // broadcast clock chose without it looking hand-picked.
+        hinted -> base
+            .background(hsl(ACCENT_HUE_B, 0.55f, 0.50f, 0.16f))
+            .border(1.dp, hsl(ACCENT_HUE_B, 0.65f, 0.62f, 0.28f), shape)
+        else -> base
             .background(KolaiColors.Glass2)
             .border(1.dp, KolaiColors.GlassBorderSoft, shape)
     }

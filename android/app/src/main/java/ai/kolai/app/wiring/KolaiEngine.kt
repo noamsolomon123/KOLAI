@@ -52,7 +52,11 @@ class KolaiEngine private constructor(
          * @param geminiKeys      ordered Gemini API keys (rotated on 429/5xx).
          * @param llmModel        text model id (e.g. gemini-3.1-flash-lite-preview).
          * @param ttsModel        TTS model id (e.g. gemini-3.1-flash-tts-preview).
-         * @param ttsVoice        prebuilt voice name (e.g. Algieba).
+         * @param ttsVoice        prebuilt voice name (e.g. Algieba) - host A.
+         * @param ttsVoiceB       second-host voice for two-host banter (must
+         *                        differ from [ttsVoice] to be audible as a
+         *                        dialogue). Defaulted so existing callers
+         *                        (e.g. the e2e instrumentation test) compile.
          * @param cacheDir        downloaded-track + voice cache root.
          * @param blocksDir       where block_<i>.m4a files are written.
          * @param ctxFactory      builds the per-block DJ-context PROVIDER from the
@@ -67,6 +71,7 @@ class KolaiEngine private constructor(
             llmModel: String,
             ttsModel: String,
             ttsVoice: String,
+            ttsVoiceB: String = "Iapetus",
             cacheDir: File,
             blocksDir: File,
             ctxFactory: (HttpClient) -> (() -> DjContext) = { { DjContext() } },
@@ -127,7 +132,10 @@ class KolaiEngine private constructor(
                 ctx = ctxProvider,
                 blocksDir = blocksDir.absolutePath,
                 voiceA = ttsVoice,
-                voiceB = null,
+                // Non-null voiceB ENABLES the two-host banter path: planned
+                // banter turns render through VoiceRendererAdapter.renderDialogue
+                // (multi-speaker Gemini TTS) instead of the single-voice join.
+                voiceB = ttsVoiceB,
                 analyzeFn = analyzeFn,
                 loadFn = loadFn,
                 encoder = encoder,

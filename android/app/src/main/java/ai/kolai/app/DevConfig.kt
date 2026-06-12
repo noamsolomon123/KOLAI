@@ -18,6 +18,8 @@ data class DevConfig(
     val llmModel: String,
     val ttsModel: String,
     val ttsVoice: String,
+    /** Second-host TTS voice for two-host banter (`gemini.tts.voice.b`). */
+    val ttsVoiceB: String,
 ) {
     companion object {
         private const val ASSET = "kolai_dev.properties"
@@ -49,6 +51,11 @@ data class DevConfig(
                 ttsModel = props.getProperty("gemini.tts.model")?.trim()
                     ?: "gemini-3.1-flash-tts-preview",
                 ttsVoice = props.getProperty("gemini.tts.voice")?.trim() ?: "Algieba",
+                // OPTIONAL key: the gitignored properties file does NOT need it
+                // (missing/blank -> default), so existing dev installs keep
+                // working and banter just uses the stock co-host voice.
+                ttsVoiceB = props.getProperty("gemini.tts.voice.b")?.trim()
+                    ?.takeIf { it.isNotEmpty() } ?: "Iapetus",
             )
         }
     }

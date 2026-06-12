@@ -1,6 +1,7 @@
 package ai.kolai.app.wiring
 
 import ai.kolai.acquire.NewPipeSource
+import ai.kolai.acquire.PoTokenSource
 import ai.kolai.core.DJSlot
 import ai.kolai.core.Song
 import ai.kolai.mix.AacEncoder
@@ -10,6 +11,7 @@ import ai.kolai.station.AudioFetcher as StationAudioFetcher
 import ai.kolai.station.BlockEncoder as StationBlockEncoder
 import ai.kolai.station.LlmClient as StationLlmClient
 import ai.kolai.station.VoiceRenderer as StationVoiceRenderer
+import ai.kolai.station.joinDialogue
 import ai.kolai.voice.VoiceRenderer as VoiceVoiceRenderer
 import kotlinx.coroutines.runBlocking
 import java.io.File
@@ -54,6 +56,25 @@ class VoiceRendererAdapter(
 ) : StationVoiceRenderer {
     override fun render(text: String, style: String?): DJSlot =
         runBlocking { inner.render(text, style = style) }
+
+    /**
+     * TWO-HOST DIALOGUE (wave 4): bridge the :station dialogue seam to the
+     * :voice multi-speaker renderer (one Gemini multi-speaker TTS call), same
+     * runBlocking bridge as [render]. On ANY failure (network, TTS refusal,
+     * parse error, ...) fall back to the seam's DEFAULT single-voice behavior:
+     * the turns flattened via [joinDialogue] and spoken through [render] - so
+     * a broken dialogue call degrades to the pre-wave-3 substitute break
+     * instead of killing the block render.
+     */
+    override fun renderDialogue(
+        turns: List<Pair<String, String>>,
+        voiceB: String,
+        style: String?,
+    ): DJSlot = try {
+        runBlocking { inner.renderDialogue(turns, voiceB = voiceB, style = style) }
+    } catch (e: Throwable) {
+        render(joinDialogue(turns), style)
+    }
 }
 
 /**
@@ -112,13 +133,47 @@ val analyzeFn: (String) -> ai.kolai.core.TrackAnalysis = { path ->
 /**
  * The :station load seam: decode the file to mono 44.1k PCM. Mirrors Python
  * `load_fn`.
+ *
+ * RESAMPLE QUALITY (wave 4): [ai.kolai.analyze.AudioDecoder.decodeToPcm] now
+ * resamples with the windowed-sinc `resampleSinc` (was `resampleLinear`), so
+ * BOTH paths through this seam get the quality resampler: the 24 kHz Gemini
+ * TTS voice WAVs (the path the wave-2 TODO targeted - linear interpolation
+ * audibly dulls speech consonants) AND any song decoded at a non-44.1k rate
+ * (sinc is strictly better there too; 44.1k -> 44.1k input is returned
+ * unchanged, so the common song case costs nothing).
  */
 val loadFn: (String) -> FloatArray = { path ->
     ai.kolai.analyze.AudioDecoder.decodeToPcm(path, 44100)
 }
 
-/** Convenience: a NewPipe-backed fetch source `(Song, cacheDir) -> path`. */
+/**
+ * ADAPTIVE-AUDIO seam (wave-1 H): a process-wide holder for the [PoTokenSource]
+ * implementation. [KolaiEngine.build] has no Android [android.content.Context]
+ * (it is pure JVM wiring), but the WebView PoToken generator NEEDS one. So the
+ * Android layer that DOES have a Context -- the foreground media service -- sets
+ * this registry at startup, and [newPipeSource] threads it into [NewPipeSource].
+ *
+ * WAVE-4 / SERVICE WIRING (done): [KolaiMediaService.onCreate], before building
+ * the engine, does:
+ *
+ *     PoTokenRegistry.source = WebViewPoTokenGenerator(applicationContext)
+ *
+ * When left null (default -- e.g. tests, or before the service sets it),
+ * [NewPipeSource] registers NO provider and behaviour is byte-identical to the
+ * pre-feature muxed-360p path. Setting it is therefore strictly additive.
+ */
+object PoTokenRegistry {
+    @Volatile
+    var source: PoTokenSource? = null
+}
+
+/**
+ * Convenience: a NewPipe-backed fetch source `(Song, cacheDir) -> path`. Reads
+ * [PoTokenRegistry.source] so that, when the service has installed a WebView
+ * PoToken generator, [NewPipeSource] can attempt the adaptive audio-only streams;
+ * otherwise it falls back to the muxed floor.
+ */
 fun newPipeSource(): (Song, File) -> String {
-    val src = NewPipeSource()
+    val src = NewPipeSource(poTokenSource = PoTokenRegistry.source)
     return { song, cacheDir -> src.fetch(song, cacheDir) }
 }
