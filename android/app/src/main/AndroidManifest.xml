@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <!-- Android 13+ runtime notification permission (media notification). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- ExoPlayer WAKE_MODE_LOCAL (screen-off playback) acquires a partial
+         wake lock; without this declared the player CRASHES on play. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="true"
