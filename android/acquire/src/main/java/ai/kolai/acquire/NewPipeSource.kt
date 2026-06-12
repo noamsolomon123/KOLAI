@@ -5,8 +5,10 @@ import okhttp3.OkHttpClient
 import okhttp3.Request as OkRequest
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.services.youtube.extractors.YoutubeStreamExtractor
 import org.schabi.newpipe.extractor.stream.AudioStream
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
+import org.schabi.newpipe.extractor.stream.VideoStream
 import java.io.File
 import java.security.MessageDigest
 
@@ -33,6 +35,18 @@ import java.security.MessageDigest
  * but `getAudioStreams()` comes back EMPTY -- YouTube withholds playable adaptive
  * formats without a valid PO-token (BotGuard). See [StreamDiagnostics] /
  * [diagnose] which the test uses to capture the exact symptom.
+ *
+ * ADAPTIVE-AUDIO via PoToken (2026): pass a [poTokenSource] to register a
+ * BotGuard PoToken provider with the extractor; the muxed itag-18 path remains
+ * the GUARANTEED floor on any failure. IMPORTANT version caveat verified against
+ * the NewPipeExtractor v0.26.2 artifact: `YoutubeStreamExtractor.onFetchPage()`
+ * requests poTokens ONLY for the android/ios streaming clients
+ * (`getAndroidClientPoToken` / `getIosClientPoToken`); the web client is
+ * metadata-only. A WebView+BotGuard mints a *web* token, so on 0.26.2 the
+ * registered web token is a harmless no-op for streams (floor preserved). The
+ * web-token streaming path (`getWebClientPoToken` -> tvHtml5 streaming data)
+ * existed in NewPipeExtractor <= v0.25.0 and was removed in 0.25.1. See the
+ * report / [NewPipePoTokenAdapter] for the upgrade recommendation.
  */
 class NewPipeSource(
     private val client: OkHttpClient = NewPipeDownloader.defaultClient(),
@@ -44,7 +58,38 @@ class NewPipeSource(
     private val transientRetries: Int = TransientRetry.DEFAULT_MAX_RETRIES,
     private val retryBackoffMs: LongArray = TransientRetry.DEFAULT_BACKOFF_MS,
     private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
+    // ADAPTIVE-AUDIO seam: when present, a PoToken provider is registered with the
+    // YouTube extractor so it can request the BotGuard-gated adaptive audio-only
+    // formats. Null (the default) preserves byte-identical legacy behaviour: no
+    // provider is registered and the muxed itag-18 path is used. See class KDoc /
+    // [NewPipePoTokenAdapter] for the v0.26.2 extractor-API caveat.
+    private val poTokenSource: PoTokenSource? = null,
 ) {
+
+    // Guards the one-time global registration of the static PoToken provider.
+    @Volatile
+    private var poTokenRegistered = false
+
+    /**
+     * Register [poTokenSource] (if any) with the YouTube extractor exactly once.
+     * No-op when null -> the extractor keeps its null provider and behaviour is
+     * byte-identical to before this feature. Defensive: a registration failure is
+     * logged and swallowed (the muxed floor still works).
+     */
+    @Synchronized
+    private fun ensurePoTokenRegistered() {
+        if (poTokenRegistered) return
+        poTokenRegistered = true
+        val src = poTokenSource ?: return
+        try {
+            YoutubeStreamExtractor.setPoTokenProvider(
+                NewPipePoTokenAdapter(src, log = ::logW),
+            )
+            logI("PoToken provider registered (adaptive-audio attempt enabled)")
+        } catch (e: Throwable) {
+            logW("PoToken provider registration failed: ${e.message} -- muxed fallback only")
+        }
+    }
 
     /** Failure of any search/extract/download step; caller skips the song. */
     class FetchException(message: String, cause: Throwable? = null) :
@@ -68,6 +113,7 @@ class NewPipeSource(
      */
     fun fetch(song: Song, cacheDir: File): String {
         ensureInit()
+        ensurePoTokenRegistered()
         if (!cacheDir.exists()) cacheDir.mkdirs()
 
         val key = cacheKey(song)
@@ -118,6 +164,7 @@ class NewPipeSource(
      */
     fun diagnose(watchUrl: String): StreamDiagnostics {
         ensureInit()
+        ensurePoTokenRegistered()
         val extractor = ServiceList.YouTube.getStreamExtractor(watchUrl)
         extractor.fetchPage()
         return StreamDiagnostics(
@@ -229,32 +276,40 @@ class NewPipeSource(
             )
         }
 
-        val audioStreams: List<AudioStream> = extractor.audioStreams ?: emptyList()
-        if (audioStreams.isNotEmpty()) {
-            val best = audioStreams.maxByOrNull { it.averageBitrate }!!
-            return PickedStream(
-                url = best.content,
-                ext = best.format?.suffix?.takeIf { it.isNotBlank() } ?: "m4a",
-                audioOnly = true,
+        // Map NewPipe streams onto the pure, unit-tested selector. The adaptive
+        // audio-only list is non-empty only when a valid PoToken unlocked it;
+        // otherwise it is empty and we fall through to the muxed itag-18 floor.
+        val audioOptions = (extractor.audioStreams ?: emptyList<AudioStream>()).map { a ->
+            StreamSelection.Option(
+                url = a.content,
+                ext = a.format?.suffix?.takeIf { it.isNotBlank() } ?: "m4a",
+                bitrate = a.averageBitrate,
+            )
+        }
+        val muxedOptions = (extractor.videoStreams ?: emptyList<VideoStream>()).map { v ->
+            StreamSelection.Option(
+                url = v.content,
+                ext = v.format?.suffix?.takeIf { it.isNotBlank() } ?: "mp4",
+                bitrate = v.bitrate,
             )
         }
 
-        // Fallback: muxed progressive stream (carries audio). Pick the best one
-        // available; the lone token-free format is usually itag 18 (360p mp4).
-        val muxed = extractor.videoStreams ?: emptyList()
-        if (muxed.isNotEmpty()) {
-            val best = muxed.maxByOrNull { it.bitrate.takeIf { b -> b > 0 } ?: 0 } ?: muxed.first()
-            return PickedStream(
-                url = best.content,
-                ext = best.format?.suffix?.takeIf { it.isNotBlank() } ?: "mp4",
-                audioOnly = false,
+        val choice = StreamSelection.chooseStream(audioOptions, muxedOptions)
+            ?: throw FetchException(
+                "no audio or muxed streams for '$watchUrl' -- this is the PO-token / " +
+                    "bot-detection wall (empty adaptive formats AND no progressive fallback).",
+            )
+
+        if (choice.audioOnly) {
+            val kbps = (audioOptions.maxOfOrNull { it.bitrate } ?: 0) / 1000
+            logI("adaptive ${kbps}kbps audio-only via PoToken for '$watchUrl'")
+        } else {
+            logW(
+                "fallback muxed-360p for '$watchUrl' " +
+                    "(no adaptive audio -- PoToken absent/empty or extractor did not consume it)",
             )
         }
-
-        throw FetchException(
-            "no audio or muxed streams for '$watchUrl' -- this is the PO-token / " +
-                "bot-detection wall (empty adaptive formats AND no progressive fallback).",
-        )
+        return PickedStream(url = choice.url, ext = choice.ext, audioOnly = choice.audioOnly)
     }
 
     // ---- download --------------------------------------------------------

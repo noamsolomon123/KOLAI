@@ -39,6 +39,11 @@ dependencies {
     // OkHttp backs the NewPipe Downloader and the stream download to cache.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // runBlocking bridges the suspend PoTokenSource onto NewPipe's synchronous
+    // PoTokenProvider interface (NpePoToken.kt). Literal version on purpose: do
+    // NOT touch the shared gradle/libs.versions.toml (parallel-module-safe).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+
     // Task 2.1: pure-JVM unit tests for the ported candidate-scoring logic.
     // Literal version on purpose: do NOT touch the shared gradle/libs.versions.toml
     // (avoids conflicts with parallel module work).
