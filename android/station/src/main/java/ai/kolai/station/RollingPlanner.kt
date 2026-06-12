@@ -47,7 +47,13 @@ import java.io.File
  * @param mood MVP: passed through to [SetlistSource.plan] unchanged; the moods
  *   table is not ported, so the planner currently ignores it (see moodBlock).
  * @param nowMs injectable clock returning epoch millis; defaults to the real one.
- * @param persistFile optional cross-launch history file (see class doc).
+ * @param persistFile optional cross-launch history file (see class doc). The
+ *   artist history is persisted alongside it in a DERIVED sibling file
+ *   ("<name>.artists"), so wiring stays a single-file concern.
+ * @param artistWindow how many recently played artists are handed to the
+ *   planner as [SetlistSource.plan]'s recentArtists for cross-call artist
+ *   fatigue (a soft DEMOTION in [TastePoolPlanner], never an exclusion;
+ *   [SetlistPlanner]'s default overload simply ignores it).
  */
 class RollingPlanner(
     private val tasteSource: TasteSource,
@@ -58,6 +64,7 @@ class RollingPlanner(
     mood: String? = null,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     private val persistFile: File? = null,
+    private val artistWindow: Int = 12,
 ) {
     /** Current station vibe; affects FUTURE song selection. Public like Python. */
     var mood: String? = mood
@@ -69,6 +76,15 @@ class RollingPlanner(
 
     /** Rolling no-repeat history of recently played keys ([baseTitle] of title). */
     val history: MutableList<String> = mutableListOf()
+
+    /** Rolling history of recently played artists (lowercased, most recent
+     *  last). Soft signal: the last [artistWindow] entries reach the planner
+     *  as recentArtists so it can DEMOTE (not exclude) fatigued artists. */
+    val artistHistory: MutableList<String> = mutableListOf()
+
+    /** Artist history persists in a sibling of [persistFile] ("<name>.artists"). */
+    private val artistPersistFile: File? =
+        persistFile?.let { File(it.parentFile, it.name + ".artists") }
 
     init {
         loadHistory()
@@ -85,28 +101,45 @@ class RollingPlanner(
     /** Load persisted history (one key per line). Corruption-tolerant: any IO
      *  or decode problem just leaves the history empty. */
     private fun loadHistory() {
-        val f = persistFile ?: return
+        loadLinesInto(persistFile, history)
+        loadLinesInto(artistPersistFile, artistHistory)
+    }
+
+    /** Read [f]'s non-blank lines into [into]; any problem leaves it empty. */
+    private fun loadLinesInto(f: File?, into: MutableList<String>) {
+        if (f == null) return
         try {
             if (!f.exists()) return
             f.readLines()
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
-                .forEach { history.add(it) }
+                .forEach { into.add(it) }
         } catch (e: Exception) {
             // corrupt/unreadable history -> start empty, never crash
-            history.clear()
+            into.clear()
         }
     }
 
     /** Persist the last [noRepeatWindow] * 2 history keys (bounds file growth).
      *  Best-effort: failures are swallowed. */
     private fun saveHistory() {
-        val f = persistFile ?: return
-        try {
-            val keep = history.takeLast(noRepeatWindow * 2)
-            StationPersistence.writeAtomic(f, keep.joinToString("\n"))
-        } catch (e: Exception) {
-            // best-effort persistence; never fail song selection over it
+        val f = persistFile
+        if (f != null) {
+            try {
+                val keep = history.takeLast(noRepeatWindow * 2)
+                StationPersistence.writeAtomic(f, keep.joinToString("\n"))
+            } catch (e: Exception) {
+                // best-effort persistence; never fail song selection over it
+            }
+        }
+        val af = artistPersistFile
+        if (af != null) {
+            try {
+                val keep = artistHistory.takeLast(artistWindow * 2)
+                StationPersistence.writeAtomic(af, keep.joinToString("\n"))
+            } catch (e: Exception) {
+                // best-effort persistence; never fail song selection over it
+            }
         }
     }
 
@@ -150,6 +183,7 @@ class RollingPlanner(
             exclude = recent,
             seed = seed,
             mood = mood,
+            recentArtists = artistHistory.takeLast(artistWindow),
         )
         val recentSet = recent.toSet()
         val fresh = picks.filter { key(it) !in recentSet }
@@ -157,6 +191,8 @@ class RollingPlanner(
         val chosen = (if (fresh.size >= n) fresh else picks).take(n)
         for (s in chosen) {
             history.add(key(s))
+            val artist = s.artist.trim().lowercase()
+            if (artist.isNotEmpty()) artistHistory.add(artist)
         }
         saveHistory()
         songsSinceRefresh += chosen.size

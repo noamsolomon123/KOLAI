@@ -36,13 +36,27 @@ import java.util.concurrent.ConcurrentHashMap
  * falls back to a taste pick). Logging goes through JVM-safe helpers (the
  * android.util.Log stub THROWS on the plain JVM - same guard as NewPipeSource).
  */
-class DeezerDiscovery(private val http: HttpClient) : DiscoverySource {
+class DeezerDiscovery(
+    private val http: HttpClient,
+    private val rng: kotlin.random.Random = kotlin.random.Random.Default,
+    private val recentArtistMemory: Int = 10,
+) : DiscoverySource {
 
     /** Seed-artist name (lowercased) -> Deezer artist id. Ids are stable: no TTL. */
     private val idCache = ConcurrentHashMap<String, Long>()
 
     /** Deezer artist id -> related artists (id, name). */
     private val relatedCache = ConcurrentHashMap<Long, List<Pair<Long, String>>>()
+
+    /** ROTATION MEMORY (in-memory, this process only). Discovered songs leave
+     *  only their TITLE in the rolling history, so without this the same
+     *  related artist could be re-suggested call after call. We remember the
+     *  last [recentArtistMemory] discovery artists (lowercased) and PREFER
+     *  related artists outside that set (soft: falls back rather than failing
+     *  a starved seed), and we avoid reusing the seed artist that produced the
+     *  previous discovery so consecutive calls fan out across the taste. */
+    private val recentDiscoveryArtists = ArrayDeque<String>()
+    @Volatile private var lastSeedLower: String? = null
 
     override suspend fun discover(
         taste: TasteProfile,
@@ -59,14 +73,25 @@ class DeezerDiscovery(private val http: HttpClient) : DiscoverySource {
         val excludeArtistsLower = excludeArtists.map { it.trim().lowercase() }.toSet()
         val tasteArtistsLower = seeds.map { it.lowercase() }.toSet()
 
-        val attempts = seeds.shuffled().take(MAX_ATTEMPTS)
+        // Seed rotation: random order, but the seed that produced the LAST
+        // discovery sinks to the end (sortedBy is stable, so the shuffle is
+        // otherwise preserved) -- consecutive discoveries fan out across the
+        // taste instead of mining one corner of it.
+        val last = lastSeedLower
+        val attempts = seeds.shuffled(rng)
+            .sortedBy { it.lowercase() == last }
+            .take(MAX_ATTEMPTS)
         for (seed in attempts) {
             val song = try {
                 discoverFromSeed(seed, excludeKeys, excludeArtistsLower, tasteArtistsLower)
             } catch (e: Exception) {
                 null // a failed seed must never fail the whole discovery
             }
-            if (song != null) return song
+            if (song != null) {
+                lastSeedLower = seed.lowercase()
+                rememberDiscoveryArtist(song.artist)
+                return song
+            }
         }
         logW("no discovery after ${attempts.size} seed attempt(s)") // one line, no per-attempt spam
         return null
@@ -82,13 +107,17 @@ class DeezerDiscovery(private val http: HttpClient) : DiscoverySource {
         // 2. Resolve the seed's Deezer id (Deezer handles Hebrew names as-is).
         val seedId = resolveArtistId(seedName) ?: return null
 
-        // 3. Related artists: drop excluded, prefer NON-taste (real discovery),
-        //    allow taste artists as fallback, pick one at random.
+        // 3. Related artists: drop excluded, prefer artists NOT discovered
+        //    recently (rotation memory) and NON-taste (real discovery), with
+        //    graceful fallbacks, pick one at random.
         val related = relatedArtists(seedId)
             .filter { (_, name) -> name.trim().lowercase() !in excludeArtistsLower }
         if (related.isEmpty()) return null
-        val nonTaste = related.filter { (_, name) -> name.trim().lowercase() !in tasteArtistsLower }
-        val (relatedId, relatedName) = nonTaste.ifEmpty { related }.random()
+        val recent = synchronized(recentDiscoveryArtists) { recentDiscoveryArtists.toSet() }
+        val unmined = related.filter { (_, name) -> name.trim().lowercase() !in recent }
+            .ifEmpty { related } // every candidate recently mined: allow repeats over failing
+        val nonTaste = unmined.filter { (_, name) -> name.trim().lowercase() !in tasteArtistsLower }
+        val (relatedId, relatedName) = nonTaste.ifEmpty { unmined }.random(rng)
 
         // 4. The related artist's top tracks are popularity-ordered: the first
         //    survivor is their biggest song the listener hasn't played.
@@ -103,6 +132,19 @@ class DeezerDiscovery(private val http: HttpClient) : DiscoverySource {
 
         logI("discovered via '$seedName' -> '$relatedName': '${song.title}' - ${song.artist}")
         return song
+    }
+
+    /** Record a successful discovery's artist (lowercased, deduped, capped). */
+    private fun rememberDiscoveryArtist(artist: String) {
+        val key = artist.trim().lowercase()
+        if (key.isEmpty()) return
+        synchronized(recentDiscoveryArtists) {
+            recentDiscoveryArtists.remove(key) // re-discovery moves it to newest
+            recentDiscoveryArtists.addLast(key)
+            while (recentDiscoveryArtists.size > recentArtistMemory) {
+                recentDiscoveryArtists.removeFirst()
+            }
+        }
     }
 
     /** /search/artist?q=name -> first artist id, cached by lowercased name. */

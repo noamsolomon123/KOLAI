@@ -31,4 +31,23 @@ interface SetlistSource {
         seed: Song? = null,
         mood: String? = null,
     ): List<Song>
+
+    /**
+     * Artist-fatigue-aware overload: like [plan], plus [recentArtists] -- the
+     * artists of recently played songs (most recent last, any case). A planner
+     * MAY use it to DEMOTE (not exclude) those artists so one artist does not
+     * dominate the station across calls.
+     *
+     * Default implementation ignores [recentArtists] and delegates to the
+     * 5-arg [plan], so existing implementations ([SetlistPlanner]) keep
+     * compiling and behaving exactly as before without any edit.
+     */
+    suspend fun plan(
+        taste: TasteProfile,
+        n: Int,
+        exclude: List<String>?,
+        seed: Song?,
+        mood: String?,
+        recentArtists: List<String>?,
+    ): List<Song> = plan(taste, n, exclude, seed, mood)
 }

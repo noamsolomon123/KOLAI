@@ -71,11 +71,21 @@ internal fun containsHebrew(s: String): Boolean = s.any { it in 'א'..'ת' }
  *   [kotlin.random.Random.Default]; tests pass a seeded Random for determinism.
  * @param curator optional LLM mood curator; null (the default) disables mood
  *   bias entirely -- plan() then behaves exactly as before this seam existed.
+ * @param discoveryRate per-slot probability of attempting a discovery pick
+ *   (still capped at 1 per call). Default 0.25; a tuning knob, e.g. 0.0
+ *   disables discovery rolls entirely even when [discovery] is wired.
+ * @param uniformEpsilon epsilon-greedy floor for taste sampling: with this
+ *   probability a pick samples UNIFORMLY from the eligible tier instead of
+ *   rank-weighted, so old favourites near the pool's tail (whose 1/(rank+6)
+ *   weight is tiny) are guaranteed to keep surfacing. 0.0 restores pure
+ *   weighted sampling.
  */
 class TastePoolPlanner(
     private val discovery: DiscoverySource? = null,
     private val rng: kotlin.random.Random = kotlin.random.Random.Default,
     private val curator: MoodCurator? = null,
+    private val discoveryRate: Double = 0.25,
+    private val uniformEpsilon: Double = 0.1,
 ) : SetlistSource {
 
     private companion object {
@@ -84,6 +94,11 @@ class TastePoolPlanner(
 
         /** Weight multiplier for pool entries the curator says fit the mood. */
         const val MOOD_BOOST = 8.0
+
+        /** Weight multiplier for artists heard recently (cross-call fatigue).
+         *  A DEMOTION, not an exclusion: a fatigued artist still plays when
+         *  the listener's pool offers little else (or the dice say so). */
+        const val ARTIST_FATIGUE = 0.25
     }
 
     /** A taste track prepared for picking: no-repeat key, weight, language. */
@@ -101,6 +116,15 @@ class TastePoolPlanner(
         exclude: List<String>?,
         seed: Song?,
         mood: String?,
+    ): List<Song> = plan(taste, n, exclude, seed, mood, recentArtists = null)
+
+    override suspend fun plan(
+        taste: TasteProfile,
+        n: Int,
+        exclude: List<String>?,
+        seed: Song?,
+        mood: String?,
+        recentArtists: List<String>?,
     ): List<Song> {
         if (n <= 0) return emptyList()
 
@@ -124,6 +148,21 @@ class TastePoolPlanner(
                     weight = 1.0 / (index + 6),
                 ),
             )
+        }
+
+        // --- artist fatigue: DEMOTE (never exclude) recently heard artists --
+        // Cross-call counterpart of within-call artist spacing: an artist the
+        // station played in the last few songs keeps a foot in the pool but
+        // stops dominating it. Multiplicative, so it composes with the rank
+        // weight above and the mood boost below.
+        val fatiguedArtists: Set<String> = recentArtists.orEmpty()
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+        if (fatiguedArtists.isNotEmpty()) {
+            for (c in pool) {
+                if (c.artistLower in fatiguedArtists) c.weight *= ARTIST_FATIGUE
+            }
         }
 
         // --- mood bias: the LLM SELECTS fitting songs FROM the real pool ----
@@ -162,7 +201,7 @@ class TastePoolPlanner(
 
         while (picks.size < n) {
             // --- discovery slot: 25% chance, at most 1 per call -------------
-            if (discovery != null && discoveriesUsed < 1 && rng.nextDouble() < 0.25) {
+            if (discovery != null && discoveriesUsed < 1 && rng.nextDouble() < discoveryRate) {
                 val found = try {
                     discovery.discover(
                         taste = taste,
@@ -234,6 +273,12 @@ class TastePoolPlanner(
 
     /** Weighted sample of one candidate (weights ∝ 1/(rank+6)). */
     private fun sampleWeighted(candidates: List<Candidate>): Candidate {
+        // Epsilon-greedy floor: occasionally sample UNIFORMLY over the tier so
+        // the pool's tail (old favourites with tiny 1/(rank+6) weights) is
+        // guaranteed to keep surfacing on air.
+        if (rng.nextDouble() < uniformEpsilon) {
+            return candidates[rng.nextInt(candidates.size)]
+        }
         val total = candidates.sumOf { it.weight }
         var r = rng.nextDouble() * total
         for (c in candidates) {

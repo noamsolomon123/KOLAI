@@ -378,4 +378,178 @@ class RollingPlannerTest {
         )
         assertTrue(rolling.history.isEmpty())
     }
+
+    // --- cross-call artist fatigue (artistHistory -> plan recentArtists) -----
+
+    /** Records the recentArtists each plan() received; replays canned batches. */
+    private class FakeSetlistSource(private val batches: List<List<Song>>) : SetlistSource {
+        val recentArtistsSeen = mutableListOf<List<String>?>()
+        private var i = 0
+        override suspend fun plan(
+            taste: TasteProfile,
+            n: Int,
+            exclude: List<String>?,
+            seed: Song?,
+            mood: String?,
+        ): List<Song> = plan(taste, n, exclude, seed, mood, recentArtists = null)
+
+        override suspend fun plan(
+            taste: TasteProfile,
+            n: Int,
+            exclude: List<String>?,
+            seed: Song?,
+            mood: String?,
+            recentArtists: List<String>?,
+        ): List<Song> {
+            recentArtistsSeen.add(recentArtists)
+            return batches[(i++).coerceAtMost(batches.size - 1)]
+        }
+    }
+
+    @Test
+    fun chosen_artists_are_recorded_lowercased_in_artistHistory() = runTest {
+        val fake = FakeSetlistSource(
+            listOf(
+                listOf(
+                    Song(title = "Creep", artist = "Radiohead"),
+                    Song(title = "Yesterday", artist = "The Beatles"),
+                ),
+            ),
+        )
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+        )
+        rolling.nextSongs(n = 2)
+        assertEquals(listOf("radiohead", "the beatles"), rolling.artistHistory)
+    }
+
+    @Test
+    fun blank_artists_are_not_recorded_in_artistHistory() = runTest {
+        val fake = FakeSetlistSource(listOf(listOf(Song(title = "Mystery", artist = "  "))))
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+        )
+        rolling.nextSongs(n = 1)
+        assertTrue(rolling.artistHistory.isEmpty())
+        assertEquals(1, rolling.history.size) // title history is unaffected
+    }
+
+    @Test
+    fun planner_receives_only_the_last_artistWindow_artists() = runTest {
+        val batches = (0 until 4).map { listOf(Song(title = "T$it", artist = "Artist$it")) }
+        val fake = FakeSetlistSource(batches)
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+            artistWindow = 2,
+        )
+        repeat(4) { rolling.nextSongs(n = 1) }
+        assertEquals(emptyList<String>(), fake.recentArtistsSeen[0])
+        assertEquals(listOf("artist0"), fake.recentArtistsSeen[1])
+        assertEquals(listOf("artist0", "artist1"), fake.recentArtistsSeen[2])
+        assertEquals(listOf("artist1", "artist2"), fake.recentArtistsSeen[3]) // windowed
+    }
+
+    @Test
+    fun artist_history_persists_in_a_sibling_file_and_restores() = runTest {
+        val file = newHistoryFile()
+        val fake1 = FakeSetlistSource(listOf(listOf(Song(title = "Creep", artist = "Radiohead"))))
+        val p1 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake1,
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        p1.nextSongs(n = 1)
+        val sibling = File(file.parentFile, file.name + ".artists")
+        assertTrue(sibling.exists())
+        assertEquals(
+            listOf("radiohead"),
+            sibling.readLines().map { it.trim() }.filter { it.isNotEmpty() },
+        )
+
+        // a SECOND planner instance over the same file restores the artist
+        // history and forwards it on its very FIRST plan() call.
+        val fake2 = FakeSetlistSource(listOf(listOf(Song(title = "Karma Police", artist = "Radiohead"))))
+        val p2 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake2,
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        assertEquals(listOf("radiohead"), p2.artistHistory)
+        p2.nextSongs(n = 1)
+        assertEquals(listOf("radiohead"), fake2.recentArtistsSeen[0])
+    }
+
+    @Test
+    fun artist_file_is_bounded_to_twice_artistWindow() = runTest {
+        val file = newHistoryFile()
+        val batches = (0 until 6).map { listOf(Song(title = "T$it", artist = "Artist$it")) }
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = FakeSetlistSource(batches),
+            refreshEvery = 100,
+            persistFile = file,
+            artistWindow = 2,
+        )
+        repeat(6) { rolling.nextSongs(n = 1) }
+
+        // in-memory keeps everything; the FILE keeps only the last 2*2
+        assertEquals(
+            listOf("artist0", "artist1", "artist2", "artist3", "artist4", "artist5"),
+            rolling.artistHistory,
+        )
+        val sibling = File(file.parentFile, file.name + ".artists")
+        val lines = sibling.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertEquals(listOf("artist2", "artist3", "artist4", "artist5"), lines)
+    }
+
+    @Test
+    fun corrupt_artist_file_is_tolerated() = runTest {
+        val file = newHistoryFile()
+        val sibling = File(file.parentFile, file.name + ".artists")
+        sibling.writeBytes(byteArrayOf(0, 1, 2, -1, -2))
+
+        val fake = FakeSetlistSource(listOf(listOf(Song(title = "T", artist = "B"))))
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+            persistFile = file,
+        )
+        // construction did not throw, and the planner keeps working + persisting
+        rolling.nextSongs(n = 1)
+        assertTrue(rolling.artistHistory.contains("b"))
+        val lines = sibling.readLines().map { it.trim() }.filter { it.isNotEmpty() }
+        assertTrue(lines.contains("b"))
+    }
+
+    @Test
+    fun a_planner_implementing_only_the_5_arg_plan_keeps_working() = runTest {
+        // SetlistPlanner-shaped implementations (only the 5-arg plan) must keep
+        // compiling and working: the interface's 6-arg default delegates.
+        val canned = listOf(Song(title = "OnlyFive", artist = "B"))
+        val fiveArgOnly = object : SetlistSource {
+            override suspend fun plan(
+                taste: TasteProfile,
+                n: Int,
+                exclude: List<String>?,
+                seed: Song?,
+                mood: String?,
+            ): List<Song> = canned
+        }
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fiveArgOnly,
+            refreshEvery = 100,
+        )
+        assertEquals(canned, rolling.nextSongs(n = 1))
+        assertEquals(listOf("b"), rolling.artistHistory) // fatigue still tracked
+    }
 }

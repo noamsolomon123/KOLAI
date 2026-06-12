@@ -446,4 +446,145 @@ class TastePoolPlannerTest {
         assertEquals(1, songs.size) // cannot invent songs; dedup by baseTitle
         assertEquals("Only One", songs.first().title)
     }
+
+    // --- artist fatigue (recentArtists demotion via the 6-arg overload) ------
+
+    @Test
+    fun recent_artists_are_demoted_not_excluded() = runTest {
+        // Two near-equal-rank artists; fatiguing one (case-insensitively) must
+        // make it open far less often -- but still sometimes (demotion!).
+        val twoArtists = TasteProfile(
+            topTracks = listOf(
+                TasteTrack(title = "Hit Song", artist = "Fatigued", durationS = 100.0),
+                TasteTrack(title = "Other Song", artist = "Fresh", durationS = 110.0),
+            ),
+            topArtists = listOf("Fatigued", "Fresh"),
+        )
+        var demoted = 0
+        var plain = 0
+        for (seed in 0 until 200) {
+            val withFatigue = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(
+                twoArtists, n = 1, exclude = null, seed = null, mood = null,
+                recentArtists = listOf("FATIGUED"), // any case
+            )
+            if (withFatigue.single().artist == "Fatigued") demoted++
+            val noFatigue = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(twoArtists, n = 1)
+            if (noFatigue.single().artist == "Fatigued") plain++
+        }
+        assertTrue("demoted=$demoted", demoted > 0) // a DEMOTION, never an exclusion
+        assertTrue("demoted=$demoted plain=$plain", demoted + 30 < plain)
+    }
+
+    @Test
+    fun fatigue_on_every_artist_still_delivers_n_songs() = runTest {
+        val songs = TastePoolPlanner(rng = kotlin.random.Random(7)).plan(
+            repeatedArtistsTaste, n = 3, exclude = null, seed = null, mood = null,
+            recentArtists = listOf("Artist A", "Artist B", "Artist C"),
+        )
+        assertEquals(3, songs.size)
+        assertEquals(3, songs.map { it.artist }.toSet().size)
+    }
+
+    @Test
+    fun empty_recentArtists_is_byte_identical_to_the_5_arg_plan() = runTest {
+        val a = TastePoolPlanner(rng = kotlin.random.Random(42)).plan(mixedTaste, n = 6)
+        val b = TastePoolPlanner(rng = kotlin.random.Random(42)).plan(
+            mixedTaste, n = 6, exclude = null, seed = null, mood = null,
+            recentArtists = emptyList(),
+        )
+        assertEquals(a, b)
+    }
+
+    // --- epsilon-greedy floor (pool tail love) --------------------------------
+
+    /** 40 tracks, distinct artists, all-English titles: a long weighted tail. */
+    private val fortyTaste = TasteProfile(
+        topTracks = (0 until 40).map { i ->
+            TasteTrack(title = "Deep$i Cut", artist = "Tail$i", durationS = 100.0)
+        },
+        topArtists = emptyList(),
+    )
+
+    private fun deepIndex(title: String): Int =
+        title.removePrefix("Deep").substringBefore(" ").toInt()
+
+    @Test
+    fun uniform_epsilon_floor_surfaces_the_pool_tail() = runTest {
+        // Openers from the BOTTOM half of a 40-track pool: epsilon = 1.0
+        // (always uniform) must reach it far more often than epsilon = 0.0
+        // (pure 1/(rank+6) weighting), and uniform sampling should put roughly
+        // half the openers there.
+        var greedy = 0
+        var uniform = 0
+        for (seed in 0 until 300) {
+            val g = TastePoolPlanner(rng = kotlin.random.Random(seed), uniformEpsilon = 0.0)
+                .plan(fortyTaste, n = 1).single()
+            if (deepIndex(g.title) >= 20) greedy++
+            val u = TastePoolPlanner(rng = kotlin.random.Random(seed), uniformEpsilon = 1.0)
+                .plan(fortyTaste, n = 1).single()
+            if (deepIndex(u.title) >= 20) uniform++
+        }
+        assertTrue("uniform=$uniform", uniform >= 120) // ~150 expected at 50%
+        assertTrue("greedy=$greedy uniform=$uniform", uniform > greedy + 30)
+    }
+
+    @Test
+    fun epsilon_uniform_picks_still_respect_tier_constraints() = runTest {
+        // Even at epsilon = 1.0 the uniform sample is taken WITHIN the eligible
+        // tier: with only two fresh tracks and n = 2 the picks must be them.
+        val freshKeys = mixedTaste.topTracks.take(2).map { baseTitle(it.title) }.toSet()
+        val exclude = mixedTaste.topTracks.drop(2).map { baseTitle(it.title) }
+        for (seed in 0 until 10) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed), uniformEpsilon = 1.0)
+                .plan(mixedTaste, n = 2, exclude = exclude)
+            assertEquals(2, songs.size)
+            assertEquals(freshKeys, songs.map { baseTitle(it.title) }.toSet())
+        }
+    }
+
+    // --- discoveryRate knob ---------------------------------------------------
+
+    @Test
+    fun discoveryRate_zero_disables_discovery_even_on_the_lowest_roll() = runTest {
+        val fake = FakeDiscovery(Song(title = "Smooth Operator", artist = "Sade"))
+        val planner = TastePoolPlanner(discovery = fake, rng = ZeroRandom(), discoveryRate = 0.0)
+        val songs = planner.plan(mixedTaste, n = 4)
+        assertEquals(4, songs.size)
+        assertEquals(0, fake.calls)
+        assertTrue(songs.all { it.title in mixedTitles })
+    }
+
+    @Test
+    fun discoveryRate_one_fires_even_on_the_highest_roll() = runTest {
+        val fake = FakeDiscovery(Song(title = "Smooth Operator", artist = "Sade"))
+        val planner = TastePoolPlanner(discovery = fake, rng = MaxRandom(), discoveryRate = 1.0)
+        val songs = planner.plan(mixedTaste, n = 2)
+        assertEquals(2, songs.size)
+        assertEquals(1, fake.calls) // capped at 1 per call even at rate 1.0
+        assertTrue(songs.any { it.title == "Smooth Operator" })
+    }
+
+    // --- alternation on a lopsided pool ----------------------------------------
+
+    @Test
+    fun mostly_single_language_pool_relaxes_alternation_and_terminates() = runTest {
+        // 7 English + 1 Hebrew: strict alternation is impossible, so the soft
+        // preference must relax -- full delivery, no dupes, no pathological
+        // loop, and the lone Hebrew track plays exactly once.
+        val lopsided = TasteProfile(
+            topTracks = (0 until 7).map { i ->
+                TasteTrack(title = "English Song $i", artist = "Band $i", durationS = 100.0)
+            } + listOf(
+                TasteTrack(title = "שיר", artist = "Singer", durationS = 100.0),
+            ),
+            topArtists = emptyList(),
+        )
+        for (seed in 0 until 20) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(lopsided, n = 8)
+            assertEquals(8, songs.size)
+            assertEquals(8, songs.map { baseTitle(it.title) }.toSet().size)
+            assertEquals(1, songs.count { containsHebrew(it.title) })
+        }
+    }
 }
