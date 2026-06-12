@@ -90,6 +90,10 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
         }
 
+        // Restore the persisted mood BEFORE composing so the mood bar opens on
+        // the remembered chip (and the service-side collectors see it too).
+        KolaiMood.load(this)
+
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 val ui by KolaiState.state.collectAsState()
@@ -316,6 +320,8 @@ fun KolaiScreen(
                     palette = palette,
                     seed = songTitle ?: WORDMARK,
                     playing = playing,
+                    title = songTitle,
+                    artist = songArtist,
                 )
             }
 

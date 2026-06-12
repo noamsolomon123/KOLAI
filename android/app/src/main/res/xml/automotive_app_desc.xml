@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android Auto capability descriptor: KOLAI is a "media" app (audio playback
+     driven through the media session; no custom car UI). -->
+<automotiveApp>
+    <uses name="media" />
+</automotiveApp>

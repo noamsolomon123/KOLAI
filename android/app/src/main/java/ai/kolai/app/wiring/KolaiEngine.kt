@@ -3,6 +3,7 @@ package ai.kolai.app.wiring
 import ai.kolai.station.BlockRenderer
 import ai.kolai.station.DjBrain
 import ai.kolai.station.DjContext
+import ai.kolai.station.MoodCurator
 import ai.kolai.station.SetlistSource
 import ai.kolai.station.TastePoolPlanner
 import ai.kolai.voice.GeminiTextClient
@@ -111,7 +112,13 @@ class KolaiEngine private constructor(
             // --- brains -----------------------------------------------------
             val brain = DjBrain(client = llm, persona = PERSONA)
             val discovery = DeezerDiscovery(http)
-            val planner: SetlistSource = TastePoolPlanner(discovery = discovery)
+            // MoodCurator is LONG-LIVED on purpose: it keeps an in-memory
+            // verdict cache, so one instance for the engine's lifetime means
+            // repeated mood checks for the same songs cost zero LLM calls.
+            val planner: SetlistSource = TastePoolPlanner(
+                discovery = discovery,
+                curator = MoodCurator(llm),
+            )
 
             val blockRenderer = BlockRenderer(
                 fetcher = fetcher,

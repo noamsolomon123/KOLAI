@@ -36,14 +36,24 @@
             </intent-filter>
         </activity>
 
-        <!-- KOLAI foreground media service (Media3 MediaSessionService). The
-             media3 intent-filter lets MediaController/system media controls bind. -->
+        <!-- Android Auto: declares KOLAI as a car media app. Auto reads the
+             automotive descriptor to know which car capabilities we use. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!-- KOLAI foreground media service (Media3 MediaLibraryService). The
+             media3 intent-filter lets MediaController/system media controls
+             bind; the legacy MediaBrowserService action is how Android Auto
+             DISCOVERS media apps (Media3's MediaLibraryService provides the
+             compat shim that serves that action). -->
         <service
             android:name=".KolaiMediaService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
                 <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
         </service>
     </application>

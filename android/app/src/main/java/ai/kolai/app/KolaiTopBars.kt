@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -37,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
@@ -77,7 +79,7 @@ internal fun StationRow(palette: KolaiPalette) {
             LivePill()
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            GhostButton(text = "🔁 תחנה חדשה", onClick = { /* re-tune: wired next */ })
+            GhostButton(text = "🔁 תחנה חדשה", onClick = { KolaiMood.requestRetune() })
             Spacer(Modifier.width(8.dp))
             GhostIconButton(glyph = "⚙️", onClick = { settingsOpen = true })
         }
@@ -157,7 +159,10 @@ private fun GhostIconButton(glyph: String, onClick: () -> Unit) {
 
 @Composable
 internal fun MoodBar() {
-    var active by remember { mutableStateOf("mix") }
+    // Single source of truth: the chips render whatever KolaiMood holds (the
+    // service + planner read the same flow), so UI and engine can never drift.
+    val active by KolaiMood.mood.collectAsState()
+    val context = LocalContext.current
     var toastTick by remember { mutableIntStateOf(0) }
     var toastVisible by remember { mutableStateOf(false) }
 
@@ -189,7 +194,7 @@ internal fun MoodBar() {
                     selected = active == mood.key,
                     onClick = {
                         if (active != mood.key) {
-                            active = mood.key
+                            KolaiMood.setAndPersist(context, mood.key)
                             toastTick += 1
                         }
                     },

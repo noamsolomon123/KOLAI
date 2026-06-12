@@ -13,13 +13,22 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.net.toUri
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionError
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import ai.kolai.app.wiring.KolaiEngine
+import ai.kolai.app.wiring.CoverArt
 import ai.kolai.app.wiring.LiveDjContext
 import ai.kolai.station.BlockMeta
 import ai.kolai.station.RollingPlanner
@@ -29,15 +38,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * KOLAI playback service. A foreground [MediaSessionService] that owns ONE
+ * KOLAI playback service. A foreground [MediaLibraryService] (a
+ * [androidx.media3.session.MediaSessionService] that also serves the Android
+ * Auto browse tree) that owns ONE
  * [ExoPlayer] + [MediaSession] and bridges the endless [StationEngine] into the
  * player's playlist so KOLAI plays back-to-back, gapless, with screen off / in
  * the car / from the lock screen.
@@ -64,14 +77,15 @@ import java.util.concurrent.ConcurrentHashMap
  *    blocks from disk, the first fed block is ready instantly, and the same
  *    rule starts playback within seconds.)
  */
-class KolaiMediaService : MediaSessionService() {
+class KolaiMediaService : MediaLibraryService() {
 
     private lateinit var player: ExoPlayer
     private lateinit var skipPlayer: SegmentSkipPlayer
-    private var mediaSession: MediaSession? = null
+    private var mediaSession: MediaLibrarySession? = null
 
     private lateinit var engine: KolaiEngine
     private lateinit var stationEngine: StationEngine
+    private lateinit var rollingPlanner: RollingPlanner
 
     // Service-owned scope: survives player state changes; cancelled ONLY in
     // onDestroy. The render-ahead loop, feed loop, and position poller run here.
@@ -90,13 +104,39 @@ class KolaiMediaService : MediaSessionService() {
     @Volatile private var lastAdvanced = -1
     @Volatile private var startedForeground = false
 
+    // Last song mirrored into the CURRENT media item's MediaMetadata (car /
+    // lock screen). Mirrors KolaiState's idempotence: we only touch the player
+    // when the active segment actually changes the song.
+    @Volatile private var lastMetaSong: String? = null
+
+    // "New station" re-entrancy guard: a retune in flight ignores new requests.
+    private val retuneInFlight = AtomicBoolean(false)
+
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "onCreate")
 
         createNotificationChannel()
 
-        player = ExoPlayer.Builder(this).build()
+        player = ExoPlayer.Builder(this)
+            // Car-grade audio focus: declare ourselves as MEDIA/MUSIC and let
+            // ExoPlayer handle focus, so KOLAI ducks for navigation prompts and
+            // pauses/resumes around phone calls instead of talking over them.
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus= */ true,
+            )
+            // Pause when the output route is yanked (headphones unplugged, car /
+            // BT disconnect) instead of blasting the phone speaker.
+            .setHandleAudioBecomingNoisy(true)
+            // Hold a partial wake lock while playing so playback never stalls
+            // with the screen off on long drives (blocks are LOCAL files, so no
+            // wifi lock is needed -> WAKE_MODE_LOCAL, not NETWORK).
+            .setWakeMode(C.WAKE_MODE_LOCAL)
+            .build()
         player.addListener(playerListener)
         // Segment-aware skip wrapper. The MediaSession is built on THIS so the UI
         // controller's seekToNext/Previous AND hardware/lock-screen NEXT/PREV all
@@ -111,7 +151,10 @@ class KolaiMediaService : MediaSessionService() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
                 )
             }
-        val builder = MediaSession.Builder(this, skipPlayer)
+        // MediaLibrarySession (not plain MediaSession): Android Auto browses the
+        // library tree via librarySessionCallback. Still built on skipPlayer so
+        // wheel/lock-screen NEXT/PREV keep hitting the segment-aware skip.
+        val builder = MediaLibrarySession.Builder(this, skipPlayer, librarySessionCallback)
         if (sessionActivityPendingIntent != null) {
             builder.setSessionActivity(sessionActivityPendingIntent)
         }
@@ -207,6 +250,10 @@ class KolaiMediaService : MediaSessionService() {
                 blocksDir = blocksDir,
                 ctxFactory = { http ->
                     val live = LiveDjContext(http = http, scope = serviceScope)
+                    // Per-block mood for the DJ prompts/cadence/TTS. "mix" is
+                    // mapped to null INSIDE LiveDjContext so default-mood
+                    // blocks keep the exact pre-mood behaviour.
+                    live.moodProvider = { KolaiMood.mood.value }
                     liveCtx = live
                     live::current
                 },
@@ -217,7 +264,7 @@ class KolaiMediaService : MediaSessionService() {
             liveCtx?.refreshNow()
 
             val taste = SeededTasteSource(this)
-            val rollingPlanner = RollingPlanner(
+            rollingPlanner = RollingPlanner(
                 tasteSource = taste,
                 setlistPlanner = engine.planner,
                 // Cross-launch no-repeat history: the planner keeps being told
@@ -243,6 +290,10 @@ class KolaiMediaService : MediaSessionService() {
             // resumes from already-rendered block files instead of re-rendering
             // from zero.
             stationEngine.start()
+            // Mood + "new station" bridges: wired only AFTER a successful
+            // build (a failed build leaves nothing for them to drive).
+            startMoodCollector()
+            startRetuneCollector()
             Log.i(TAG, "engine built; blocksDir=${blocksDir.absolutePath}")
         } catch (e: Throwable) {
             Log.e(TAG, "engine build FAILED", e)
@@ -290,11 +341,23 @@ class KolaiMediaService : MediaSessionService() {
 
                     // Cache this block's meta so the poller + skip player can map
                     // position -> segment synchronously.
-                    cacheMeta(idx)
+                    val blockMeta = cacheMeta(idx)
 
+                    // Seed the item with the block's FIRST song so Android Auto /
+                    // lock screen show a real title+artist the moment the block
+                    // starts (the position poller then live-updates the metadata
+                    // as segments advance within the block).
+                    val firstSeg = blockMeta?.segments?.firstOrNull()
                     val item = MediaItem.Builder()
                         .setMediaId(idx.toString())
                         .setUri(File(path).toUri())
+                        .setMediaMetadata(
+                            songMetadata(
+                                firstSeg?.title ?: "KOLAI",
+                                firstSeg?.artist,
+                                firstSeg?.let { CoverArt.cachedCoverUrl(it.artist, it.title) },
+                            ),
+                        )
                         .build()
 
                     runOnPlayer {
@@ -329,6 +392,80 @@ class KolaiMediaService : MediaSessionService() {
         }
     }
 
+    // --- mood + retune bridges -------------------------------------------------
+
+    /**
+     * Keep the planner's mood in sync with the UI chips. The key is passed
+     * AS-IS ("mix" included): [RollingPlanner] forwards it to the setlist
+     * planner, which ignores null/"mix", so the default mood costs nothing.
+     */
+    private fun startMoodCollector() {
+        serviceScope.launch {
+            KolaiMood.mood.collect { value ->
+                Log.i(TAG, "mood -> $value")
+                rollingPlanner.setMood(value)
+            }
+        }
+    }
+
+    /**
+     * "New station" handler: tear playback down to the cold-start shape
+     * (player IDLE with an EMPTY playlist -- the COLD-START LIFECYCLE
+     * invariant holds because the restarted feed loop only prepare()+play()s
+     * once the new FIRST FED block actually lands), reset the engine to a
+     * fresh generation at block 0, and restart the feed. The engine's run
+     * loop self-heals after [StationEngine.reset] and re-renders block 0 with
+     * a FRESH setlist + the current mood; block 0 is a single song, so the
+     * new station starts in roughly one song-render. Requests arriving while
+     * a retune is in flight are ignored ([retuneInFlight]).
+     */
+    private fun startRetuneCollector() {
+        serviceScope.launch {
+            KolaiMood.retune.collect {
+                if (!retuneInFlight.compareAndSet(false, true)) {
+                    Log.i(TAG, "retune already in flight; ignored")
+                    return@collect
+                }
+                try {
+                    Log.i(TAG, "retune requested")
+                    // 1) stop feeding; join so no stale block lands mid-teardown.
+                    feedJob?.cancelAndJoin()
+                    // 2) player back to the cold-start state: paused, playlist
+                    //    cleared, stop() -> IDLE with an empty playlist. Must
+                    //    run ON the player thread, and we must WAIT for it
+                    //    (runOnPlayer is fire-and-forget), hence withContext.
+                    withContext(Dispatchers.Main) {
+                        player.pause()
+                        player.clearMediaItems()
+                        player.stop()
+                    }
+                    // 3) clear caches + UI state; show "tuning" right away.
+                    metaCache.clear()
+                    lastMetaSong = null
+                    KolaiState.reset()
+                    KolaiState.setTuning()
+                    withContext(Dispatchers.Main) { promoteToForeground("מתחבר לתחנה…") }
+                    // 4) fresh engine generation: discards in-flight renders,
+                    //    clears blocks + continuity, frontier = current = 0.
+                    stationEngine.reset()
+                    // 5) restart the feed. firstPlayableIndex() now returns
+                    //    the post-reset frontier (0, registry is empty), so
+                    //    the loop re-tunes from block 0 and its existing
+                    //    first-fed-block path prepare()+play()s when it lands.
+                    nextToAdd = 0
+                    lastAdvanced = -1
+                    startFeedLoop()
+                } catch (e: Throwable) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    Log.e(TAG, "retune failed", e)
+                    KolaiState.setError("retune failed: ${e.message}")
+                } finally {
+                    retuneInFlight.set(false)
+                }
+            }
+        }
+    }
+
     /**
      * Position poller: while the player is playing, map the player's current
      * position to the active segment + active talk of the CURRENT block and
@@ -349,22 +486,81 @@ class KolaiMediaService : MediaSessionService() {
                 }
                 if (blockIndex >= 0) {
                     val meta = metaCache[blockIndex] ?: cacheMeta(blockIndex)
-                    if (meta != null) publishForPosition(meta, posSec)
+                    if (meta != null) publishForPosition(blockIndex, meta, posSec)
                 }
                 delay(POLL_MS)
             }
         }
     }
 
-    /** Find the active segment + talk for [posSec] and publish to the UI. */
-    private fun publishForPosition(meta: BlockMeta, posSec: Double) {
+    /**
+     * Find the active segment + talk for [posSec], publish to the UI, and keep
+     * the CURRENT media item's [MediaMetadata] in sync (car / lock screen).
+     */
+    private fun publishForPosition(blockIndex: Int, meta: BlockMeta, posSec: Double) {
         val seg = activeSegment(meta, posSec)
         if (seg != null) {
             KolaiState.setCurrentSong(seg.title, seg.artist.ifBlank { null })
+            publishSegmentMetadata(blockIndex, seg)
         }
         val talk = meta.talk.firstOrNull { posSec >= it.startS && posSec < it.endS }
         KolaiState.setDj(onAir = talk != null, beat = talk?.beat)
     }
+
+    /**
+     * Mirror the active segment into the CURRENT media item's [MediaMetadata] so
+     * Android Auto / the lock screen show the REAL current song as segments
+     * advance within a block. ExoPlayer applies [Player.replaceMediaItem] as an
+     * IN-PLACE metadata update (canUpdateMediaItem: URI unchanged) with no
+     * playback interruption. [lastMetaSong] gates it to actual song changes, and
+     * the mediaId guard skips stale polls where the player already moved on to
+     * another block.
+     */
+    private fun publishSegmentMetadata(blockIndex: Int, seg: ai.kolai.station.Segment) {
+        val key = "$blockIndex|${seg.title}|${seg.artist}"
+        if (key == lastMetaSong) return
+        lastMetaSong = key
+        // Publish immediately with whatever cover is already cached; when the
+        // cover is unknown, fetch it async and re-publish ONLY if this segment
+        // is still the live one (lastMetaSong unchanged).
+        val cached = CoverArt.cachedCoverUrl(seg.artist, seg.title)
+        applySegmentMetadata(blockIndex, seg, cached)
+        if (cached == null) {
+            serviceScope.launch {
+                val url = CoverArt.coverUrl(seg.artist, seg.title) ?: return@launch
+                if (lastMetaSong == key) applySegmentMetadata(blockIndex, seg, url)
+            }
+        }
+    }
+
+    private fun applySegmentMetadata(
+        blockIndex: Int,
+        seg: ai.kolai.station.Segment,
+        artworkUrl: String?,
+    ) {
+        runOnPlayer {
+            val cur = player.currentMediaItem ?: return@runOnPlayer
+            if (cur.mediaId != blockIndex.toString()) return@runOnPlayer
+            val updated = cur.buildUpon()
+                .setMediaMetadata(songMetadata(seg.title, seg.artist, artworkUrl))
+                .build()
+            player.replaceMediaItem(player.currentMediaItemIndex, updated)
+        }
+    }
+
+    /** Car / lock-screen metadata for one song (playable music leaf). The
+     *  https [artworkUrl] (Deezer album cover) is loaded by the session's
+     *  default DataSourceBitmapLoader, so Auto + the media notification show
+     *  real album art. */
+    private fun songMetadata(title: String, artist: String?, artworkUrl: String? = null): MediaMetadata =
+        MediaMetadata.Builder()
+            .setTitle(title)
+            .setArtist(artist?.ifBlank { null })
+            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+            .setIsPlayable(true)
+            .setIsBrowsable(false)
+            .apply { if (!artworkUrl.isNullOrBlank()) setArtworkUri(artworkUrl.toUri()) }
+            .build()
 
     /** Segment whose [startS, endS) contains [posSec], clamped to first/last. */
     private fun activeSegment(meta: BlockMeta, posSec: Double): ai.kolai.station.Segment? {
@@ -446,6 +642,136 @@ class KolaiMediaService : MediaSessionService() {
             val text = if (seg.artist.isNotBlank()) "${seg.title} - ${seg.artist}" else seg.title
             withContext(Dispatchers.Main) { promoteToForeground(text) }
         }
+    }
+
+    // --- Android Auto browse tree + queue resolution ---------------------------
+
+    /** Browse-tree root: a single browsable folder (not playable). */
+    private fun rootItem(): MediaItem = MediaItem.Builder()
+        .setMediaId(ROOT_ID)
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle("KOLAI")
+                .setIsBrowsable(true)
+                .setIsPlayable(false)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                .build(),
+        )
+        .build()
+
+    /** The ONE playable leaf: "the live station". Has NO URI on purpose. */
+    private fun liveItem(): MediaItem = MediaItem.Builder()
+        .setMediaId(LIVE_ID)
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle("KOLAI — רדיו AI חי")
+                .setArtist("תחנת הרדיו האישית שלך")
+                .setIsBrowsable(false)
+                .setIsPlayable(true)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .build(),
+        )
+        .build()
+
+    /**
+     * The player's existing playlist + position as a resume queue. MUST be
+     * called on the main (player application) thread -- Media3 invokes the
+     * session callbacks there. When the playlist is EMPTY we are mid cold
+     * render: return an empty queue and DO NOT touch the player (the COLD-START
+     * LIFECYCLE invariant: only the feed loop's first-fed-block path may
+     * prepare()+play()). The tap is best-effort; playback starts the moment
+     * block 0 lands.
+     */
+    private fun currentQueueSnapshot(): MediaSession.MediaItemsWithStartPosition {
+        val items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
+        return if (items.isNotEmpty()) {
+            MediaSession.MediaItemsWithStartPosition(
+                items,
+                player.currentMediaItemIndex,
+                player.currentPosition,
+            )
+        } else {
+            MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0)
+        }
+    }
+
+    /**
+     * Android Auto / browser session callback. Browse tree: ROOT_ID -> one
+     * playable LIVE_ID leaf representing "the station". The leaf has no URI, so
+     * onAddMediaItems/onSetMediaItems must NEVER forward it to the player;
+     * instead a tap resolves to the station's REAL queue (the player's current
+     * playlist) -- i.e. "play the live item" == "resume the station".
+     */
+    private val librarySessionCallback = object : MediaLibrarySession.Callback {
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> =
+            Futures.immediateFuture(LibraryResult.ofItem(rootItem(), params))
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
+            if (parentId == ROOT_ID) {
+                Futures.immediateFuture(
+                    LibraryResult.ofItemList(ImmutableList.of(liveItem()), params),
+                )
+            } else {
+                // Unknown parent: empty list (not an error) keeps Auto happy.
+                Futures.immediateFuture(
+                    LibraryResult.ofItemList(ImmutableList.of(), params),
+                )
+            }
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> = when (mediaId) {
+            ROOT_ID -> Futures.immediateFuture(LibraryResult.ofItem(rootItem(), null))
+            LIVE_ID -> Futures.immediateFuture(LibraryResult.ofItem(liveItem(), null))
+            else -> Futures.immediateFuture(
+                LibraryResult.ofError(SessionError.ERROR_BAD_VALUE),
+            )
+        }
+
+        /** Browse items have no URI: never let any reach the player. */
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+        ): ListenableFuture<MutableList<MediaItem>> =
+            Futures.immediateFuture(mutableListOf())
+
+        /**
+         * Tap on the LIVE leaf in the car: ignore the requested (URI-less)
+         * items and resolve to the station's real queue -- the player's
+         * existing playlist at its current position (seamless resume), or an
+         * empty queue mid cold render (feed loop starts playback when block 0
+         * lands).
+         */
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            Futures.immediateFuture(currentQueueSnapshot())
+
+        /** System/Auto playback resumption (reboot / app death): same queue. */
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            Futures.immediateFuture(currentQueueSnapshot())
     }
 
     // --- segment-aware skip ---------------------------------------------------
@@ -557,7 +883,7 @@ class KolaiMediaService : MediaSessionService() {
 
     // --- MediaSessionService lifecycle ---------------------------------------
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? =
         mediaSession
 
     override fun onDestroy() {
@@ -580,6 +906,9 @@ class KolaiMediaService : MediaSessionService() {
         private const val BUFFER_AHEAD = 2
         private const val KEEP_BEHIND = 2
         private const val POLL_MS = 500L
+        // Android Auto browse-tree ids: one root folder with one "live" leaf.
+        private const val ROOT_ID = "kolai_root"
+        private const val LIVE_ID = "kolai_live"
         private const val CHANNEL_ID = "kolai_playback"
         private const val NOTIF_ID = 1001
     }

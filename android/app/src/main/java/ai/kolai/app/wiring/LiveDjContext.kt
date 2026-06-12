@@ -2,6 +2,7 @@ package ai.kolai.app.wiring
 
 import ai.kolai.station.DjClock
 import ai.kolai.station.DjContext
+import ai.kolai.station.Moods
 import ai.kolai.station.WeatherText
 import ai.kolai.station.parseNewsRss
 import android.util.Log
@@ -57,6 +58,13 @@ class LiveDjContext(
 
     private val refreshing = AtomicBoolean(false)
 
+    /**
+     * Current mood key supplier (set by the service to read [KolaiMood]).
+     * "mix" -- the default -- maps to a NULL [DjContext.mood] in [current] so
+     * default-mood prompts/cadence/TTS stay byte-identical to pre-mood blocks.
+     */
+    @Volatile var moodProvider: () -> String? = { null }
+
     /** Fresh time-of-day NOW + the latest cached weather/news. Non-blocking. */
     fun current(): DjContext {
         val cal = Calendar.getInstance()
@@ -69,6 +77,7 @@ class LiveDjContext(
             weather = weather,
             generalHeadline = generalHeadline,
             topicHeadlines = topicHeadlines,
+            mood = moodProvider()?.takeIf { it != Moods.DEFAULT },
         )
     }
 

@@ -36,22 +36,24 @@ class GeminiLlmClient(
 }
 
 /**
- * Adapts the :voice [VoiceVoiceRenderer] (suspend `render(text, voiceOverride?)`)
- * to the :station [StationVoiceRenderer] seam.
+ * Adapts the :voice [VoiceVoiceRenderer] (suspend `render(text, voiceOverride?,
+ * style?)`) to the :station [StationVoiceRenderer] seam.
  *
  * IMPORTANT SIGNATURE MISMATCH (verified by reading station/RenderSeams.kt):
- * the :station seam is NON-suspend `fun render(text: String): DJSlot`, while the
+ * the :station seam is NON-suspend `fun render(text, style?): DJSlot`, while the
  * :voice renderer is `suspend fun render(...)`. BlockRenderer always calls
  * voice.render(...) from inside its own `suspend render(...)` (i.e. already on a
  * coroutine / dispatcher), so we bridge with [runBlocking]: it blocks the calling
  * worker thread for the duration of the TTS network call, which is exactly the
  * sequential behaviour the renderer expects. (Post-MVP: make the :station seam
- * suspend to drop this bridge.)
+ * suspend to drop this bridge.) The mood [style] prefix passes straight through
+ * to the :voice renderer (named arg: the middle voiceOverride param stays null).
  */
 class VoiceRendererAdapter(
     private val inner: VoiceVoiceRenderer,
 ) : StationVoiceRenderer {
-    override fun render(text: String): DJSlot = runBlocking { inner.render(text) }
+    override fun render(text: String, style: String?): DJSlot =
+        runBlocking { inner.render(text, style = style) }
 }
 
 /**
