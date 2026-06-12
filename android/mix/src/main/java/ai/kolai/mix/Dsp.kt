@@ -109,6 +109,12 @@ object Dsp {
      * linearly from 1.0 down to `gain`; [start+ramp, end) is steady `gain`;
      * the voice is then overlaid onto [start, end); result clipped to [-1, 1].
      * Operates on a copy — `music` is not mutated.
+     *
+     * [easedReleaseS] <= 0 (the default) keeps the ORIGINAL behavior bit-exact:
+     * the bed snaps straight back to unity gain the sample after the voice
+     * ends. When > 0 (~0.7 s feels broadcast-natural) the post-voice recovery
+     * instead follows a smoothstep ease from `gain` up to 1.0 over that many
+     * seconds — the music "swells back" instead of jumping.
      */
     fun duck(
         music: FloatArray,
@@ -116,6 +122,7 @@ object Dsp {
         startS: Float,
         attenuationDb: Float = -7.0f,
         rampS: Float = 0.3f,
+        easedReleaseS: Float = 0.0f,
     ): FloatArray {
         val out = music.copyOf()
         val start = (startS * SR).toInt()
@@ -146,6 +153,20 @@ object Dsp {
         while (k < vlen) {
             out[start + k] += voice[k]
             k++
+        }
+
+        // eased release: smoothstep recovery gain -> 1 over [end, end + relN).
+        // Skipped entirely when easedReleaseS <= 0 so the default path stays
+        // bit-exact with the original implementation.
+        if (easedReleaseS > 0.0f) {
+            val relN = (easedReleaseS * SR).toInt()
+            var r = 0
+            while (r < relN && end + r < out.size) {
+                val f = r.toFloat() / relN.toFloat()
+                val s = f * f * (3.0f - 2.0f * f) // smoothstep
+                out[end + r] *= gain + (1.0f - gain) * s
+                r++
+            }
         }
 
         return peakNormalizeClip(out)
@@ -248,6 +269,68 @@ object Dsp {
         }
         return out
     }
+    /**
+     * Drop a near-silent TAIL from [audio], keeping [keepS] seconds of it as a
+     * natural breath. YouTube-muxed masters often carry a long silent
+     * music-video tail; this trims it so crossfades never blend into nothing.
+     *
+     * The tail is detected with 50 ms RMS windows walked backward from the
+     * end: windows whose RMS stays under [threshold] are silence. The result
+     * is audio[0 until tailStart + keepS] (clamped to the clip length).
+     *
+     * Identity cases (the SAME array instance is returned, no copy):
+     *  - no trailing window is below threshold;
+     *  - the silent tail is shorter than [keepS];
+     *  - empty input.
+     * NaN samples in a window make that window count as NOT silent (NaN
+     * comparisons are false), so corrupt decodes are never silently dropped.
+     */
+    fun trimTrailingSilence(
+        audio: FloatArray,
+        sr: Int,
+        threshold: Float = 0.003f,
+        keepS: Float = 0.5f,
+    ): FloatArray {
+        require(sr > 0) { "sr must be > 0, was $sr" }
+        if (audio.isEmpty()) return audio
+        val win = maxOf(1, sr / 20) // 50 ms RMS windows
+
+        // Walk windows backward from the end while their RMS stays silent.
+        var tailStart = audio.size
+        var end = audio.size
+        while (end > 0) {
+            val from = maxOf(0, end - win)
+            var sumSq = 0.0
+            for (i in from until end) {
+                val v = audio[i].toDouble()
+                sumSq += v * v
+            }
+            val rms = sqrt(sumSq / (end - from))
+            // NaN rms -> comparison false -> treated as loud -> stop scanning.
+            if (!(rms < threshold)) break
+            tailStart = from
+            end = from
+        }
+
+        if (tailStart >= audio.size) return audio // no silent tail
+        val keep = maxOf(0, (keepS * sr).toInt())
+        val cut = minOf(audio.size.toLong(), tailStart.toLong() + keep).toInt()
+        if (cut >= audio.size) return audio // tail shorter than keepS
+        return audio.copyOfRange(0, cut)
+    }
+
+    /**
+     * First beat time (seconds) at or after [t], or null when none exists.
+     * [beatTimes] must be ascending (TrackAnalysis.beatTimes always is).
+     * NaN [t] or NaN beat entries compare false and are skipped -> null-safe.
+     */
+    fun firstBeatAtOrAfter(beatTimes: List<Double>, t: Double): Double? {
+        for (b in beatTimes) {
+            if (b >= t) return b
+        }
+        return null
+    }
+
     /**
      * Round an overlap length to a whole number of beats (min 1) at `bpm`.
      * Ports snap_overlap_to_beats. Non-positive bpm returns overlap unchanged.

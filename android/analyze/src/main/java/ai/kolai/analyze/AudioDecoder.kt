@@ -35,7 +35,13 @@ object AudioDecoder {
      * Decode the audio in [path] to mono [targetSr] Float PCM in [-1, 1].
      *
      * Pipeline: MediaExtractor selects the first audio track -> MediaCodec
-     * decodes to 16-bit interleaved PCM -> [downmixToMono] -> [resampleLinear].
+     * decodes to 16-bit interleaved PCM -> [downmixToMono] -> [resampleSinc].
+     *
+     * RESAMPLE QUALITY (wave 4): the rate conversion uses the windowed-sinc
+     * [resampleSinc] (was [resampleLinear]). This is the broadcast-quality
+     * path for the 24 kHz Gemini TTS voice WAVs AND for songs decoded at
+     * non-44.1k rates - sinc is strictly better than linear in both cases,
+     * and same-rate input is returned unchanged (no cost for 44.1k songs).
      *
      * @param path     absolute filesystem path to the audio file.
      * @param targetSr desired output sample rate (Hz); default 44100.
@@ -47,7 +53,7 @@ object AudioDecoder {
         require(targetSr > 0) { "targetSr must be > 0, was $targetSr" }
         val (interleaved, channels, decodedSr) = decodeWithSampleRate(path)
         val mono = downmixToMono(interleaved, channels)
-        val out = resampleLinear(mono, decodedSr, targetSr)
+        val out = resampleSinc(mono, decodedSr, targetSr)
         Log.i(
             TAG,
             "decoded $path: frames=${interleaved.size / channels} channels=$channels " +
