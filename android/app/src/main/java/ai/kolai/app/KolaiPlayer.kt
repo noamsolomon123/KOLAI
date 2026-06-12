@@ -52,14 +52,47 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.CompositionLocalProvider
+import ai.kolai.app.wiring.CoverArt
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import kotlin.math.PI
+import kotlin.math.sin
 
 // ---------------------------------------------------------------------------
 //  Cover art  (web .cover / .cover__glyph / cover-wrap::before glow)
 // ---------------------------------------------------------------------------
 
 @Composable
-internal fun CoverArtHero(palette: KolaiPalette, seed: String, playing: Boolean) {
+internal fun CoverArtHero(
+    palette: KolaiPalette,
+    seed: String,
+    playing: Boolean,
+    title: String? = null,
+    artist: String? = null,
+) {
     val shape = RoundedCornerShape(28.dp)
+    // Real album cover for the current song (Deezer, free/keyless lookup).
+    // State only flips AFTER a lookup completes, so on a song change the
+    // previous cover stays up until the new one (or a null miss) arrives.
+    var coverUrl by remember { mutableStateOf<String?>(null) }
+    var prevCoverUrl by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(title, artist) {
+        if (title.isNullOrBlank()) {
+            prevCoverUrl = null
+            coverUrl = null
+        } else {
+            val url = CoverArt.coverUrl(artist.orEmpty(), title)
+            prevCoverUrl = coverUrl
+            coverUrl = url
+        }
+    }
     val glowAlpha by animateFloatAsState(
         targetValue = if (playing) 0.6f else 0.32f,
         animationSpec = tween(600),
@@ -92,6 +125,29 @@ internal fun CoverArtHero(palette: KolaiPalette, seed: String, playing: Boolean)
                 contentAlignment = Alignment.Center,
             ) {
                 Waveform(seed = seed, modifier = Modifier.fillMaxSize())
+                // Real cover, crossfaded over the waveform once a URL is known.
+                // The waveform stays composed behind it and doubles as the live
+                // placeholder while a (new) image loads; Coil's own crossfade +
+                // the previous image as memory-cache placeholder keep song-to-
+                // song transitions smooth.
+                Crossfade(
+                    targetState = coverUrl != null,
+                    animationSpec = tween(500),
+                    label = "coverSwap",
+                ) { hasCover ->
+                    if (hasCover) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(LocalContext.current)
+                                .data(coverUrl)
+                                .crossfade(true)
+                                .placeholderMemoryCacheKey(prevCoverUrl)
+                                .build(),
+                            contentDescription = title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -100,14 +156,21 @@ internal fun CoverArtHero(palette: KolaiPalette, seed: String, playing: Boolean)
 /**
  * Deterministic decorative waveform drawn from a seed string (the song title):
  * same song -> same wave, every render. Mirrored rounded bars around the
- * vertical center, like a track's amplitude view. STATIC by design (no
- * per-frame animation -- the lightweight perf rule); motion comes from the
- * hue/glow transitions around it.
+ * vertical center, like a track's amplitude view. A single slow infinite
+ * phase gently breathes the bar heights (one transition, no per-frame
+ * allocation -- the lightweight perf rule) so the fallback never looks dead.
  */
 @Composable
 private fun Waveform(seed: String, modifier: Modifier = Modifier) {
     val heights = remember(seed) { waveformHeights(kolaiHash(seed), bars = 44) }
     val color = Color.White.copy(alpha = 0.92f)
+    val wave = rememberInfiniteTransition(label = "wave")
+    val phase by wave.animateFloat(
+        initialValue = 0f,
+        targetValue = (2.0 * PI).toFloat(),
+        animationSpec = infiniteRepeatable(tween(4200, easing = LinearEasing)),
+        label = "wavePhase",
+    )
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
@@ -119,7 +182,9 @@ private fun Waveform(seed: String, modifier: Modifier = Modifier) {
         val minHalf = h * 0.025f
         val maxHalf = h * 0.21f            // tallest bar = 42% of cover height
         for (i in 0 until n) {
-            val half = minHalf + (maxHalf - minHalf) * heights[i]
+            // subtle breath: each bar sways +/-15% on a slow traveling sine
+            val sway = 1f + 0.15f * sin(phase + i * 0.45f)
+            val half = (minHalf + (maxHalf - minHalf) * heights[i]) * sway
             drawRoundRect(
                 color = color,
                 topLeft = Offset(x0 + slot * i + (slot - barW) / 2f, h / 2f - half),
