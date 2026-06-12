@@ -5,12 +5,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
@@ -67,6 +71,19 @@ class StationEngine(
     private val keepBehind: Int = 2,
     private val blocksDir: String,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    // RENDER WATCHDOG knobs (defaults are production values; unit tests rely on
+    // runTest VIRTUAL time, so the defaults stay instant in tests): one render
+    // attempt is bounded by [renderTimeoutMs]; a failed/hung attempt retries
+    // after each backoff in [renderRetryDelaysMs]; after TOTAL failure the run
+    // loop keeps retrying every [failureRetryDelayMs] forever (self-recovery
+    // when the network returns).
+    private val renderTimeoutMs: Long = 8 * 60_000L,
+    private val renderRetryDelaysMs: List<Long> = listOf(5_000L, 30_000L, 120_000L),
+    private val failureRetryDelayMs: Long = 180_000L,
+    // THERMAL COURTESY: breather between back-to-back render-ahead renders once
+    // the buffer is already comfortable (applied by the run loop only; urgent
+    // getBlockPath callers never pay it).
+    private val renderCooldownMs: Long = 15_000L,
 ) {
     // index -> (meta, path). Prunable. Guarded by stateMutex.
     private val blocks = HashMap<Int, Pair<BlockMeta, String>>()
@@ -191,8 +208,9 @@ class StationEngine(
      * [reset] and is discarded -- the loop then re-snapshots the post-reset
      * frontier). Every commit also persists the block's meta json + state.json.
      */
-    suspend fun ensureThrough(target: Int) {
+    suspend fun ensureThrough(target: Int, cooldownMs: Long = 0L) {
         while (true) {
+            var cooldownEligible = false
             val done = renderMutex.withLock {
                 val i: Int
                 val gen: Int
@@ -207,7 +225,11 @@ class StationEngine(
                 if (i > target) return@withLock true
 
                 val songs = nextSongs(songsPerBlock(i), seed)
-                val res = renderBlock(songs, i, prevTrack)
+                // RENDER WATCHDOG: per-attempt timeout + retry-with-backoff.
+                // null = a reset() landed during a backoff (this snapshot is
+                // stale): skip the render and re-snapshot on the next loop.
+                val res = renderWithWatchdog(songs, i, prevTrack, gen)
+                    ?: return@withLock false
 
                 stateMutex.withLock {
                     if (gen != generation) {
@@ -218,6 +240,12 @@ class StationEngine(
                     prevLastTrack = res.lastTrack
                     prevLastSong = songs.lastOrNull()
                     frontier = i + 1
+                    // THERMAL COURTESY eligibility: more blocks remain to render
+                    // AND the buffer already holds >= 1 fully-rendered block
+                    // beyond the playing one, so a breather cannot stall
+                    // playback (and an urgent getBlockPath caller acquires the
+                    // render mutex itself during the pause -- it never waits).
+                    cooldownEligible = frontier <= target && frontier > current + 1
                     try {
                         StationPersistence.writeAtomic(
                             File(blocksDir, "block_$i.meta.json"),
@@ -231,7 +259,46 @@ class StationEngine(
                 false
             }
             if (done) break
+            if (cooldownMs > 0 && cooldownEligible) delay(cooldownMs)
         }
+    }
+
+    /**
+     * RENDER WATCHDOG: run ONE block render with a generous per-attempt timeout
+     * (a hung network call must never wedge the station) and retry-with-backoff
+     * on failure. Returns null when a [reset] landed during a backoff (the
+     * snapshot is stale; the caller re-snapshots); throws the LAST error only
+     * after every attempt failed -- the run loop then keeps retrying forever
+     * every [failureRetryDelayMs] while already-rendered blocks stay playable.
+     */
+    private suspend fun renderWithWatchdog(
+        songs: List<Song>,
+        index: Int,
+        prevTrack: LoadedTrack?,
+        gen: Int,
+    ): BlockResult? {
+        val attempts = renderRetryDelaysMs.size + 1
+        var lastErr: Throwable? = null
+        for (attempt in 1..attempts) {
+            try {
+                return withTimeout(renderTimeoutMs) { renderBlock(songs, index, prevTrack) }
+            } catch (e: TimeoutCancellationException) {
+                lastErr = e
+                println("[station] render of block $index TIMED OUT after ${renderTimeoutMs}ms (attempt $attempt/$attempts)")
+            } catch (e: CancellationException) {
+                throw e // engine stopping: never swallow real cancellation
+            } catch (e: Exception) {
+                lastErr = e
+                println("[station] render of block $index failed (attempt $attempt/$attempts): $e")
+            }
+            if (attempt < attempts) {
+                delay(renderRetryDelaysMs[attempt - 1])
+                // a reset() during the backoff makes this render stale: abort
+                // quietly so the caller re-snapshots the fresh generation.
+                stateMutex.withLock { if (gen != generation) return null }
+            }
+        }
+        throw lastErr ?: IllegalStateException("render of block $index failed")
     }
 
     /** Python `get_block_meta`. */
@@ -358,13 +425,24 @@ class StationEngine(
     private suspend fun run() {
         while (scope.isActive) {
             val target = stateMutex.withLock { current + bufferAhead }
+            var failed = false
             try {
-                ensureThrough(target)
+                ensureThrough(target, renderCooldownMs)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                println("[station] render error: $e")
+                failed = true
+                println(
+                    "[station] render error: $e -- retrying in ${failureRetryDelayMs}ms " +
+                        "(station self-recovers when the network returns)",
+                )
             }
             prune()
-            withTimeoutOrNull(2000) { wakeChannel.receive() }
+            // SELF-RECOVERY: after a TOTAL render failure (watchdog exhausted)
+            // keep retrying forever on a slow cadence; a wake (advance/reset)
+            // still triggers an immediate pass. Already-rendered blocks stay in
+            // the registry and remain playable meanwhile.
+            withTimeoutOrNull(if (failed) failureRetryDelayMs else 2000) { wakeChannel.receive() }
         }
     }
 

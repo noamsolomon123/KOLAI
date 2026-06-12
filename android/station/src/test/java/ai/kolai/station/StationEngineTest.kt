@@ -2,11 +2,15 @@ package ai.kolai.station
 
 import ai.kolai.core.Song
 import ai.kolai.core.TrackAnalysis
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
@@ -25,6 +29,7 @@ import java.nio.file.Files
  * dir; the fake render actually writes the block_<index>.m4a file so prune/delete
  * can be asserted on the filesystem.
  */
+@OptIn(ExperimentalCoroutinesApi::class) // TestScope.currentTime (virtual clock)
 class StationEngineTest {
 
     // ---- helpers ---------------------------------------------------------
@@ -465,5 +470,144 @@ class StationEngineTest {
         // the unusable pair was deleted best-effort
         assertFalse(blockFile(dir, 1).exists())
         assertFalse(metaFile(dir, 1).exists())
+    }
+
+    // ======================================================================
+    // RENDER WATCHDOG + SELF-RECOVERY + THERMAL COURTESY
+    // All delays/timeouts run on runTest VIRTUAL time -> tests are instant,
+    // and currentTime PROVES the backoff/cooldown was actually applied.
+    // ======================================================================
+
+    @Test
+    fun watchdog_retriesFailingRender_withBackoff_thenCommits() = runTest {
+        val dir = newTempDir()
+        val inner = FakeRender(dir)
+        var failuresLeft = 2
+        var calls = 0
+        val engine = StationEngine(
+            nextSongs = FakeNextSongs(3)::nextSongs,
+            renderBlock = { songs, index, prev ->
+                calls++
+                if (failuresLeft > 0) {
+                    failuresLeft--
+                    throw RuntimeException("network died")
+                }
+                inner.render(songs, index, prev)
+            },
+            songsPerBlock = { 3 },
+            bufferAhead = 2,
+            keepBehind = 2,
+            blocksDir = dir,
+        )
+
+        engine.ensureThrough(0)
+
+        // initial attempt + 2 retries, then the block commits normally
+        assertEquals(3, calls)
+        assertEquals(1, engine.frontierForTest())
+        assertEquals(0, engine.getBlockMeta(0)?.index)
+        assertTrue(blockFile(dir, 0).exists())
+        // backoff actually applied between attempts: 5s then 30s (virtual time)
+        assertEquals(35_000L, currentTime)
+    }
+
+    @Test
+    fun watchdog_timesOutHungRender_thenRetrySucceeds() = runTest {
+        val dir = newTempDir()
+        val inner = FakeRender(dir)
+        var calls = 0
+        val engine = StationEngine(
+            nextSongs = FakeNextSongs(3)::nextSongs,
+            renderBlock = { songs, index, prev ->
+                calls++
+                if (calls == 1) delay(10 * 60 * 60_000L) // hung render (network died mid-fetch)
+                inner.render(songs, index, prev)
+            },
+            songsPerBlock = { 3 },
+            bufferAhead = 2,
+            keepBehind = 2,
+            blocksDir = dir,
+        )
+
+        engine.ensureThrough(0)
+
+        // the hung attempt was killed by the per-attempt timeout, then retried
+        assertEquals(2, calls)
+        assertEquals(1, engine.frontierForTest())
+        assertEquals(0, engine.getBlockMeta(0)?.index)
+        // 8min render timeout + 5s first backoff (virtual)
+        assertEquals(8 * 60_000L + 5_000L, currentTime)
+    }
+
+    @Test
+    fun watchdog_totalFailure_throws_keepsRenderedBlocks_thenRecovers() = runTest {
+        val dir = newTempDir()
+        val inner = FakeRender(dir)
+        var networkDown = false
+        var block1Attempts = 0
+        val engine = StationEngine(
+            nextSongs = FakeNextSongs(3)::nextSongs,
+            renderBlock = { songs, index, prev ->
+                if (index == 1 && networkDown) {
+                    block1Attempts++
+                    throw RuntimeException("network died")
+                }
+                inner.render(songs, index, prev)
+            },
+            songsPerBlock = { 3 },
+            bufferAhead = 2,
+            keepBehind = 2,
+            blocksDir = dir,
+        )
+
+        engine.ensureThrough(0) // block 0 renders fine
+        networkDown = true
+        try {
+            engine.ensureThrough(1)
+            fail("expected total render failure to surface")
+        } catch (e: RuntimeException) {
+            assertEquals("network died", e.message)
+        }
+
+        // every attempt burned (initial + 3 retries); block 0 STAYS playable
+        assertEquals(4, block1Attempts)
+        assertEquals(1, engine.frontierForTest())
+        assertEquals("$dir/block_0.m4a", engine.getBlockPath(0))
+        assertEquals(0, engine.getBlockMeta(0)?.index)
+
+        // network returns -> the SAME engine recovers on the next pass
+        networkDown = false
+        engine.ensureThrough(1)
+        assertEquals(2, engine.frontierForTest())
+        assertEquals(1, engine.getBlockMeta(1)?.index)
+        assertTrue(blockFile(dir, 1).exists())
+    }
+
+    @Test
+    fun renderCooldown_pausesBetweenBackToBackRenders_whenBufferComfortable() = runTest {
+        val dir = newTempDir()
+        val render = FakeRender(dir)
+        val engine = newEngine(FakeNextSongs(3), render, dir)
+
+        engine.ensureThrough(3, cooldownMs = 15_000L)
+
+        assertEquals(listOf(0, 1, 2, 3), render.callIndices)
+        // cooldown applies ONLY between back-to-back renders once the buffer is
+        // comfortable: after block 0 (frontier=1 == current+1) no pause; after
+        // blocks 1 and 2 a 15s pause each; after block 3 the target is reached
+        // (no trailing pause). Total = 30s of virtual time.
+        assertEquals(30_000L, currentTime)
+    }
+
+    @Test
+    fun renderCooldown_zeroByDefault_addsNoDelay() = runTest {
+        val dir = newTempDir()
+        val render = FakeRender(dir)
+        val engine = newEngine(FakeNextSongs(3), render, dir)
+
+        engine.ensureThrough(3)
+
+        assertEquals(listOf(0, 1, 2, 3), render.callIndices)
+        assertEquals(0L, currentTime)
     }
 }

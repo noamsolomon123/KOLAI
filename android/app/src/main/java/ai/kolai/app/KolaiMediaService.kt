@@ -18,6 +18,7 @@ import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.LibraryResult
@@ -111,6 +112,14 @@ class KolaiMediaService : MediaLibraryService() {
 
     // "New station" re-entrancy guard: a retune in flight ignores new requests.
     private val retuneInFlight = AtomicBoolean(false)
+
+    // SELF-HEAL bookkeeping: timestamps of recent auto-restarts per loop
+    // (bounded to MAX_LOOP_RESTARTS_PER_HOUR) and of recent player-error
+    // recoveries (bounded to MAX_PLAYER_RECOVERIES per window).
+    private val feedRestarts = ArrayDeque<Long>()
+    private val posRestarts = ArrayDeque<Long>()
+    private val playerErrorTimes = ArrayDeque<Long>() // player thread (main) only
+    private var lastErroredBlockId: String? = null    // player thread (main) only
 
     override fun onCreate() {
         super.onCreate()
@@ -315,12 +324,37 @@ class KolaiMediaService : MediaLibraryService() {
     private fun startFeedLoop() {
         feedJob = serviceScope.launch {
             try {
+                if (!::stationEngine.isInitialized) {
+                    // engine build failed in onCreate: nothing to feed, and a
+                    // restart cannot fix it -> stay down (ERROR already shown).
+                    Log.e(TAG, "feed: engine never built; not feeding")
+                    return@launch
+                }
                 // Resume point: lowest already-rendered block at/after the
                 // engine's current position, else the render frontier.
-                val first = stationEngine.firstPlayableIndex()
+                val engineFirst = stationEngine.firstPlayableIndex()
+                // SELF-HEAL RESTART SAFETY: if the player ALREADY holds items
+                // (this loop crashed mid-flight and was auto-restarted), never
+                // re-add blocks it already has, and never re-run the
+                // first-fed-block prepare()+play()/tuning path -- the COLD-START
+                // LIFECYCLE invariant applies to an EMPTY player only. On a
+                // cold start / retune the playlist is empty, so coldStart=true
+                // keeps the original behaviour exactly.
+                val maxQueued = withContext(Dispatchers.Main) {
+                    (0 until player.mediaItemCount)
+                        .mapNotNull { player.getMediaItemAt(it).mediaId.toIntOrNull() }
+                        .maxOrNull()
+                }
+                val coldStart = maxQueued == null
+                val first = if (maxQueued == null) engineFirst else maxOf(engineFirst, maxQueued + 1)
                 nextToAdd = first
-                lastAdvanced = first - 1
-                Log.i(TAG, "feed: starting at block $first")
+                if (coldStart) {
+                    lastAdvanced = first - 1
+                } else if (withContext(Dispatchers.Main) { player.isPlaying }) {
+                    // restarted while playback survived: clear any stale ERROR.
+                    KolaiState.setPlaying()
+                }
+                Log.i(TAG, "feed: starting at block $first (coldStart=$coldStart)")
                 while (isActive) {
                     // Compare BLOCK ids (mediaId), not playlist positions:
                     // pruning removes leading items and a restored start is
@@ -334,7 +368,7 @@ class KolaiMediaService : MediaLibraryService() {
                     }
 
                     val idx = nextToAdd
-                    if (idx == first) KolaiState.setTuning()
+                    if (idx == first && coldStart) KolaiState.setTuning()
                     Log.i(TAG, "feed: requesting block $idx (cold render if not on disk)")
                     val path = withContext(Dispatchers.IO) { stationEngine.getBlockPath(idx) }
                     Log.i(TAG, "feed: block $idx ready -> $path")
@@ -362,7 +396,7 @@ class KolaiMediaService : MediaLibraryService() {
 
                     runOnPlayer {
                         player.addMediaItem(item)
-                        if (idx == first) {
+                        if (idx == first && coldStart) {
                             // The FIRST FED block just landed (block 0 after the
                             // long cold render, or a restored block instantly on
                             // a warm relaunch). The player has been IDLE/empty
@@ -378,7 +412,7 @@ class KolaiMediaService : MediaLibraryService() {
                             player.prepare()
                         }
                     }
-                    if (idx == first) {
+                    if (idx == first && coldStart) {
                         KolaiState.setReady()
                         updateNowPlaying(first)
                     }
@@ -386,8 +420,11 @@ class KolaiMediaService : MediaLibraryService() {
                 }
             } catch (e: Throwable) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
-                Log.e(TAG, "feed loop error", e)
+                // SELF-HEAL: never stay dead on a long drive -- surface the
+                // error, then auto-restart the loop (bounded per hour).
+                Log.e(TAG, "feed loop CRASHED -- scheduling self-heal restart", e)
                 KolaiState.setError("feed error: ${e.message}")
+                scheduleLoopRestart("feed", feedRestarts, { feedJob?.isActive == true }, ::startFeedLoop)
             }
         }
     }
@@ -474,22 +511,71 @@ class KolaiMediaService : MediaLibraryService() {
      */
     private fun startPositionLoop() {
         posJob = serviceScope.launch {
-            while (isActive) {
-                val playing = withContext(Dispatchers.Main) { player.isPlaying }
-                if (!playing) {
-                    delay(1000)
-                    continue
+            try {
+                while (isActive) {
+                    val playing = withContext(Dispatchers.Main) { player.isPlaying }
+                    if (!playing) {
+                        delay(1000)
+                        continue
+                    }
+                    val (blockIndex, posSec) = withContext(Dispatchers.Main) {
+                        val id = player.currentMediaItem?.mediaId?.toIntOrNull() ?: -1
+                        id to (player.currentPosition / 1000.0)
+                    }
+                    if (blockIndex >= 0) {
+                        val meta = metaCache[blockIndex] ?: cacheMeta(blockIndex)
+                        if (meta != null) publishForPosition(blockIndex, meta, posSec)
+                    }
+                    delay(POLL_MS)
                 }
-                val (blockIndex, posSec) = withContext(Dispatchers.Main) {
-                    val id = player.currentMediaItem?.mediaId?.toIntOrNull() ?: -1
-                    id to (player.currentPosition / 1000.0)
-                }
-                if (blockIndex >= 0) {
-                    val meta = metaCache[blockIndex] ?: cacheMeta(blockIndex)
-                    if (meta != null) publishForPosition(blockIndex, meta, posSec)
-                }
-                delay(POLL_MS)
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                // SELF-HEAL: a dead poller silently freezes now-playing /
+                // ON-AIR; auto-restart it (bounded per hour). Playback itself
+                // is unaffected meanwhile.
+                Log.e(TAG, "position poller CRASHED -- scheduling self-heal restart", e)
+                scheduleLoopRestart("position", posRestarts, { posJob?.isActive == true }, ::startPositionLoop)
             }
+        }
+    }
+
+    /**
+     * SELF-HEAL: restart a crashed service loop after [LOOP_RESTART_DELAY_MS],
+     * bounded to [MAX_LOOP_RESTARTS_PER_HOUR] so a hard-broken loop cannot
+     * spin. [isAlive] re-checks at fire time: if something else (e.g. a
+     * retune) already restarted the loop, the pending restart is dropped so
+     * two copies of a loop can never run at once.
+     */
+    private fun scheduleLoopRestart(
+        name: String,
+        restartTimes: ArrayDeque<Long>,
+        isAlive: () -> Boolean,
+        restart: () -> Unit,
+    ) {
+        val now = System.currentTimeMillis()
+        synchronized(restartTimes) {
+            while (restartTimes.isNotEmpty() && now - restartTimes.first() > RESTART_WINDOW_MS) {
+                restartTimes.removeFirst()
+            }
+            if (restartTimes.size >= MAX_LOOP_RESTARTS_PER_HOUR) {
+                Log.e(
+                    TAG,
+                    "SELF-HEAL: $name loop crashed ${restartTimes.size} times in the last hour" +
+                        " -- giving up until the hourly window clears",
+                )
+                return
+            }
+            restartTimes.addLast(now)
+        }
+        Log.e(TAG, "SELF-HEAL: $name loop down -- auto-restart in ${LOOP_RESTART_DELAY_MS / 1000}s")
+        serviceScope.launch {
+            delay(LOOP_RESTART_DELAY_MS)
+            if (isAlive()) {
+                Log.i(TAG, "SELF-HEAL: $name loop already running again; skipping auto-restart")
+                return@launch
+            }
+            Log.w(TAG, "SELF-HEAL: restarting $name loop NOW")
+            restart()
         }
     }
 
@@ -604,6 +690,49 @@ class KolaiMediaService : MediaLibraryService() {
 
         override fun onPlaybackStateChanged(state: Int) {
             Log.i(TAG, "onPlaybackStateChanged=$state")
+        }
+
+        /**
+         * PLAYER ERROR RECOVERY (self-heal): an ExoPlayer error normally halts
+         * playback for good. Blocks are LOCAL files, so errors are rare (a
+         * corrupt encode, a pruned-under-our-feet file): re-prepare()+play()
+         * and keep driving. If the SAME block errors twice in a row it is
+         * treated as corrupt and removed so the station continues with the
+         * next block. Bounded ([MAX_PLAYER_RECOVERIES] per window) so a
+         * hard-broken player cannot loop. Runs on the player thread (main),
+         * so direct player access is safe.
+         */
+        override fun onPlayerError(error: PlaybackException) {
+            Log.e(TAG, "onPlayerError: ${error.errorCodeName}", error)
+            val now = System.currentTimeMillis()
+            while (playerErrorTimes.isNotEmpty() && now - playerErrorTimes.first() > PLAYER_RECOVERY_WINDOW_MS) {
+                playerErrorTimes.removeFirst()
+            }
+            if (playerErrorTimes.size >= MAX_PLAYER_RECOVERIES) {
+                Log.e(TAG, "player error recovery limit reached; surfacing error")
+                KolaiState.setError("playback error: ${error.errorCodeName}")
+                return
+            }
+            playerErrorTimes.addLast(now)
+
+            val curId = player.currentMediaItem?.mediaId
+            if (curId != null && curId == lastErroredBlockId) {
+                // second error on the SAME block -> corrupt file: drop it and
+                // continue with whatever is queued behind it.
+                Log.w(TAG, "SELF-HEAL: block $curId errored twice -- removing it from the playlist")
+                val idx = player.currentMediaItemIndex
+                if (idx in 0 until player.mediaItemCount) player.removeMediaItem(idx)
+                lastErroredBlockId = null
+            } else {
+                lastErroredBlockId = curId
+            }
+            if (player.mediaItemCount > 0) {
+                // NEVER prepare()/play() an empty player (cold-start invariant);
+                // with items present, re-prepare + resume is safe.
+                Log.w(TAG, "SELF-HEAL: re-preparing player after error")
+                player.prepare()
+                player.play()
+            }
         }
     }
 
@@ -892,6 +1021,11 @@ class KolaiMediaService : MediaLibraryService() {
         posJob?.cancel()
         try { stationEngine.stop() } catch (_: Exception) {}
         serviceScope.cancel()
+        // Memory hygiene: drop any queued player ops (runOnPlayer posts) so a
+        // late-running block can never touch the released player, and detach
+        // our listener explicitly before release.
+        mainHandler.removeCallbacksAndMessages(null)
+        try { player.removeListener(playerListener) } catch (_: Exception) {}
         mediaSession?.run {
             player.release()
             release()
@@ -911,5 +1045,12 @@ class KolaiMediaService : MediaLibraryService() {
         private const val LIVE_ID = "kolai_live"
         private const val CHANNEL_ID = "kolai_playback"
         private const val NOTIF_ID = 1001
+        // SELF-HEAL bounds: loop auto-restart delay + hourly cap, and the
+        // player-error recovery cap per sliding window.
+        private const val LOOP_RESTART_DELAY_MS = 30_000L
+        private const val RESTART_WINDOW_MS = 60 * 60_000L
+        private const val MAX_LOOP_RESTARTS_PER_HOUR = 5
+        private const val PLAYER_RECOVERY_WINDOW_MS = 10 * 60_000L
+        private const val MAX_PLAYER_RECOVERIES = 6
     }
 }

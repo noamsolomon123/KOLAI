@@ -36,11 +36,30 @@ import java.security.MessageDigest
  */
 class NewPipeSource(
     private val client: OkHttpClient = NewPipeDownloader.defaultClient(),
+    // FETCH RESILIENCE: transient (IOException-caused) failures of the three
+    // network steps (search / stream-resolve / download) retry with a short
+    // backoff before surfacing. Deterministic failures (verified no-candidate,
+    // PO-token wall, HTTP error codes) never retry -- see [TransientRetry].
+    // Injectable for instant unit tests.
+    private val transientRetries: Int = TransientRetry.DEFAULT_MAX_RETRIES,
+    private val retryBackoffMs: LongArray = TransientRetry.DEFAULT_BACKOFF_MS,
+    private val sleeper: (Long) -> Unit = { Thread.sleep(it) },
 ) {
 
     /** Failure of any search/extract/download step; caller skips the song. */
     class FetchException(message: String, cause: Throwable? = null) :
         RuntimeException(message, cause)
+
+    /** Transient-aware retry around one named network step. */
+    private fun <T> retryTransient(what: String, block: () -> T): T =
+        TransientRetry.run(
+            what = what,
+            maxRetries = transientRetries,
+            backoffMs = retryBackoffMs,
+            sleeper = sleeper,
+            log = ::logW,
+            block = block,
+        )
 
     /**
      * Resolve [song] to a local audio file path, downloading if not cached.
@@ -62,14 +81,14 @@ class NewPipeSource(
         val query = song.query?.takeIf { it.isNotBlank() }
             ?: "${song.artist} ${song.title}"
 
-        val watchUrl = resolveWatchUrl(song, query)
-        val picked = resolveBestStream(watchUrl)
+        val watchUrl = retryTransient("search '$query'") { resolveWatchUrl(song, query) }
+        val picked = retryTransient("stream resolve for '$query'") { resolveBestStream(watchUrl) }
 
         val streamUrl = picked.url
             ?: throw FetchException("stream for '$query' has no URL/content")
         val outFile = File(cacheDir, "$key.${picked.ext}")
 
-        downloadTo(streamUrl, outFile, query)
+        retryTransient("download '$query'") { downloadTo(streamUrl, outFile, query) }
         return outFile.absolutePath
     }
 
@@ -82,7 +101,7 @@ class NewPipeSource(
         ensureInit()
         val query = song.query?.takeIf { it.isNotBlank() }
             ?: "${song.artist} ${song.title}"
-        return resolveWatchUrl(song, query)
+        return retryTransient("search '$query'") { resolveWatchUrl(song, query) }
     }
 
     /** Per-client / per-format stream counts for a watch URL (diagnostics). */
