@@ -101,9 +101,13 @@ class TastePoolPlanner(
         const val ARTIST_FATIGUE = 0.25
     }
 
-    /** A taste track prepared for picking: no-repeat key, weight, language. */
+    /** A taste track prepared for picking: no-repeat key, weight, language.
+     *  [rank] is the track's ORIGINAL index in taste.topTracks (the rank that
+     *  produced its 1/(rank+6) weight); it is stamped onto the picked Song as
+     *  [Song.tasteRank] so the DJ can acknowledge personal favorites. */
     private class Candidate(
         val track: TasteTrack,
+        val rank: Int,
         val key: String,
         val artistLower: String,
         val hebrew: Boolean,
@@ -142,6 +146,7 @@ class TastePoolPlanner(
             pool.add(
                 Candidate(
                     track = t,
+                    rank = index,
                     key = key,
                     artistLower = t.artist.trim().lowercase(),
                     hebrew = containsHebrew(title),
@@ -262,6 +267,7 @@ class TastePoolPlanner(
                     title = c.track.title,
                     artist = c.track.artist,
                     durationS = c.track.durationS.takeIf { it > 0.0 },
+                    tasteRank = c.rank,
                 ),
             )
             chosenKeys.add(c.key)

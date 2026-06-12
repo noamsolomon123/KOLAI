@@ -33,9 +33,6 @@ interface AudioFetcher {
  * `voice.VoiceRenderer.render(text) -> DJSlot`. The returned [DJSlot] carries
  * the spoken text plus the path to (and duration of) the synthesized audio; the
  * renderer reloads that path via `loadFn` to get the PCM samples.
- *
- * The two-host banter path (Python `voice.render_banter`) is deferred; banter is
- * substituted with a normal single-voice break for the MVP (see [BlockRenderer]).
  */
 interface VoiceRenderer {
     /**
@@ -44,7 +41,31 @@ interface VoiceRenderer {
      * (and its caching behavior). Overrides must NOT redeclare the default.
      */
     fun render(text: String, style: String? = null): DJSlot
+
+    /**
+     * Render a two-host DIALOGUE: speaker-tagged [turns] (e.g.
+     * `[("A", line), ("B", line), ...]`, see DjBrain.writeBanter) where the
+     * second host speaks with [voiceB].
+     *
+     * DEFAULT body (wave 3): single-voice fallback - the turns are flattened
+     * via [joinDialogue] and spoken through [render], so every existing
+     * fake/adapter keeps compiling and keeps the MVP single-voice banter
+     * behavior. The :app adapter overrides this (wave 4) with true
+     * multi-speaker Gemini TTS; [BlockRenderer] only calls it when a voiceB
+     * is configured. Overrides must NOT redeclare the [style] default.
+     */
+    fun renderDialogue(turns: List<Pair<String, String>>, voiceB: String, style: String? = null): DJSlot =
+        render(joinDialogue(turns), style)
 }
+
+/**
+ * Canonical single-voice flattening of a two-host script: one `"A: line"` /
+ * `"B: line"` turn per line. Shared by [VoiceRenderer.renderDialogue]'s default
+ * body and [BlockRenderer]'s banter talk meta, so the spoken fallback and the
+ * meta text always agree.
+ */
+fun joinDialogue(turns: List<Pair<String, String>>): String =
+    turns.joinToString("\n") { (speaker, line) -> "$speaker: $line" }
 
 /**
  * Encode the finished block timeline to a file. Mirrors

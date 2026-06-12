@@ -41,6 +41,10 @@ dependencies {
     // Task 5.3 (BlockRenderer): the renderer calls Dsp.* (trimSilence, duck,
     // equalPowerCrossfade, SR) from :mix instead of re-porting the DSP math.
     implementation(project(":mix"))
+    // Wave 2 (feature 13): BlockRenderer refines the analyzer's outro hint
+    // against the decoded audio via ai.kolai.analyze.refineOutroStart (pure
+    // Kotlin, no native load in unit tests).
+    implementation(project(":analyze"))
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
 

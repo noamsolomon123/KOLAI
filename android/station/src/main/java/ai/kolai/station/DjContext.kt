@@ -25,4 +25,14 @@ data class DjContext(
     // Station mood key (see [Moods]); null = default behavior, fully backward
     // compatible. Android addition - the Python carries the mood separately.
     val mood: String? = null,
+    // Israeli-calendar note for the DJ (Android addition): a short Hebrew label
+    // when the moment is calendar-special ("ערב שבת", "מוצאי שבת", a holiday
+    // name), else null. Set by the app-side context provider.
+    val calendarNote: String? = null,
+    // True on somber national days (יום הזיכרון / יום השואה): the DJ must drop
+    // all wordplay/banter and keep a quiet, respectful tone.
+    val somber: Boolean = false,
+    // Friday weekly-recap brief (Android addition): pre-computed Hebrew-ready
+    // stats text the DJ weaves into a special opening; null on a normal day.
+    val recapBrief: String? = null,
 )

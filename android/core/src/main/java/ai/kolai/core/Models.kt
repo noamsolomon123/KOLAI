@@ -31,6 +31,10 @@ data class Song(
     val durationS: Double? = null,
     /** Optional explicit search query override. */
     val query: String? = null,
+    /** Listener-taste rank when this pick came from the taste pool (0 = top
+     *  track); null for discovery/unknown. Lets the DJ acknowledge a personal
+     *  favorite ("taste wink") without re-deriving taste membership. */
+    val tasteRank: Int? = null,
 )
 
 data class TrackAnalysis(

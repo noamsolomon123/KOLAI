@@ -587,4 +587,58 @@ class TastePoolPlannerTest {
             assertEquals(1, songs.count { containsHebrew(it.title) })
         }
     }
+
+    // --- tasteRank (taste-wink marking) ----------------------------------------
+
+    @Test
+    fun taste_picks_carry_their_original_topTracks_index_as_tasteRank() = runTest {
+        val rankByTitle = mixedTaste.topTracks
+            .mapIndexed { i, t -> t.title to i }.toMap()
+        for (seed in 0 until 20) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(mixedTaste, n = 8)
+            assertEquals(8, songs.size)
+            for (s in songs) {
+                assertEquals(
+                    "wrong tasteRank for ${s.title} (rng seed $seed)",
+                    rankByTitle.getValue(s.title),
+                    s.tasteRank,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun dedup_by_baseTitle_keeps_the_best_rank_as_tasteRank() = runTest {
+        // "Only One" (index 1) and "Only One (Live)" (index 2) share a
+        // baseTitle; dedup keeps the best-ranked version, so the pick must
+        // carry tasteRank 1 -- its ORIGINAL topTracks index, not 0.
+        val taste = TasteProfile(
+            topTracks = listOf(
+                TasteTrack(title = "Opener", artist = "X", durationS = 100.0),
+                TasteTrack(title = "Only One", artist = "A", durationS = 100.0),
+                TasteTrack(title = "Only One (Live)", artist = "A", durationS = 101.0),
+            ),
+            topArtists = listOf("X", "A"),
+        )
+        for (seed in 0 until 10) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(taste, n = 2)
+            assertEquals(2, songs.size)
+            val pick = songs.first { it.title == "Only One" }
+            assertEquals(1, pick.tasteRank)
+            assertEquals(0, songs.first { it.title == "Opener" }.tasteRank)
+        }
+    }
+
+    @Test
+    fun discovery_picks_have_null_tasteRank() = runTest {
+        val discovered = Song(title = "Smooth Operator", artist = "Sade", durationS = 290.0)
+        val planner = TastePoolPlanner(discovery = FakeDiscovery(discovered), rng = ZeroRandom())
+        val songs = planner.plan(mixedTaste, n = 4)
+        assertEquals(4, songs.size)
+        // ZeroRandom fires the discovery roll on the first slot.
+        assertEquals("Smooth Operator", songs.first().title)
+        assertNull(songs.first().tasteRank)
+        // every other pick is a taste pick and IS marked
+        assertTrue(songs.drop(1).all { it.tasteRank != null })
+    }
 }

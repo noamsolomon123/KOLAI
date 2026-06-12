@@ -12,6 +12,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.random.Random
 
@@ -51,6 +52,19 @@ class BlockRendererTest {
         override suspend fun complete(prompt: String): String = "SKIP"
     }
 
+    /** Routes prompts by a contained marker; [default] otherwise. Records all. */
+    private class RoutedLlmClient(
+        private val routes: List<Pair<String, String>>,
+        private val default: String = "שורה רגילה של רדיו",
+    ) : LlmClient {
+        val prompts = mutableListOf<String>()
+        override suspend fun complete(prompt: String): String {
+            prompts.add(prompt)
+            for ((marker, response) in routes) if (prompt.contains(marker)) return response
+            return default
+        }
+    }
+
     /** fetch(song) -> a deterministic local path per song title. */
     private class FakeFetcher(private val failTitles: Set<String> = emptySet()) : AudioFetcher {
         override fun fetch(song: Song): String {
@@ -63,9 +77,16 @@ class BlockRendererTest {
      *  array. Records every style passed through the seam. */
     private class FakeVoice(private val djSamples: Int) : VoiceRenderer {
         val styles = mutableListOf<String?>()
+        val texts = mutableListOf<String>()
+        val dialogues = mutableListOf<Triple<List<Pair<String, String>>, String, String?>>()
         override fun render(text: String, style: String?): DJSlot {
             styles.add(style)
+            texts.add(text)
             return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
+        }
+        override fun renderDialogue(turns: List<Pair<String, String>>, voiceB: String, style: String?): DJSlot {
+            dialogues.add(Triple(turns, voiceB, style))
+            return DJSlot(text = joinDialogue(turns), audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
         }
     }
 
@@ -100,19 +121,59 @@ class BlockRendererTest {
     )
 
     /** Songs -> full-amplitude arrays (so trimSilence keeps all of it);
-     *  the DJ voice path -> a loud djSamples-long array. */
+     *  the DJ voice path -> DC 0.3 + 0.2 sine @ 440 Hz (loud everywhere:
+     *  |x| >= 0.1, so trimSilence keeps the full 2 s). ADJUSTED for feature
+     *  16: the pre-chain constant-0.5 fixture was pure DC, which the broadcast
+     *  chain's 90 Hz high-pass would (correctly) erase; the DC component now
+     *  serves as the chain TRACER (see the voice-chain test). */
     private fun fakeLoad(path: String): FloatArray =
-        if (path.startsWith("/voice/")) FloatArray(djSamples) { 0.5f }
+        if (path.startsWith("/voice/")) FloatArray(djSamples) { i ->
+            0.3f + 0.2f * kotlin.math.sin(2.0 * Math.PI * 440.0 * i / Dsp.SR).toFloat()
+        }
         else FloatArray(songSamples) { 0.3f }
 
     private fun songs(n: Int): List<Song> =
         (0 until n).map { Song(title = "S$it", artist = "A$it") }
 
+    /** RMS of [audio] over [fromS, toS) seconds - level-relationship asserts. */
+    private fun rms(audio: FloatArray, fromS: Double, toS: Double): Double {
+        val a = (fromS * Dsp.SR).toInt()
+        val b = minOf(audio.size, (toS * Dsp.SR).toInt())
+        var sumSq = 0.0
+        for (i in a until b) sumSq += audio[i].toDouble() * audio[i]
+        return kotlin.math.sqrt(sumSq / (b - a))
+    }
+
+    /** Mean of [audio] over [fromS, toS) seconds - the DC-tracer assert. */
+    private fun mean(audio: FloatArray, fromS: Double, toS: Double): Double {
+        val a = (fromS * Dsp.SR).toInt()
+        val b = minOf(audio.size, (toS * Dsp.SR).toInt())
+        var sum = 0.0
+        for (i in a until b) sum += audio[i]
+        return sum / (b - a)
+    }
+
+    /** [fakeAnalyze] with selected fields overridden (feature 13/15 tests). */
+    private fun analyzeWith(
+        bpm: Double = 120.0,
+        beatTimes: List<Double> = listOf(0.0, 0.5, 1.0),
+        introEndS: Double = 1.0,
+        outroStartS: Double = 9.0,
+    ): AnalyzeFn = { path ->
+        fakeAnalyze(path).copy(
+            bpm = bpm, beatTimes = beatTimes,
+            introEndS = introEndS, outroStartS = outroStartS,
+        )
+    }
+
     private fun newRenderer(
         fetcher: AudioFetcher = FakeFetcher(),
         client: LlmClient = FakeLlmClient(),
         voice: VoiceRenderer = FakeVoice(djSamples),
+        voiceB: String? = null,
         ctx: DjContext = DjContext(),
+        // overrides the fixed [ctx] when a test needs a PER-BLOCK context
+        ctxProvider: (() -> DjContext)? = null,
         maxSilence: Int = 4,
         talkChance: Double = 0.5,
         banterChance: Double = 0.2,
@@ -121,24 +182,29 @@ class BlockRendererTest {
         write: Boolean = false,
         rng: Random = Random(7),
         minuteOfHour: () -> Int = { 15 },
+        // pinned fake wall clock for the wave-3 show-format latches
+        nowMs: () -> Long = { 0L },
         ident: (() -> FloatArray)? = null,
+        analyze: AnalyzeFn = ::fakeAnalyze,
+        load: LoadFn = ::fakeLoad,
     ): BlockRenderer = BlockRenderer(
         fetcher = fetcher,
         brain = DjBrain(client, persona = "דני"),
         voice = voice,
-        ctx = { ctx },
+        ctx = ctxProvider ?: { ctx },
         blocksDir = "/tmp/blocks",
         voiceA = null,
-        voiceB = null,
+        voiceB = voiceB,
         maxSilence = maxSilence,
         banterEvery = banterEvery,
         talkChance = talkChance,
         banterChance = banterChance,
         rng = rng,
         minuteOfHour = minuteOfHour,
+        nowMs = nowMs,
         ident = ident,
-        analyzeFn = ::fakeAnalyze,
-        loadFn = ::fakeLoad,
+        analyzeFn = analyze,
+        loadFn = load,
         encoder = encoder,
         write = write,
     )
@@ -567,19 +633,19 @@ class BlockRendererTest {
 
     @Test
     fun render_voice_sits_clearly_above_ducked_bed() = runTest {
-        // Steady talk-over region (duck 0.5..2.5 s, 0.3 s ramp): the bed is
-        // SONG_TARGET_RMS * 10^(-15/20) ~= 0.0142 and the DJ voice (constant
-        // 0.5) is normalized to VOICE_TARGET_RMS = 0.15 -> the voice rides
-        // ~20 dB above the bed.
+        // ADJUSTED (feature 16): the DJ clip now runs through
+        // voiceBroadcastChain before normalization, so the old exact
+        // sample-value assertion (constant voice + constant bed) no longer
+        // holds. Assert the level RELATIONSHIP instead: over the steady
+        // talk-over region (duck 0.5..2.5 s, 0.3 s ramp -> 0.9..2.3 s) the
+        // RMS sits at ~VOICE_TARGET_RMS, far above the ducked
+        // SONG_TARGET_RMS * 10^(-15/20) ~= 0.0142 bed.
         val result = newRenderer(talkChance = 0.0)
             .render(songs(2), index = 0, prevTrack = null)
-        val idx = (1.5 * Dsp.SR).toInt()
-        val bed = BlockRenderer.SONG_TARGET_RMS * Math.pow(10.0, -15.0 / 20.0).toFloat()
-        assertEquals(bed + BlockRenderer.VOICE_TARGET_RMS, result.audio[idx], 1e-3f)
-        assertTrue(
-            "voice must dominate the ducked bed",
-            BlockRenderer.VOICE_TARGET_RMS > 4.0f * bed,
-        )
+        val bed = BlockRenderer.SONG_TARGET_RMS * Math.pow(10.0, -15.0 / 20.0)
+        val voiceRms = rms(result.audio, 0.9, 2.3)
+        assertEquals(BlockRenderer.VOICE_TARGET_RMS.toDouble(), voiceRms, 0.02)
+        assertTrue("voice must dominate the ducked bed", voiceRms > 4.0 * bed)
     }
 
     @Test
@@ -621,5 +687,485 @@ class BlockRendererTest {
         for (v in result.audio) {
             assertTrue("sample must stay within [-1, 1]", abs(v) <= 1.0f)
         }
+    }
+
+    // ---- analysis-driven transitions (feature 13) ---------------------------
+
+    @Test
+    fun render_pure_music_boundary_cuts_outro_and_meta_matches_audio() = runTest {
+        // outroStartS = 6.0 on a flat 10 s song: refineOutroStart keeps the
+        // hint (energy runs to the end), the cut lands at 6.0 + OUTRO_GRACE_S
+        // = 7.0 s, then the 4 s musical crossfade -> 7 + 10 - 4 = 13 s total,
+        // and song 1's segment starts exactly at the cut boundary (7.0 s) -
+        // the meta the app's now-playing/skip depends on.
+        val result = newRenderer(talkChance = 0.0, analyze = analyzeWith(outroStartS = 6.0))
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(13.0, result.meta.durationS, 0.01)
+        assertEquals(2, result.meta.segments.size)
+        assertEquals(7.0, result.meta.segments[1].startS, 0.01)
+    }
+
+    @Test
+    fun render_talk_boundary_skips_outro_cut() = runTest {
+        // Same outro hint, but maxSilence = 1 forces a break at boundary 1:
+        // talk-over boundaries keep the full tail (the duck look-back needs
+        // it) -> 10 + 10 - 1.5 = 18.5 s, boundary meta at the full 10 s.
+        val result = newRenderer(
+            talkChance = 0.0, maxSilence = 1,
+            analyze = analyzeWith(outroStartS = 6.0),
+        ).render(songs(2), index = 0, prevTrack = null)
+        assertEquals(18.5, result.meta.durationS, 0.01)
+        assertEquals(10.0, result.meta.segments[1].startS, 0.01)
+    }
+
+    @Test
+    fun render_musical_overlap_snaps_to_outgoing_beats() = runTest {
+        // bpm 132 -> beat 0.4545 s; 4.0 s rounds to 9 beats = 4.0909 s. Sanity-
+        // check the snap actually moved, then assert the block length follows
+        // the SNAPPED overlap: 10 + 10 - snapped.
+        val snapped = Dsp.snapOverlapToBeats(BlockRenderer.MUSIC_SEGUE_S, 132.0f)
+        assertTrue("fixture bpm must move the snap", abs(snapped - BlockRenderer.MUSIC_SEGUE_S) > 0.05f)
+        val result = newRenderer(talkChance = 0.0, analyze = analyzeWith(bpm = 132.0))
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(20.0 - snapped, result.meta.durationS, 0.01)
+    }
+
+    @Test
+    fun render_insane_bpm_keeps_plain_music_segue() = runTest {
+        // bpm 250 is outside [MIN_SNAP_BPM, MAX_SNAP_BPM]: no beat snapping,
+        // the plain MUSIC_SEGUE_S (4 s) stays -> 10 + 10 - 4 = 16 s.
+        val result = newRenderer(talkChance = 0.0, analyze = analyzeWith(bpm = 250.0))
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(16.0, result.meta.durationS, 0.01)
+    }
+
+    @Test
+    fun render_incoming_entry_aligns_to_beat_at_crossfade_midpoint() = runTest {
+        // Crossfade midpoint = 4.0 / 2 = 2.0 s; the incoming song's first beat
+        // at/after it is 2.5 s -> its head is trimmed 0.5 s so that beat lands
+        // ON the midpoint: 10 + 9.5 - 4 = 15.5 s.
+        val result = newRenderer(
+            talkChance = 0.0, analyze = analyzeWith(beatTimes = listOf(0.0, 2.5)),
+        ).render(songs(2), index = 0, prevTrack = null)
+        assertEquals(15.5, result.meta.durationS, 0.01)
+    }
+
+    @Test
+    fun render_entry_alignment_skipped_when_trim_exceeds_cap() = runTest {
+        // First beat after the midpoint is 7.0 s -> trimming 5 s would exceed
+        // MAX_BEAT_ALIGN_SKIP_S (4 s) and eat the intro: identity, 16 s total.
+        val result = newRenderer(
+            talkChance = 0.0, analyze = analyzeWith(beatTimes = listOf(0.0, 7.0)),
+        ).render(songs(2), index = 0, prevTrack = null)
+        assertEquals(16.0, result.meta.durationS, 0.01)
+    }
+
+    // ---- vocal-aware opening budget, tier 1 (feature 15) --------------------
+
+    @Test
+    fun plan_opening_budget_clamped_to_intro_end() = runTest {
+        // introEndS = 8.0 (sane: > 4 s, inside the track): the opening budget
+        // clamps to the usable bed 8.0 - 0.5 (duck start) - 0.5 (tail guard)
+        // = 7.0 s -> 17 words, instead of the 10 s / 25 words default.
+        val client = FakeLlmClient()
+        val r = newRenderer(client = client, talkChance = 0.0, analyze = analyzeWith(introEndS = 8.0))
+        val tracks = loadTracks(r, songs(2))
+        r.planFor(tracks, prevTrack = null)
+        assertTrue(
+            "budget must clamp to the intro bed",
+            client.prompts.first().contains("עד 17 מילים"),
+        )
+    }
+
+    @Test
+    fun plan_opening_budget_keeps_default_when_intro_too_short() = runTest {
+        // The fixture introEndS = 1.0 is below OPENING_INTRO_MIN_S: no usable
+        // intro bed -> intro-fitting skipped, default 10 s -> 25 words stays.
+        val client = FakeLlmClient()
+        val r = newRenderer(client = client, talkChance = 0.0)
+        val tracks = loadTracks(r, songs(2))
+        r.planFor(tracks, prevTrack = null)
+        assertTrue(
+            "default budget must stay",
+            client.prompts.first().contains("עד 25 מילים"),
+        )
+    }
+
+    // ---- broadcast voice chain + eased duck release (feature 16) ------------
+
+    @Test
+    fun render_voice_chain_removes_dc_tracer_from_talk_over() = runTest {
+        // The raw DJ fixture carries a 0.3 DC tracer; the broadcast chain's
+        // 90 Hz high-pass must erase it on air. Without the chain the
+        // normalized voice would keep ~0.13 of DC and the talk-over region's
+        // mean would sit near 0.15; with it only the ducked bed (~0.014)
+        // remains.
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        val m = mean(result.audio, 0.9, 2.3)
+        assertTrue("DC tracer must be removed by the broadcast chain (mean=$m)", abs(m) < 0.05)
+    }
+
+    @Test
+    fun render_duck_release_swells_back_gradually() = runTest {
+        // The opening talk ends at 2.5 s; with VOICE_DUCK_RELEASE_S = 0.7 the
+        // bed half-way through the release (2.85 s) must sit strictly BETWEEN
+        // the ducked (~0.014) and full (0.08) levels - a swell, not a snap.
+        val result = newRenderer(talkChance = 0.0)
+            .render(songs(2), index = 0, prevTrack = null)
+        val v = result.audio[(2.85 * Dsp.SR).toInt()]
+        assertTrue("bed must still be recovering (v=$v)", v > 0.02f)
+        assertTrue("bed must not have snapped back (v=$v)", v < 0.07f)
+    }
+
+    // ---- parallel song loads (feature 14b) -----------------------------------
+
+    @Test
+    fun loadTracks_parallel_preserves_setlist_order() = runTest {
+        // S0 is the SLOWEST load: with parallel loads a naive collect would
+        // yield it last; map { async } + awaitAll must keep setlist order.
+        val slowFirst = object : AudioFetcher {
+            override fun fetch(song: Song): String {
+                if (song.title == "S0") Thread.sleep(120)
+                return "/fake/${song.title}.m4a"
+            }
+        }
+        val tracks = newRenderer(fetcher = slowFirst).loadTracks(songs(4))
+        assertEquals(listOf("S0", "S1", "S2", "S3"), tracks.map { it.song.title })
+    }
+
+    @Test
+    fun loadTracks_concurrency_capped_at_LOAD_CONCURRENCY() = runTest {
+        val active = AtomicInteger(0)
+        val maxSeen = AtomicInteger(0)
+        val gauge = object : AudioFetcher {
+            override fun fetch(song: Song): String {
+                val now = active.incrementAndGet()
+                maxSeen.updateAndGet { maxOf(it, now) }
+                Thread.sleep(60)
+                active.decrementAndGet()
+                return "/fake/${song.title}.m4a"
+            }
+        }
+        newRenderer(fetcher = gauge).loadTracks(songs(8))
+        assertTrue(
+            "max in-flight loads (${maxSeen.get()}) must respect the cap",
+            maxSeen.get() <= BlockRenderer.LOAD_CONCURRENCY,
+        )
+        assertTrue("loads must actually run in parallel", maxSeen.get() >= 2)
+    }
+
+    // ---- show formats (wave 3): recap opening + day-part handover -----------
+
+    /** Songs whose tasteRank equals their index (all < TASTE_WINK_MAX_RANK). */
+    private fun winkSongs(n: Int): List<Song> =
+        (0 until n).map { Song(title = "S$it", artist = "A$it", tasteRank = it) }
+
+    @Test
+    fun plan_block0_recap_opening_used_when_recapBrief_set() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(
+            client = client, talkChance = 0.0,
+            ctx = DjContext(partOfDay = "בוקר", recapBrief = "112 שירים, אמן השבוע: עומר אדם"),
+        )
+        val tracks = loadTracks(r, songs(3))
+        val events = r.planFor(tracks, prevTrack = null)
+        assertEquals("open", events.first().kind)
+        val prompt = client.prompts.first()
+        assertTrue("recap prompt expected", prompt.contains("הסיכום השבועי"))
+        assertTrue("the brief must be woven in", prompt.contains("עומר אדם"))
+        // the recap gets its own 20 s budget -> 50 words (not the plain 25)
+        assertTrue("recap budget expected", prompt.contains("עד 50 מילים"))
+    }
+
+    @Test
+    fun plan_block0_plain_opening_when_recapBrief_null() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(client = client, talkChance = 0.0, ctx = DjContext(partOfDay = "בוקר"))
+        r.planFor(loadTracks(r, songs(3)), prevTrack = null)
+        assertFalse(client.prompts.first().contains("הסיכום השבועי"))
+    }
+
+    @Test
+    fun render_recap_opening_duck_follows_actual_clip_duration() = runTest {
+        // A 6 s recap clip (vs the usual 2 s fixture): the opening duck math
+        // tracks the ACTUAL slot duration - talk end = duck start + clip len.
+        val longLoad: LoadFn = { path ->
+            if (path.startsWith("/voice/")) FloatArray(Dsp.SR * 6) { i ->
+                0.3f + 0.2f * kotlin.math.sin(2.0 * Math.PI * 440.0 * i / Dsp.SR).toFloat()
+            } else FloatArray(songSamples) { 0.3f }
+        }
+        val r = newRenderer(talkChance = 0.0, ctx = DjContext(recapBrief = "סיכום"), load = longLoad)
+        val result = r.render(songs(3), index = 0, prevTrack = null)
+        val talk = result.meta.talk.first()
+        assertEquals(0.5, talk.startS, 0.001)
+        assertEquals(6.0, talk.endS - talk.startS, 0.05)
+    }
+
+    @Test
+    fun plan_handover_fires_once_per_transition_and_replaces_the_break() = runTest {
+        val client = FakeLlmClient()
+        var part = "בוקר"
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4,
+            ctxProvider = { DjContext(partOfDay = part) },
+        )
+        // block 0 establishes lastPartOfDay; no handover is possible yet.
+        val t0 = loadTracks(r, songs(7))
+        val e0 = r.planFor(t0, prevTrack = null)
+        assertTrue(e0.none { it.beat == "handover" })
+
+        // block 1 flips the day part: its single forced boundary becomes the
+        // handover - REPLACING the break, never adding one.
+        part = "צהריים"
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        val breaks1 = e1.filter { it.kind == "break" }
+        assertEquals(listOf(4), breaks1.map { it.i })
+        assertEquals(listOf("handover"), breaks1.map { it.beat })
+        assertTrue(client.prompts.any { it.contains("חלק חדש של היום") })
+
+        // block 2 keeps the same day part: the transition is spent.
+        val t2 = loadTracks(r, songs(7))
+        val e2 = r.planFor(t2, prevTrack = t1.last())
+        assertTrue(e2.none { it.beat == "handover" })
+    }
+
+    @Test
+    fun plan_handover_silent_transition_still_consumes_the_change() = runTest {
+        var part = "בוקר"
+        val r = newRenderer(
+            talkChance = 0.0, maxSilence = 4,
+            ctxProvider = { DjContext(partOfDay = part) },
+        )
+        val t0 = loadTracks(r, songs(3))
+        r.planFor(t0, prevTrack = null)
+
+        // block 1 flips the day part but has NO eligible boundary: the
+        // transition passes silently - and is still consumed.
+        part = "ערב"
+        val t1 = loadTracks(r, songs(3))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertTrue(e1.none { it.kind == "break" })
+
+        // block 2 has a forced boundary, but no late handover may fire.
+        val t2 = loadTracks(r, songs(7))
+        val e2 = r.planFor(t2, prevTrack = t1.last())
+        assertTrue("spent transitions never fire late", e2.none { it.beat == "handover" })
+        assertTrue("the forced boundary still talks", e2.any { it.kind == "break" })
+    }
+
+    // ---- taste wink (feature 9) ---------------------------------------------
+
+    @Test
+    fun plan_taste_wink_needs_tasteRank_and_60min_spacing() = runTest {
+        val wink = "הכי אהובים על המאזין"
+        val client = FakeLlmClient()
+        var now = 0L
+        // 11 songs, every eligible boundary talks: breaks at 2,4,6,8,10 with
+        // rotation beats song,weather,topic,news,song - two "song" chances.
+        val r = newRenderer(
+            client = client, maxSilence = 100, talkChance = 1.0,
+            banterChance = 0.0, nowMs = { now },
+        )
+        r.planFor(loadTracks(r, winkSongs(11)), prevTrack = null)
+        assertEquals(
+            "only the FIRST song-beat inside the hour may wink",
+            1, client.prompts.count { it.contains(wink) },
+        )
+
+        // 61 minutes later the latch re-arms: the next song-beat winks again.
+        now = 61L * 60_000L
+        r.planFor(loadTracks(r, winkSongs(11)), prevTrack = null)
+        assertEquals(2, client.prompts.count { it.contains(wink) })
+    }
+
+    @Test
+    fun plan_no_wink_without_tasteRank() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(client = client, maxSilence = 100, talkChance = 1.0, banterChance = 0.0)
+        // default songs() carry no tasteRank -> the wink may never fire.
+        r.planFor(loadTracks(r, songs(7)), prevTrack = null)
+        assertTrue(client.prompts.none { it.contains("הכי אהובים על המאזין") })
+    }
+
+    // ---- good thing (feature 10) ---------------------------------------------
+
+    @Test
+    fun plan_good_thing_fires_once_per_3h_and_never_in_block0() = runTest {
+        val client = FakeLlmClient()
+        var now = 0L
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 4, nowMs = { now })
+
+        // block 0: never a good-thing, even at the forced boundary.
+        val t0 = loadTracks(r, songs(7))
+        val e0 = r.planFor(t0, prevTrack = null)
+        assertTrue(e0.none { it.beat == "good_thing" })
+
+        // block 1: the forced boundary becomes the branded micro-segment.
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        val gt = e1.filter { it.beat == "good_thing" }
+        assertEquals(listOf(4), gt.map { it.i })
+        assertTrue("branded opener required", gt.first().text!!.startsWith("ומשהו טוב לדרך"))
+
+        // block 2, same clock: latch closed -> a NORMAL forced break instead.
+        val t2 = loadTracks(r, songs(7))
+        val e2 = r.planFor(t2, prevTrack = t1.last())
+        assertTrue(e2.none { it.beat == "good_thing" })
+        assertTrue(e2.any { it.i == 4 && it.kind == "break" })
+
+        // 3 h later the latch re-arms.
+        now = 3L * 60L * 60_000L
+        val t3 = loadTracks(r, songs(7))
+        val e3 = r.planFor(t3, prevTrack = t2.last())
+        assertTrue(e3.any { it.beat == "good_thing" })
+    }
+
+    @Test
+    fun plan_good_thing_skip_does_not_consume_latch() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP"))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 4)
+        val t0 = loadTracks(r, songs(7))
+        r.planFor(t0, prevTrack = null)
+
+        // skipped -> the boundary falls through to a NORMAL forced break...
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        val b1 = e1.filter { it.kind == "break" }
+        assertEquals(listOf(4), b1.map { it.i })
+        assertFalse(b1.first().beat == "good_thing")
+
+        // ...and the latch is NOT consumed: block 2 tries the segment again.
+        val t2 = loadTracks(r, songs(7))
+        r.planFor(t2, prevTrack = t1.last())
+        assertEquals(2, client.prompts.count { it.contains("משהו טוב לדרך") })
+    }
+
+    @Test
+    fun plan_good_thing_blocked_when_somber() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4,
+            ctx = DjContext(somber = true),
+        )
+        val t0 = loadTracks(r, songs(7))
+        r.planFor(t0, prevTrack = null)
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertTrue(client.prompts.none { it.contains("משהו טוב לדרך") })
+        assertTrue(e1.none { it.beat == "good_thing" })
+    }
+
+    // ---- two-host banter (feature 11) ----------------------------------------
+
+    /** A valid 3-turn A/B/A banter script (A hands over to the music). */
+    private val banterJson =
+        """[{"s":"A","t":"שמעת את זה"},{"s":"B","t":"שמעתי"},{"s":"A","t":"אז הנה השיר הבא"}]"""
+
+    @Test
+    fun render_banter_uses_renderDialogue_when_voiceB_set() = runTest {
+        val client = RoutedLlmClient(routes = listOf("באנטר" to banterJson))
+        val voice = FakeVoice(djSamples)
+        // maxSilence 1 forces boundary 1; banterEvery 1 makes it banter.
+        val r = newRenderer(
+            client = client, voice = voice, voiceB = "Kore",
+            talkChance = 0.0, maxSilence = 1, banterEvery = 1,
+        )
+        val result = r.render(songs(2), index = 0, prevTrack = null)
+
+        assertEquals(1, voice.dialogues.size)
+        val (turns, voiceB, _) = voice.dialogues.first()
+        assertEquals("Kore", voiceB)
+        assertEquals(3, turns.size)
+        assertEquals("A" to "שמעת את זה", turns.first())
+
+        val talk = result.meta.talk.first { it.beat == "banter" }
+        assertTrue(talk.text.contains("A: שמעת את זה"))
+        assertTrue(talk.text.contains("B: שמעתי"))
+    }
+
+    @Test
+    fun render_banter_voiceB_null_joins_turns_single_voice() = runTest {
+        val client = RoutedLlmClient(routes = listOf("באנטר" to banterJson))
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(
+            client = client, voice = voice,
+            talkChance = 0.0, maxSilence = 1, banterEvery = 1,
+        )
+        val result = r.render(songs(2), index = 0, prevTrack = null)
+        assertTrue("no dialogue seam without a voiceB", voice.dialogues.isEmpty())
+        assertTrue(voice.texts.any { it.contains("A: שמעת את זה") && it.contains("B: שמעתי") })
+        assertTrue(result.meta.talk.any { it.beat == "banter" })
+    }
+
+    @Test
+    fun plan_empty_banter_falls_back_to_single_voice_break() = runTest {
+        val client = RoutedLlmClient(routes = listOf("באנטר" to "[]"))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 1, banterEvery = 1)
+        val events = r.planFor(loadTracks(r, songs(2)), prevTrack = null)
+        val brk = events.first { it.kind == "break" }
+        assertEquals("the MVP substitute break, not banter", "song", brk.beat)
+        assertNotNull(brk.text)
+    }
+
+    @Test
+    fun seam_renderDialogue_default_body_is_single_voice() {
+        // The seam DEFAULT must keep every existing single-voice adapter
+        // working: it flattens the turns and delegates to render(text, style).
+        val rendered = mutableListOf<Pair<String, String?>>()
+        val v = object : VoiceRenderer {
+            override fun render(text: String, style: String?): DJSlot {
+                rendered.add(text to style)
+                return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = 1.0)
+            }
+        }
+        val slot = v.renderDialogue(listOf("A" to "שלום", "B" to "אהלן"), voiceB = "Kore", style = "calm")
+        assertEquals(1, rendered.size)
+        assertEquals(joinDialogue(listOf("A" to "שלום", "B" to "אהלן")), rendered.first().first)
+        assertEquals("calm", rendered.first().second)
+        assertEquals(rendered.first().first, slot.text)
+    }
+
+    // ---- calendar mention gate (feature 7) -------------------------------
+
+    @Test
+    fun plan_calendar_note_gated_to_once_per_90min() = runTest {
+        val client = FakeLlmClient()
+        var now = 0L
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4, nowMs = { now },
+            ctx = DjContext(calendarNote = "ערב שבת"),
+        )
+        // the opening mentions the note and CLOSES the gate; the forced
+        // boundary-4 break inside the same 90 min must see a stripped ctx.
+        r.planFor(loadTracks(r, songs(7)), prevTrack = null)
+        assertTrue("first talk carries the note", client.prompts.first().contains("ערב שבת"))
+        assertTrue(
+            "gated talks must not see the note",
+            client.prompts.drop(1).none { it.contains("ערב שבת") },
+        )
+
+        // 91 minutes later the gate re-opens.
+        now = 91L * 60_000L
+        r.planFor(loadTracks(r, songs(2)), prevTrack = null)
+        assertTrue(client.prompts.last().contains("ערב שבת"))
+    }
+
+    @Test
+    fun plan_somber_survives_the_calendar_gate() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4,
+            ctx = DjContext(calendarNote = "יום הזיכרון", somber = true),
+        )
+        r.planFor(loadTracks(r, songs(7)), prevTrack = null)
+        // opening: gate open -> the named note is in the prompt.
+        assertTrue(client.prompts.first().contains("יום הזיכרון"))
+        // boundary 4 (gate closed): the NAME is stripped, but the somber tone
+        // law is intact - somber is never stripped.
+        val boundary = client.prompts.last()
+        assertFalse(boundary.contains("יום הזיכרון"))
+        assertTrue("somber tone must survive", boundary.contains("יום לאומי כבד ורציני"))
     }
 }
