@@ -9,6 +9,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.random.Random
@@ -57,10 +58,21 @@ class BlockRendererTest {
         }
     }
 
-    /** voice.render(text) -> a DJSlot whose audioPath maps to a known-length array. */
+    /** voice.render(text) -> a DJSlot whose audioPath maps to a known-length
+     *  array. Records every style passed through the seam. */
     private class FakeVoice(private val djSamples: Int) : VoiceRenderer {
-        override fun render(text: String): DJSlot =
-            DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
+        val styles = mutableListOf<String?>()
+        override fun render(text: String, style: String?): DJSlot {
+            styles.add(style)
+            return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
+        }
+    }
+
+    /** Random whose nextDouble() is ~0.5000000075 - deterministically BELOW the
+     *  default talk chances (0.5 < 0.9) and ABOVE the focus ones (>= 0.2), so
+     *  mood-cadence tests need no seed bookkeeping. */
+    private class MidRandom : Random() {
+        override fun nextBits(bitCount: Int): Int = 1 shl (bitCount - 1)
     }
 
     /** Records every encode call (path + audio length). */
@@ -473,5 +485,68 @@ class BlockRendererTest {
         val identN = (StationIdent.DURATION_S * Dsp.SR).toInt()
         val overlapN = (BlockRenderer.IDENT_OVERLAP_S * Dsp.SR).toInt()
         assertEquals(identN - overlapN, withDefault.audio.size - without.audio.size)
+    }
+
+    // ---- mood-aware cadence + voice style (mood support) --------------------
+
+    @Test
+    fun plan_mood_null_keeps_constructor_cadence() = runTest {
+        // MidRandom's ~0.5 is below the constructor talkChance (0.9): every
+        // eligible boundary (since-talk >= 2) talks -> breaks at 2, 4, 6.
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 0.9, banterChance = 0.0,
+            rng = MidRandom(), ctx = DjContext(mood = null),
+        )
+        val tracks = loadTracks(r, songs(8))
+        val events = r.planFor(tracks, prevTrack = null)
+        val breakAt = events.filter { it.kind == "break" }.map { it.i }
+        assertEquals(listOf(2, 4, 6), breakAt)
+    }
+
+    @Test
+    fun plan_mood_focus_overrides_constructor_cadence() = runTest {
+        // Same renderer config, but the block ctx carries mood = "focus"
+        // (talkChance 0.2, maxSilence 6): MidRandom's ~0.5 >= 0.2 so no
+        // coin-flip break ever fires, and the FIRST break is forced only at
+        // boundary 6 (the mood's maxSilence), not the constructor's values.
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 0.9, banterChance = 0.0,
+            rng = MidRandom(), ctx = DjContext(mood = "focus"),
+        )
+        val tracks = loadTracks(r, songs(8))
+        val events = r.planFor(tracks, prevTrack = null)
+        val breakAt = events.filter { it.kind == "break" }.map { it.i }
+        assertEquals(listOf(6), breakAt)
+    }
+
+    @Test
+    fun plan_unknown_mood_falls_back_to_constructor_cadence() = runTest {
+        val r = newRenderer(
+            maxSilence = 100, talkChance = 0.9, banterChance = 0.0,
+            rng = MidRandom(), ctx = DjContext(mood = "no_such_mood"),
+        )
+        val tracks = loadTracks(r, songs(8))
+        val events = r.planFor(tracks, prevTrack = null)
+        val breakAt = events.filter { it.kind == "break" }.map { it.i }
+        assertEquals(listOf(2, 4, 6), breakAt)
+    }
+
+    @Test
+    fun render_passes_mood_ttsStyle_to_voice_when_mood_set() = runTest {
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(voice = voice, talkChance = 0.0, ctx = DjContext(mood = "late_night"))
+        r.render(songs(3), index = 0, prevTrack = null)
+        assertTrue("voice should have rendered the opening", voice.styles.isNotEmpty())
+        val expected = Moods.ALL.getValue("late_night").ttsStyle
+        voice.styles.forEach { assertEquals(expected, it) }
+    }
+
+    @Test
+    fun render_passes_null_style_when_mood_null() = runTest {
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(voice = voice, talkChance = 0.0, ctx = DjContext())
+        r.render(songs(3), index = 0, prevTrack = null)
+        assertTrue(voice.styles.isNotEmpty())
+        voice.styles.forEach { assertNull("style must be null without a mood", it) }
     }
 }

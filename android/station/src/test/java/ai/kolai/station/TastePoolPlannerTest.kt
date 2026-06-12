@@ -331,10 +331,103 @@ class TastePoolPlannerTest {
         assertTrue("all 21 seeds opened with the same song", openers.size > 1)
     }
 
+    // --- mood bias (LLM curator selecting FROM the real pool) -----------------------
+
+    /** LlmClient replaying one fixed reply forever; counts calls, records prompts. */
+    private class FixedLlm(private val reply: String) : LlmClient {
+        var calls = 0
+        val prompts = mutableListOf<String>()
+        override suspend fun complete(prompt: String): String {
+            calls++
+            prompts.add(prompt)
+            return reply
+        }
+    }
+
+    /** 8 English-titled tracks by 8 distinct artists: no language/artist tier noise. */
+    private val eightTaste = TasteProfile(
+        topTracks = (0 until 8).map { i ->
+            TasteTrack(title = "Track ${'A' + i}", artist = "Artist ${'A' + i}", durationS = 100.0)
+        },
+        topArtists = (0 until 8).map { i -> "Artist ${'A' + i}" },
+    )
+
+    @Test
+    fun mood_fitting_songs_dominate_picks_under_a_seeded_rng() = runTest {
+        // The curator says ONLY pool index 7 fits -- the LOWEST-weighted track
+        // (weight 1/13). With the 8x boost it must win the n=1 slot far more
+        // often than the unbiased planner ever picks it.
+        val llm = FixedLlm("[7]")
+        val curator = MoodCurator(llm)
+        var biased = 0
+        var unbiased = 0
+        for (seed in 0 until 200) {
+            val withMood = TastePoolPlanner(rng = kotlin.random.Random(seed), curator = curator)
+                .plan(eightTaste, n = 1, mood = "party")
+            if (withMood.single().title == "Track H") biased++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(eightTaste, n = 1)
+            if (plain.single().title == "Track H") unbiased++
+        }
+        assertTrue("biased=" + biased, biased >= 60)
+        assertTrue("unbiased=" + unbiased, unbiased <= 40)
+        assertTrue("biased=" + biased + " unbiased=" + unbiased, biased > 2 * unbiased)
+        assertEquals(1, llm.calls) // verdicts are cached across the 200 plans
+    }
+
+    @Test
+    fun null_mood_mix_mood_and_null_curator_are_byte_identical_to_unbiased() = runTest {
+        val llm = FixedLlm("[0]")
+        val curator = MoodCurator(llm)
+        val base = TastePoolPlanner(rng = kotlin.random.Random(42)).plan(mixedTaste, n = 6)
+        val curatorNullMood = TastePoolPlanner(rng = kotlin.random.Random(42), curator = curator)
+            .plan(mixedTaste, n = 6, mood = null)
+        val curatorMixMood = TastePoolPlanner(rng = kotlin.random.Random(42), curator = curator)
+            .plan(mixedTaste, n = 6, mood = "mix")
+        val moodNoCurator = TastePoolPlanner(rng = kotlin.random.Random(42))
+            .plan(mixedTaste, n = 6, mood = "party")
+        assertEquals(base, curatorNullMood)
+        assertEquals(base, curatorMixMood)
+        assertEquals(base, moodNoCurator)
+        assertEquals(0, llm.calls) // the LLM is never consulted in these cases
+    }
+
+    @Test
+    fun curator_returning_null_yields_unbiased_picks() = runTest {
+        val curator = MoodCurator(object : LlmClient {
+            override suspend fun complete(prompt: String): String =
+                throw RuntimeException("llm down")
+        })
+        for (seed in 0 until 10) {
+            val base = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(mixedTaste, n = 6)
+            val degraded = TastePoolPlanner(rng = kotlin.random.Random(seed), curator = curator)
+                .plan(mixedTaste, n = 6, mood = "party")
+            assertEquals("rng seed " + seed, base, degraded)
+        }
+    }
+
+    @Test
+    fun curator_is_asked_about_at_most_the_first_60_pool_entries() = runTest {
+        val big = TasteProfile(
+            topTracks = (0 until 70).map { i ->
+                TasteTrack(title = "Song$i Unique", artist = "Artist$i", durationS = 100.0)
+            },
+            topArtists = emptyList(),
+        )
+        val llm = FixedLlm("[]")
+        val curator = MoodCurator(llm)
+        TastePoolPlanner(rng = kotlin.random.Random(1), curator = curator)
+            .plan(big, n = 2, mood = "party")
+        val prompt = llm.prompts.single()
+        assertTrue(prompt.contains("Song59 Unique"))
+        assertTrue(!prompt.contains("Song60 Unique"))
+        assertTrue(!prompt.contains("Song69 Unique"))
+    }
+
     // --- misc ----------------------------------------------------------------------
 
     @Test
-    fun mood_is_accepted_and_ignored_for_now() = runTest {
+    fun mood_without_a_curator_is_accepted_and_ignored() = runTest {
         val planner = TastePoolPlanner(rng = kotlin.random.Random(5))
         val songs = planner.plan(mixedTaste, n = 2, mood = "chill")
         assertEquals(2, songs.size)

@@ -38,7 +38,12 @@ interface AudioFetcher {
  * substituted with a normal single-voice break for the MVP (see [BlockRenderer]).
  */
 interface VoiceRenderer {
-    fun render(text: String): DJSlot
+    /**
+     * [style] is an optional English TTS delivery prefix (a mood's
+     * [MoodSpec.ttsStyle]); null keeps the implementation's default delivery
+     * (and its caching behavior). Overrides must NOT redeclare the default.
+     */
+    fun render(text: String, style: String? = null): DJSlot
 }
 
 /**

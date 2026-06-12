@@ -35,9 +35,13 @@ class VoiceRendererTest {
     }
 
     /** A synth whose underlying HTTP engine records every call (to detect caching). */
-    private fun fakeSynth(callCount: IntArray): GeminiTtsSynth {
-        val engine = MockEngine {
+    private fun fakeSynth(
+        callCount: IntArray,
+        recordedBodies: MutableList<String> = mutableListOf(),
+    ): GeminiTtsSynth {
+        val engine = MockEngine { request ->
             callCount[0]++
+            recordedBodies.add((request.body as io.ktor.http.content.TextContent).text)
             respond(content = audioBody(knownPcm), status = HttpStatusCode.OK, headers = jsonHeaders)
         }
         return GeminiTtsSynth(
@@ -90,6 +94,64 @@ class VoiceRendererTest {
         assertEquals("same duration", first.durationS, second.durationS, 1e-9)
         // synth (HTTP engine) hit exactly once across two renders -> cache hit
         assertEquals("synth called only once", 1, calls[0])
+    }
+
+    @Test
+    fun render_same_text_different_styles_uses_different_cache_files() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "אותו טקסט בדיוק"
+
+        val night = renderer.render(text, style = "Read this like a soft late-night host")
+        val morning = renderer.render(text, style = "Read this like an upbeat morning host")
+        val plain = renderer.render(text)
+
+        // three distinct cache files: a WAV voiced for one mood is never reused for another
+        assertTrue("night vs morning", night.audioPath != morning.audioPath)
+        assertTrue("night vs plain", night.audioPath != plain.audioPath)
+        assertTrue("morning vs plain", morning.audioPath != plain.audioPath)
+        assertEquals("each style synthesized once", 3, calls[0])
+
+        // and each styled render is itself cached on repeat
+        val nightAgain = renderer.render(text, style = "Read this like a soft late-night host")
+        assertEquals(night.audioPath, nightAgain.audioPath)
+        assertEquals("repeat styled render is a cache hit", 3, calls[0])
+    }
+
+    @Test
+    fun render_null_style_keeps_legacy_sha1_text_filename() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "שלום עולם"
+
+        val slot = renderer.render(text, style = null)
+
+        // legacy key is sha1(text) alone — pre-style cached WAVs stay valid
+        val sha1 = java.security.MessageDigest.getInstance("SHA-1")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val expectedName = "dj_${sha1.substring(0, 16)}.wav"
+        assertEquals(expectedName, java.io.File(slot.audioPath).name)
+
+        // blank style is treated like null (same legacy file)
+        val blank = renderer.render(text, style = "  ")
+        assertEquals(slot.audioPath, blank.audioPath)
+        assertEquals("blank style hits the legacy cache", 1, calls[0])
+    }
+
+    @Test
+    fun render_forwards_style_to_synth_content() = runTest {
+        val calls = intArrayOf(0)
+        val bodies = mutableListOf<String>()
+        val renderer = VoiceRenderer(fakeSynth(calls, bodies), tmp.root)
+
+        renderer.render("text-here", style = "Read this like a soft late-night host")
+
+        // synth received the style: contentText is "$style\n\n$text" (JSON-escaped)
+        assertTrue(
+            "style prepended in outbound request",
+            bodies[0].contains("""Read this like a soft late-night host\n\ntext-here"""),
+        )
     }
 
     @Test

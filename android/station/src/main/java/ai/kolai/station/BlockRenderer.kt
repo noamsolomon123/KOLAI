@@ -90,6 +90,11 @@ class BlockRenderer(
     // rotate beats / topics across the whole station, not just one block
     private var beatK: Int = 0
     private var topicK: Int = 0
+    // TTS delivery style for the CURRENT block's voice lines: set once per
+    // block in [planFor] from the ctx snapshot's mood (null when the mood is
+    // null / unknown -> default delivery, existing behavior). Consumed by the
+    // voice.render call sites in [render].
+    private var blockTtsStyle: String? = null
     // last hourly-anchor beat that fired ("news"/"weather"), cleared once a beat
     // is chosen outside any anchor window -> each anchor fires at most once per
     // window (deviation 4 above).
@@ -160,6 +165,16 @@ class BlockRenderer(
         // Fresh context for THIS block (deviation 5): snapshot the provider ONCE
         // so all of this block's talk shares one coherent time/weather/news view.
         val ctx = ctx()
+        // Mood-aware cadence (Android addition): when this block's ctx carries
+        // a mood that resolves to a [MoodSpec], ITS talkChance / banterChance /
+        // maxSilence govern this block; a null mood keeps the constructor
+        // values (the existing defaults). The mood's ttsStyle is remembered for
+        // this block's voice.render calls (null when no mood).
+        val moodSpec = ctx.mood?.let { Moods.ALL[it] }
+        val maxSilence = moodSpec?.maxSilence ?: this.maxSilence
+        val talkChance = moodSpec?.talkChance ?: this.talkChance
+        val banterChance = moodSpec?.banterChance ?: this.banterChance
+        blockTtsStyle = moodSpec?.ttsStyle?.takeIf { it.isNotBlank() }
         val events = ArrayList<PlanEvent>()
 
         // ---- block opening ------------------------------------------------
@@ -278,7 +293,7 @@ class BlockRenderer(
         // opening talkover (if any) - DJ over the intro of song 0
         val opening = events.firstOrNull { it.kind == "open" }
         if (opening != null) {
-            val slot = voice.render(opening.text!!)
+            val slot = voice.render(opening.text!!, style = blockTtsStyle)
             val djAudio = Dsp.trimSilence(loadFn(slot.audioPath))
             val djDur = djAudio.size.toDouble() / Dsp.SR
             val startS = openingDuckStartS
@@ -311,7 +326,7 @@ class BlockRenderer(
 
             if (talkEvent != null) {
                 // BANTER substitution: a single-voice break (see planFor TODO).
-                val slot = voice.render(talkEvent.text!!)
+                val slot = voice.render(talkEvent.text!!, style = blockTtsStyle)
                 val djAudio = Dsp.trimSilence(loadFn(slot.audioPath))
                 val djDur = djAudio.size.toDouble() / Dsp.SR
                 // duck the DJ over the TAIL of the current timeline (talkover),

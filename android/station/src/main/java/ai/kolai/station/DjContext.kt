@@ -22,4 +22,7 @@ data class DjContext(
     val weather: String? = null,
     val generalHeadline: String? = null,
     val topicHeadlines: Map<String, String> = emptyMap(),
+    // Station mood key (see [Moods]); null = default behavior, fully backward
+    // compatible. Android addition - the Python carries the mood separately.
+    val mood: String? = null,
 )

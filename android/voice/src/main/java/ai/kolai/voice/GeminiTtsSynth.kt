@@ -27,7 +27,8 @@ import java.util.Base64
  * Ported 1:1 from backend/radioai/voice.py `GeminiTTSSynth.synth`: request with
  * `generationConfig.responseModalities=["AUDIO"]` and
  * `generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName`;
- * when `style` is non-empty the content text is `"$style\n\n$text"`; on success
+ * when the effective style (per-call `styleOverride`, else the constructor
+ * `style`) is non-empty the content text is `"$style\n\n$text"`; on success
  * base64-decode `candidates[0].content.parts[0].inlineData.data` and wrap it via
  * [pcmToWav].
  *
@@ -49,9 +50,14 @@ class GeminiTtsSynth(
         require(keys.isNotEmpty()) { "GeminiTtsSynth needs at least one API key" }
     }
 
-    suspend fun synth(text: String, voiceOverride: String? = null): ByteArray {
+    suspend fun synth(
+        text: String,
+        voiceOverride: String? = null,
+        styleOverride: String? = null,
+    ): ByteArray {
         val voiceName = voiceOverride ?: voice
-        val contentText = if (style.isNotEmpty()) "$style\n\n$text" else text
+        val effectiveStyle = styleOverride ?: style
+        val contentText = if (effectiveStyle.isNotEmpty()) "$effectiveStyle\n\n$text" else text
 
         val requestJson = buildJsonObject {
             putJsonArray("contents") {

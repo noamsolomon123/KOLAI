@@ -92,9 +92,21 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
     private fun maybeSkip(budget: Int, allowSkip: Boolean): String =
         if (allowSkip) "\n" + skipLine() + "\n" else ""
 
+    /**
+     * NEW (Android mood support, no Python counterpart): when [DjContext.mood]
+     * resolves to a [MoodSpec] with a non-empty [MoodSpec.djLine], that Hebrew
+     * guidance line is appended to every prompt the brain builds. An empty
+     * djLine (the "mix" default) or a null/unknown mood appends NOTHING, so
+     * default-mood prompts stay byte-identical to the pre-mood prompts.
+     */
+    private fun moodLine(ctx: DjContext?): String {
+        val line = ctx?.mood?.let { Moods.ALL[it] }?.djLine.orEmpty()
+        return if (line.isEmpty()) "" else "\n" + line
+    }
+
     // ---- per-beat prompts -----------------------------------------------
 
-    private fun prompt(prev: Song?, nxt: Song, budget: Int, allowSkip: Boolean = false): String {
+    private fun prompt(prev: Song?, nxt: Song, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String {
         val prevLine = if (prev != null) {
             "השיר שהרגע התנגן: \"${prev.title}\" של ${prev.artist}."
         } else {
@@ -108,7 +120,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget)
+            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
     }
 
     private fun weatherPrompt(nxt: Song, ctx: DjContext, budget: Int, allowSkip: Boolean = false): String =
@@ -119,9 +131,9 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget)
+            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
 
-    private fun newsPrompt(nxt: Song, headline: String, budget: Int, allowSkip: Boolean = false): String =
+    private fun newsPrompt(nxt: Song, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + "\n" +
             "כותרת חדשות עכשווית: \"$headline\".\n" +
             "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
@@ -130,9 +142,9 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget)
+            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
 
-    private fun topicPrompt(nxt: Song, topic: String, headline: String, budget: Int, allowSkip: Boolean = false): String =
+    private fun topicPrompt(nxt: Song, topic: String, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + " אתה אוהב את הנושא '$topic'.\n" +
             "כותרת עדכנית בנושא $topic: \"$headline\".\n" +
             "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
@@ -141,7 +153,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget)
+            formatLine(budget) + moodLine(ctx)
 
     /**
      * NEW (not in the Python; research finding 3): the very first words of a
@@ -166,7 +178,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             "מאוחרת - לפי מה שמתאים לחלק היום.\n" +
             "ומשם זרום בטבעיות אל השיר הראשון: \"${nxt.title}\" של ${nxt.artist}.\n" +
             oneListenerLine() + "\n" +
-            formatLine(budget)
+            formatLine(budget) + moodLine(ctx)
     }
 
     // ---- output shaping --------------------------------------------------
@@ -175,14 +187,14 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
      * Optional cheap second pass to sharpen the line. Robust: any failure or
      * empty/garbage result falls back to the original line. Python: _refine.
      */
-    suspend fun refine(line: String, budget: Int): String {
+    suspend fun refine(line: String, budget: Int, ctx: DjContext? = null): String {
         try {
             val p = personaLine() + "\n" +
                 "הנה שורת קישור שכתבת: \"$line\".\n" +
                 "חדד אותה: יותר שנונה וטבעית, רצוי עם משחק מילים על שם השיר/אמן, " +
                 "עד $budget מילים, משפט שלם. החזר רק את השורה המשופרת בעברית " +
                 "מדוברת, בלי מרכאות, אנגלית, עיצוב או הסברים.\n" +
-                oneListenerLine()
+                oneListenerLine() + moodLine(ctx)
             val out = finish(client.complete(p), budget)
             if (out.isNotBlank()) return out
         } catch (e: Exception) {
@@ -193,10 +205,10 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
 
     // ---- public API ------------------------------------------------------
 
-    /** Python: write_intro. */
-    suspend fun writeIntro(prev: Song?, nxt: Song, seconds: Double): String {
+    /** Python: write_intro. [ctx] (optional) only contributes the mood line. */
+    suspend fun writeIntro(prev: Song?, nxt: Song, seconds: Double, ctx: DjContext? = null): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(prompt(prev, nxt, budget))
+        val text = client.complete(prompt(prev, nxt, budget, ctx = ctx))
         return finish(text, budget)
     }
 
@@ -230,12 +242,12 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             beat == "weather" && !ctx.weather.isNullOrEmpty() ->
                 weatherPrompt(nxt, ctx, budget, allowSkip)
             beat == "news" && !ctx.generalHeadline.isNullOrEmpty() ->
-                newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip)
+                newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip, ctx)
             beat == "topic" && topic != null && !ctx.topicHeadlines[topic].isNullOrEmpty() ->
-                topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip)
+                topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip, ctx)
             else ->
                 // song beat / fallback -> witty handoff (honors allowSkip too)
-                prompt(prev, nxt, budget, allowSkip)
+                prompt(prev, nxt, budget, allowSkip, ctx)
         }
         val raw = client.complete(p)
         if (allowSkip && isSkip(raw)) return null

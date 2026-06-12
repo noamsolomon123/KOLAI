@@ -169,4 +169,58 @@ class DjBrainTest {
         assertTrue("output exceeds budget: ${words.size}", words.size <= wordsForSeconds(10.0))
         assertTrue(out.isNotEmpty())
     }
+
+    // ---- mood line (mood support) ------------------------------------------
+
+    /** Stable marker shared by all non-empty mood djLines. */
+    private val moodMarker = "השידור עכשיו במצב"
+
+    @Test
+    fun writeBreak_prompt_contains_mood_line_when_mood_set() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "late_night"), seconds = 8.0)
+        val p = client.prompts.first()
+        assertTrue("mood line missing", p.contains(Moods.ALL.getValue("late_night").djLine))
+    }
+
+    @Test
+    fun every_prompt_kind_contains_mood_line_when_mood_set() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(
+            timeStr = "23:00", partOfDay = "לילה", weather = "קריר",
+            generalHeadline = "כותרת כללית",
+            topicHeadlines = mapOf("ספורט" to "כותרת ספורט"),
+            mood = "late_night",
+        )
+        brain.writeBreak(prev, nxt, beat = "song", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "news", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "topic", ctx = ctx, seconds = 8.0, topic = "ספורט")
+        brain.writeOpening(nxt = nxt, ctx = ctx, seconds = 10.0)
+        assertEquals(5, client.prompts.size)
+        client.prompts.forEachIndexed { idx, p ->
+            assertTrue("prompt #$idx missing mood line", p.contains(moodMarker))
+        }
+    }
+
+    @Test
+    fun prompt_has_no_mood_line_when_mood_null() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertFalse(client.prompts.first().contains(moodMarker))
+    }
+
+    @Test
+    fun mix_mood_prompt_is_byte_identical_to_null_mood_prompt() = runTest {
+        // mix has an empty djLine: prompts must stay byte-identical to today's.
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = null), seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "mix"), seconds = 8.0)
+        assertEquals(client.prompts[0], client.prompts[1])
+        assertFalse(client.prompts[1].contains(moodMarker))
+    }
 }

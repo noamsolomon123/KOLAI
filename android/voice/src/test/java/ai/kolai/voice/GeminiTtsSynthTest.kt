@@ -116,6 +116,50 @@ class GeminiTtsSynthTest {
     }
 
     @Test
+    fun synth_styleOverride_prepends_to_content_over_constructor_style() = runTest {
+        val urls = mutableListOf<String>()
+        val bodies = mutableListOf<String>()
+        val client = mockClient(
+            listOf(HttpStatusCode.OK to audioBody(knownPcm)),
+            urls, bodies,
+        )
+        val synth = GeminiTtsSynth(
+            apiKeys = listOf("KEY_A"),
+            model = "gemini-tts",
+            voice = "Kore",
+            style = "Constructor style",
+            httpClient = client,
+        )
+        synth.synth("text-here", styleOverride = "Read this like a soft late-night host")
+        // contentText is "$style\n\n$text" (JSON-escaped newlines in the body)
+        assertTrue(
+            "override style prepended with blank line",
+            bodies[0].contains("""Read this like a soft late-night host\n\ntext-here"""),
+        )
+        // the per-call override replaces the constructor style entirely
+        assertTrue(!bodies[0].contains("Constructor style"))
+    }
+
+    @Test
+    fun synth_null_styleOverride_falls_back_to_constructor_style() = runTest {
+        val urls = mutableListOf<String>()
+        val bodies = mutableListOf<String>()
+        val client = mockClient(
+            listOf(HttpStatusCode.OK to audioBody(knownPcm)),
+            urls, bodies,
+        )
+        val synth = GeminiTtsSynth(
+            apiKeys = listOf("KEY_A"),
+            model = "gemini-tts",
+            voice = "Kore",
+            style = "Say cheerfully",
+            httpClient = client,
+        )
+        synth.synth("text-here", styleOverride = null)
+        assertTrue(bodies[0].contains("""Say cheerfully\n\ntext-here"""))
+    }
+
+    @Test
     fun synth_rotates_keys_on_failure() = runTest {
         val urls = mutableListOf<String>()
         val bodies = mutableListOf<String>()

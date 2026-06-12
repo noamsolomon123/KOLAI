@@ -24,13 +24,21 @@ class VoiceRenderer(
     /**
      * Synthesize (or reuse the cached WAV for) [text] and return its [DJSlot].
      * [voiceOverride] forwards to the synth for per-call voice selection.
+     * [style] forwards to the synth as a per-call TTS style override.
+     *
+     * Cache-key note: when [style] is null/blank the key stays the legacy
+     * `sha1(text)` so WAVs cached before styles existed remain valid; when a
+     * style is given the key is `sha1(style + " " + text)` so the same text
+     * voiced in different moods produces different cache files instead of
+     * reusing a WAV synthesized for another mood.
      */
-    suspend fun render(text: String, voiceOverride: String? = null): DJSlot {
+    suspend fun render(text: String, voiceOverride: String? = null, style: String? = null): DJSlot {
         outDir.mkdirs()
-        val outFile = File(outDir, "dj_${sha1Hex(text).substring(0, 16)}.wav")
+        val cacheKey = if (style.isNullOrBlank()) text else "$style $text"
+        val outFile = File(outDir, "dj_${sha1Hex(cacheKey).substring(0, 16)}.wav")
 
         if (!outFile.exists()) {
-            val bytes = synth.synth(text, voiceOverride)
+            val bytes = synth.synth(text, voiceOverride, style)
             outFile.writeBytes(bytes)
         }
 
