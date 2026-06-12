@@ -184,3 +184,29 @@ def test_refine_prompt_carries_exclude_and_seed_constraints():
     for p in llm.prompts:
         assert excl in p
         assert "Seed Song" in p
+
+
+# === MOOD TESTS (appended) ===
+def test_plan_threads_party_mood_vibe_into_prompt():
+    llm = _FakeLLM('[{"title": "Tel Aviv", "artist": "Omer Adam"}]')
+    planner = SetlistPlanner(client=llm)
+    songs = planner.plan(_TASTE, n=1, mood="party")
+    assert songs and songs[0].title == "Tel Aviv"
+    p = llm.last_prompt.lower()
+    assert "party" in p or "high-energy" in p
+    # still grounded in taste
+    assert "Noa Kirel" in llm.last_prompt
+
+
+def test_plan_mood_carries_into_refine_prompt():
+    llm = _RecordingLLM([_DRAFT, _REFINED])
+    _SP(client=llm).plan(_TASTE, n=2, mood="late_night")
+    for prompt in llm.prompts:
+        low = prompt.lower()
+        assert "late-night" in low or "low-energy" in low
+
+
+def test_plan_without_mood_omits_vibe_line():
+    llm = _FakeLLM('[{"title": "Tel Aviv", "artist": "Omer Adam"}]')
+    SetlistPlanner(client=llm).plan(_TASTE, n=1)
+    assert "VIBE for this set" not in llm.last_prompt

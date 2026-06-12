@@ -1,5 +1,6 @@
 import time as _time
 from radioai.models import Song
+from radioai.moods import DEFAULT_MOOD
 
 
 class RollingPlanner:
@@ -13,17 +14,23 @@ class RollingPlanner:
 
     def __init__(self, taste_service, setlist_planner, *,
                  refresh_every: int = 5, refresh_ttl_s: float = 600.0,
-                 no_repeat_window: int = 50, clock=None):
+                 no_repeat_window: int = 50, clock=None,
+                 mood: str = DEFAULT_MOOD):
         self._taste = taste_service
         self._planner = setlist_planner
         self._refresh_every = refresh_every
         self._refresh_ttl_s = refresh_ttl_s
         self._no_repeat_window = no_repeat_window
         self._clock = clock or _time.monotonic
+        self.mood = mood
         self._profile = None
         self._songs_since_refresh = 0
         self._last_refresh = 0.0
         self.history: list[str] = []
+
+    def set_mood(self, mood: str) -> None:
+        """Switch the station's vibe; affects FUTURE song selection."""
+        self.mood = mood
 
     def _key(self, song) -> str:
         return f"{song.title} — {song.artist}"
@@ -44,7 +51,8 @@ class RollingPlanner:
     def next_songs(self, n: int, seed=None) -> list[Song]:
         profile = self._ensure_profile()
         recent = self.history[-self._no_repeat_window:]
-        picks = self._planner.plan(profile, n=n, exclude=recent, seed=seed)
+        picks = self._planner.plan(profile, n=n, exclude=recent, seed=seed,
+                                   mood=self.mood)
         recent_set = set(recent)
         fresh = [s for s in picks if self._key(s) not in recent_set]
         chosen = (fresh if len(fresh) >= n else picks)[:n]   # relax: accept if starved

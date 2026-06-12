@@ -15,8 +15,9 @@ class FakePlanner:
     def __init__(self):
         self.calls = []          # records {n, exclude, seed}
         self._i = 0
-    def plan(self, profile, n=6, exclude=None, seed=None):
-        self.calls.append({"n": n, "exclude": list(exclude or []), "seed": seed})
+    def plan(self, profile, n=6, exclude=None, seed=None, mood=None):
+        self.calls.append({"n": n, "exclude": list(exclude or []),
+                           "seed": seed, "mood": mood})
         out = []
         for _ in range(n):
             self._i += 1
@@ -84,9 +85,28 @@ def test_seed_passed_to_planner():
 def test_relaxes_when_starved():
     taste = FakeTaste()
     class RepeatPlanner:
-        def plan(self, profile, n=6, exclude=None, seed=None):
+        def plan(self, profile, n=6, exclude=None, seed=None, mood=None):
             return [Song(title="Same", artist="A") for _ in range(n)]
     rp = RollingPlanner(taste, RepeatPlanner(), clock=Clock())
     rp.next_songs(1)                             # history ["Same — A"]
     out = rp.next_songs(1)                       # planner repeats -> relax & accept, don't stall
     assert len(out) == 1
+
+
+# === MOOD TESTS (appended) ===
+def test_default_mood_is_mix_and_passed_to_planner():
+    from radioai.moods import DEFAULT_MOOD
+    taste, planner = FakeTaste(), FakePlanner()
+    rp = RollingPlanner(taste, planner, clock=Clock())
+    assert rp.mood == DEFAULT_MOOD
+    rp.next_songs(1)
+    assert planner.calls[0]["mood"] == DEFAULT_MOOD
+
+
+def test_set_mood_changes_mood_passed_to_planner():
+    taste, planner = FakeTaste(), FakePlanner()
+    rp = RollingPlanner(taste, planner, clock=Clock())
+    rp.set_mood("late_night")
+    assert rp.mood == "late_night"
+    rp.next_songs(1)
+    assert planner.calls[0]["mood"] == "late_night"
