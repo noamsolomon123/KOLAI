@@ -8,6 +8,7 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
@@ -31,6 +32,11 @@ import java.util.Base64
  * `style`) is non-empty the content text is `"$style\n\n$text"`; on success
  * base64-decode `candidates[0].content.parts[0].inlineData.data` and wrap it via
  * [pcmToWav].
+ *
+ * [synthDialogue] uses the same endpoint/models with the multi-speaker variant:
+ * `generationConfig.speechConfig.multiSpeakerVoiceConfig.speakerVoiceConfigs`
+ * (speakers "A"/"B" mapped to prebuilt voices) and a script content text of
+ * `"A: ...\nB: ..."` lines. Response shape is identical to single-speaker.
  *
  * The [httpClient] is injected so tests can pass a MockEngine client and
  * production an OkHttp one — the engine is never hardcoded here.
@@ -56,10 +62,47 @@ class GeminiTtsSynth(
         styleOverride: String? = null,
     ): ByteArray {
         val voiceName = voiceOverride ?: voice
-        val effectiveStyle = styleOverride ?: style
-        val contentText = if (effectiveStyle.isNotEmpty()) "$effectiveStyle\n\n$text" else text
+        val body = requestBody(
+            contentText = withStyle(text, styleOverride),
+            speechConfig = singleSpeakerConfig(voiceName),
+        )
+        return postWithKeyRotation(body)
+    }
 
-        val requestJson = buildJsonObject {
+    /**
+     * Synthesize a two-host dialogue in one multi-speaker TTS call.
+     *
+     * [turns] are (speakerLabel, Hebrew text) pairs where the label is "A" or
+     * "B"; they are joined into a `"A: ...\nB: ..."` script that Gemini voices
+     * with speaker "A" = [voiceA] (defaulting to the constructor [voice]) and
+     * speaker "B" = [voiceB]. Style semantics mirror [synth]: the effective
+     * style ([styleOverride], else the constructor [style]) is prepended as its
+     * own paragraph when non-empty. Returns WAV bytes like [synth].
+     */
+    suspend fun synthDialogue(
+        turns: List<Pair<String, String>>,
+        voiceA: String? = null,
+        voiceB: String,
+        styleOverride: String? = null,
+    ): ByteArray {
+        require(turns.isNotEmpty()) { "synthDialogue needs at least one turn" }
+        val script = dialogueScript(turns)
+        val body = requestBody(
+            contentText = withStyle(script, styleOverride),
+            speechConfig = multiSpeakerConfig(voiceA ?: voice, voiceB),
+        )
+        return postWithKeyRotation(body)
+    }
+
+    /** `"$style\n\n$text"` when the effective style is non-empty, else [text]. */
+    private fun withStyle(text: String, styleOverride: String?): String {
+        val effectiveStyle = styleOverride ?: style
+        return if (effectiveStyle.isNotEmpty()) "$effectiveStyle\n\n$text" else text
+    }
+
+    /** generateContent request body shared by single- and multi-speaker calls. */
+    private fun requestBody(contentText: String, speechConfig: JsonObject): String =
+        buildJsonObject {
             putJsonArray("contents") {
                 add(
                     buildJsonObject {
@@ -71,17 +114,39 @@ class GeminiTtsSynth(
             }
             putJsonObject("generationConfig") {
                 putJsonArray("responseModalities") { add("AUDIO") }
-                putJsonObject("speechConfig") {
-                    putJsonObject("voiceConfig") {
-                        putJsonObject("prebuiltVoiceConfig") {
-                            put("voiceName", voiceName)
-                        }
-                    }
+                put("speechConfig", speechConfig)
+            }
+        }.toString()
+
+    private fun singleSpeakerConfig(voiceName: String): JsonObject = buildJsonObject {
+        putJsonObject("voiceConfig") {
+            putJsonObject("prebuiltVoiceConfig") {
+                put("voiceName", voiceName)
+            }
+        }
+    }
+
+    private fun multiSpeakerConfig(voiceA: String, voiceB: String): JsonObject = buildJsonObject {
+        putJsonObject("multiSpeakerVoiceConfig") {
+            putJsonArray("speakerVoiceConfigs") {
+                add(speakerVoiceConfig("A", voiceA))
+                add(speakerVoiceConfig("B", voiceB))
+            }
+        }
+    }
+
+    private fun speakerVoiceConfig(speaker: String, voiceName: String): JsonObject =
+        buildJsonObject {
+            put("speaker", speaker)
+            putJsonObject("voiceConfig") {
+                putJsonObject("prebuiltVoiceConfig") {
+                    put("voiceName", voiceName)
                 }
             }
         }
-        val body = requestJson.toString()
 
+    /** POST [body], rotating across keys on 429/5xx/exceptions; returns WAV bytes. */
+    private suspend fun postWithKeyRotation(body: String): ByteArray {
         val errors = mutableListOf<String>()
         repeat(keys.size) {
             val key = keys[idx]
@@ -111,3 +176,7 @@ class GeminiTtsSynth(
         return Base64.getDecoder().decode(b64)
     }
 }
+
+/** Join dialogue turns into the `"A: ...\nB: ..."` script Gemini multi-speaker expects. */
+internal fun dialogueScript(turns: List<Pair<String, String>>): String =
+    turns.joinToString("\n") { (speaker, text) -> "$speaker: $text" }

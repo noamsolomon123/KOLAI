@@ -46,7 +46,37 @@ class VoiceRenderer(
         return DJSlot(text = text, audioPath = outFile.absolutePath, durationS = durationS)
     }
 
-    // TODO post-MVP: renderBanter(turns, voiceA, voiceB) two-voice stitch
+    /**
+     * Synthesize (or reuse the cached WAV for) a two-host banter dialogue via
+     * one multi-speaker TTS call and return its [DJSlot].
+     *
+     * [turns] are (speakerLabel "A"/"B", Hebrew text) pairs; speaker A uses the
+     * synth's constructor voice and speaker B uses [voiceB]. [style] forwards
+     * to the synth as the per-call TTS style override.
+     *
+     * Cache-key: `sha1("dlg|" + voiceB + "|" + style + "|" + joined turns)` —
+     * the "dlg|" prefix keeps dialogue WAVs disjoint from single-voice ones,
+     * and voiceB/style/turns each contribute so a different co-host voice,
+     * mood, or script never reuses another dialogue's WAV.
+     */
+    suspend fun renderDialogue(
+        turns: List<Pair<String, String>>,
+        voiceB: String,
+        style: String? = null,
+    ): DJSlot {
+        outDir.mkdirs()
+        val script = dialogueScript(turns)
+        val cacheKey = "dlg|$voiceB|$style|$script"
+        val outFile = File(outDir, "dj_${sha1Hex(cacheKey).substring(0, 16)}.wav")
+
+        if (!outFile.exists()) {
+            val bytes = synth.synthDialogue(turns, voiceB = voiceB, styleOverride = style)
+            outFile.writeBytes(bytes)
+        }
+
+        val durationS = wavDurationSeconds(outFile.readBytes())
+        return DJSlot(text = script, audioPath = outFile.absolutePath, durationS = durationS)
+    }
 
     private fun sha1Hex(text: String): String {
         val digest = MessageDigest.getInstance("SHA-1").digest(text.toByteArray(Charsets.UTF_8))

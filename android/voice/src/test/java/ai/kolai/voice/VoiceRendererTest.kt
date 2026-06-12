@@ -155,6 +155,66 @@ class VoiceRendererTest {
     }
 
     @Test
+    fun renderDialogue_writes_wav_and_returns_script_slot() = runTest {
+        val calls = intArrayOf(0)
+        val bodies = mutableListOf<String>()
+        val renderer = VoiceRenderer(fakeSynth(calls, bodies), tmp.root)
+        val turns = listOf("A" to "shalom", "B" to "ma kore")
+
+        val slot = renderer.renderDialogue(turns, voiceB = "Iapetus")
+
+        val written = java.io.File(slot.audioPath)
+        assertTrue("file exists", written.exists())
+        assertEquals(tmp.root.absolutePath, written.parentFile!!.absolutePath)
+        assertTrue("dj_ prefix", written.name.startsWith("dj_"))
+        assertTrue(".wav suffix", written.name.endsWith(".wav"))
+        assertEquals("dj_".length + 16 + ".wav".length, written.name.length)
+
+        // slot text is the joined "A: ...\nB: ..." script; duration from the WAV
+        assertEquals("A: shalom\nB: ma kore", slot.text)
+        assertEquals(1.0, slot.durationS, 1e-9)
+
+        // the outbound request was a multi-speaker call carrying both voices
+        assertTrue(bodies[0].contains("multiSpeakerVoiceConfig"))
+        assertTrue("speaker A = synth constructor voice", bodies[0].contains("Algieba"))
+        assertTrue("speaker B = per-call voice", bodies[0].contains("Iapetus"))
+    }
+
+    @Test
+    fun renderDialogue_is_cached_second_call_makes_no_http() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val turns = listOf("A" to "hi", "B" to "yo")
+
+        val first = renderer.renderDialogue(turns, voiceB = "Iapetus", style = "Playful banter")
+        val second = renderer.renderDialogue(turns, voiceB = "Iapetus", style = "Playful banter")
+
+        assertEquals("same cached path", first.audioPath, second.audioPath)
+        assertEquals("same duration", first.durationS, second.durationS, 1e-9)
+        assertEquals("synth called only once", 1, calls[0])
+    }
+
+    @Test
+    fun renderDialogue_voiceB_style_and_turns_each_change_cache_file() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val turns = listOf("A" to "hi", "B" to "yo")
+
+        val base = renderer.renderDialogue(turns, voiceB = "Iapetus")
+        val otherVoice = renderer.renderDialogue(turns, voiceB = "Puck")
+        val styled = renderer.renderDialogue(turns, voiceB = "Iapetus", style = "Late night")
+        val otherTurns = renderer.renderDialogue(listOf("A" to "hi", "B" to "bye"), voiceB = "Iapetus")
+
+        val paths = listOf(base, otherVoice, styled, otherTurns).map { it.audioPath }
+        assertEquals("all four renders use distinct files", 4, paths.toSet().size)
+        assertEquals("each variant synthesized once", 4, calls[0])
+
+        // dialogue cache keys are disjoint from single-voice renders of the same script
+        val single = renderer.render("A: hi\nB: yo")
+        assertTrue("dlg| prefix keeps caches apart", single.audioPath != base.audioPath)
+    }
+
+    @Test
     fun wavDurationSeconds_parses_known_pcm() {
         val wav = pcmToWav(knownPcm, 24000)
         assertEquals(1.0, wavDurationSeconds(wav), 1e-9)
