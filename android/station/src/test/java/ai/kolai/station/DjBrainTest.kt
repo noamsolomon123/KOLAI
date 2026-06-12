@@ -1,6 +1,7 @@
 package ai.kolai.station
 
 import ai.kolai.core.Song
+import kotlin.random.Random
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -216,11 +217,176 @@ class DjBrainTest {
     @Test
     fun mix_mood_prompt_is_byte_identical_to_null_mood_prompt() = runTest {
         // mix has an empty djLine: prompts must stay byte-identical to today's.
+        // Two fresh brains with the same seeded Random so the flavor nudge and
+        // (empty) anti-repetition memory match; the only variable is the mood.
+        val c1 = FakeLlmClient(listOf("שלום"))
+        val c2 = FakeLlmClient(listOf("שלום"))
+        val b1 = DjBrain(c1, persona = "דני", random = Random(42))
+        val b2 = DjBrain(c2, persona = "דני", random = Random(42))
+        b1.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = null), seconds = 8.0)
+        b2.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "mix"), seconds = 8.0)
+        assertEquals(c1.prompts[0], c2.prompts[0])
+        assertFalse(c2.prompts[0].contains(moodMarker))
+    }
+
+    // ---- anti-repetition memory (2026-06-12) -------------------------------
+
+    /** Stable marker of the avoid-instruction (avoidLine). */
+    private val avoidMarker = "אל תחזור על הפתיחים/הניסוחים האלה"
+
+    @Test
+    fun first_prompt_has_no_avoid_instruction() = runTest {
+        val client = FakeLlmClient(listOf("שלום עולם"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertFalse(client.prompts.first().contains(avoidMarker))
+    }
+
+    @Test
+    fun second_prompt_contains_avoid_instruction_with_recent_line() = runTest {
+        val client = FakeLlmClient(listOf("ערב מושלם לשיר הזה", "שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        val p = client.prompts[1]
+        assertTrue("avoid instruction missing", p.contains(avoidMarker))
+        assertTrue("recent line missing from avoid list", p.contains("ערב מושלם לשיר הזה"))
+    }
+
+    @Test
+    fun memory_keeps_last_8_and_evicts_oldest() = runTest {
+        val responses = (1..10).map { "שורה מספר $it" }
+        val client = FakeLlmClient(responses)
+        val brain = DjBrain(client, persona = "דני")
+        repeat(10) { brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0) }
+        val mem = brain.recentLinesSnapshot()
+        assertEquals(DjBrain.MEMORY_SIZE, mem.size)
+        assertEquals("שורה מספר 3", mem.first()) // 1 and 2 evicted
+        assertEquals("שורה מספר 10", mem.last())
+    }
+
+    @Test
+    fun avoid_list_truncates_remembered_lines_to_60_chars() = runTest {
+        val long = "א".repeat(80)
+        val client = FakeLlmClient(listOf(long, "שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        val p = client.prompts[1]
+        assertTrue("truncated line missing", p.contains("א".repeat(60)))
+        assertFalse("line not truncated to 60", p.contains("א".repeat(61)))
+    }
+
+    @Test
+    fun skipped_output_is_not_remembered() = runTest {
+        val client = FakeLlmClient(listOf("SKIP", "שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0, allowSkip = true)
+        assertNull(out)
+        assertTrue("SKIP must not be remembered", brain.recentLinesSnapshot().isEmpty())
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertFalse(client.prompts[1].contains(avoidMarker))
+    }
+
+    @Test
+    fun opening_and_intro_lines_are_remembered_too() = runTest {
+        val client = FakeLlmClient(listOf("בוקר טוב לך", "קישור נחמד"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeOpening(nxt = nxt, ctx = DjContext(partOfDay = "בוקר"), seconds = 10.0)
+        brain.writeIntro(prev = prev, nxt = nxt, seconds = 8.0)
+        assertEquals(listOf("בוקר טוב לך", "קישור נחמד"), brain.recentLinesSnapshot())
+        // and the second prompt warns against repeating the opening line
+        assertTrue(client.prompts[1].contains(avoidMarker))
+        assertTrue(client.prompts[1].contains("בוקר טוב לך"))
+    }
+
+    // ---- variety flavor nudges (seeded Random) -----------------------------
+
+    @Test
+    fun seeded_random_gives_reproducible_flavor_nudge() = runTest {
+        val c1 = FakeLlmClient(listOf("שלום"))
+        val c2 = FakeLlmClient(listOf("שלום"))
+        val b1 = DjBrain(c1, persona = "דני", random = Random(7))
+        val b2 = DjBrain(c2, persona = "דני", random = Random(7))
+        b1.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        b2.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertEquals(c1.prompts[0], c2.prompts[0])
+        assertTrue(
+            "prompt must carry one of the flavor nudges",
+            DjBrain.FLAVOR_NUDGES.any { c1.prompts[0].contains(it) },
+        )
+    }
+
+    @Test
+    fun flavor_nudges_rotate_across_calls() = runTest {
+        // SKIP responses keep the memory empty, so prompts differ only by flavor.
+        val client = FakeLlmClient(listOf("SKIP"))
+        val brain = DjBrain(client, persona = "דני", random = Random(1))
+        repeat(12) {
+            brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0, allowSkip = true)
+        }
+        val used = DjBrain.FLAVOR_NUDGES.filter { n -> client.prompts.any { it.contains(n) } }
+        assertTrue("expected at least 2 distinct nudges, got ${used.size}", used.size >= 2)
+    }
+
+    // ---- back-announce of the outgoing song --------------------------------
+
+    /** Stable marker of the back-announce nudge (backAnnounceLine). */
+    private val backAnnounceMarker = "השיר שהרגע הסתיים"
+
+    @Test
+    fun weather_prompt_offers_back_announce_when_prev_known() = runTest {
         val client = FakeLlmClient(listOf("שלום"))
         val brain = DjBrain(client, persona = "דני")
-        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = null), seconds = 8.0)
-        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "mix"), seconds = 8.0)
-        assertEquals(client.prompts[0], client.prompts[1])
-        assertFalse(client.prompts[1].contains(moodMarker))
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי")
+        brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        val p = client.prompts.first()
+        assertTrue("back-announce nudge missing", p.contains(backAnnounceMarker))
+        assertTrue("outgoing song title missing", p.contains("Yesterday"))
+        assertTrue("outgoing artist missing", p.contains("The Beatles"))
+    }
+
+    @Test
+    fun weather_prompt_has_no_back_announce_when_prev_null() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי")
+        brain.writeBreak(null, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        assertFalse(client.prompts.first().contains(backAnnounceMarker))
+    }
+
+    // ---- sharper quality gate ----------------------------------------------
+
+    @Test
+    fun allowSkip_prompt_contains_raised_bar_sentence() = runTest {
+        val client = FakeLlmClient(listOf("SKIP"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0, allowSkip = true)
+        val p = client.prompts.first()
+        assertTrue("raised-bar sentence missing", p.contains("מילוי גרוע משתיקה"))
+        // the original skip line stays verbatim right before it
+        assertTrue("original skip line missing", p.contains("החזר בדיוק את המילה SKIP"))
+    }
+
+    @Test
+    fun no_skip_prompt_has_no_raised_bar_sentence() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertFalse(client.prompts.first().contains("מילוי גרוע משתיקה"))
+    }
+
+    @Test
+    fun additions_leave_existing_fragments_untouched() = runTest {
+        // mood + one-listener + naming + persona must all survive the new
+        // appended fragments on the same prompt.
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "late_night"), seconds = 8.0, allowSkip = true)
+        val p = client.prompts.first()
+        assertTrue(p.contains(oneListenerMarker))
+        assertTrue(p.contains("back-announce"))
+        assertTrue(p.contains(moodMarker))
+        assertTrue(p.contains("שדרן רדיו ישראלי"))
     }
 }

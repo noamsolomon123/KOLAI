@@ -1,6 +1,7 @@
 package ai.kolai.station
 
 import ai.kolai.core.Song
+import kotlin.random.Random
 
 /**
  * Single-host DJ line generation, ported 1:1 from backend/radioai/djbrain.py
@@ -29,7 +30,83 @@ import ai.kolai.core.Song
  *     part of day, welcomes the listener and flows into the first song
  *     (finding 3). No SKIP is allowed there - an opening always speaks.
  */
-class DjBrain(private val client: LlmClient, private val persona: String) {
+class DjBrain(
+    private val client: LlmClient,
+    private val persona: String,
+    private val random: Random = Random.Default,
+) {
+
+    // ---- anti-repetition memory + variety dials (additions, 2026-06-12) --
+
+    /**
+     * NEW (no Python counterpart): a small ring of the last [MEMORY_SIZE]
+     * lines this brain actually put on air. Every generation prompt gets an
+     * appended Hebrew instruction listing the most recent [AVOID_COUNT] of
+     * them (each truncated to [AVOID_TRUNC] chars) so the model stops
+     * recycling the same openers/phrasings block after block. Guarded by
+     * [memoryLock] because the renderer may call from worker threads.
+     */
+    private val recentLines = ArrayDeque<String>()
+    private val memoryLock = Any()
+
+    private fun remember(line: String?) {
+        if (line.isNullOrBlank()) return
+        synchronized(memoryLock) {
+            recentLines.addLast(line)
+            while (recentLines.size > MEMORY_SIZE) recentLines.removeFirst()
+        }
+    }
+
+    /** Snapshot for tests/debugging; newest line last. */
+    internal fun recentLinesSnapshot(): List<String> =
+        synchronized(memoryLock) { recentLines.toList() }
+
+    private fun avoidLine(): String {
+        val recent = synchronized(memoryLock) { recentLines.toList() }
+        if (recent.isEmpty()) return ""
+        val items = recent.takeLast(AVOID_COUNT)
+            .joinToString(" | ") { "\"" + it.take(AVOID_TRUNC) + "\"" }
+        return "\n" + "אל תחזור על הפתיחים/הניסוחים האלה מהשורות האחרונות שלך: " +
+            items + ". תפתח ותנסח אחרת לגמרי."
+    }
+
+    /**
+     * NEW: one short randomized angle-nudge per spoken line, so consecutive
+     * links don't all share the same flavor. Chosen via the injectable
+     * [random] (tests pass a seeded Random). Nudges are deliberately short
+     * and respect the no-over-talk law.
+     */
+    private fun flavorLine(): String = "\n" + FLAVOR_NUDGES[random.nextInt(FLAVOR_NUDGES.size)]
+
+    /**
+     * NEW: when the previous song is known, nudge the model that it may also
+     * close the song that just ended (back-announce), not only tee up the
+     * next one - natural radio behavior. Optional by design ("לא חובה") so it
+     * never becomes a formula. Appended to the weather/news/topic prompts,
+     * whose verbatim bodies never mention the outgoing song.
+     */
+    private fun backAnnounceLine(prev: Song?): String =
+        if (prev == null) "" else
+            "\n" + "אם זה יושב טוב, אפשר גם מילה קטנה על השיר שהרגע הסתיים - " +
+                "\"${prev.title}\" של ${prev.artist} - כמו שדרן שסוגר שיר באוויר. לא חובה."
+
+    /** NEW: raises the SKIP bar; appended right after the verbatim [skipLine]. */
+    private fun skipGateLine(): String =
+        "והרף גבוה: דבר רק אם יש לך משהו באמת מעניין, מפתיע או מצחיק להגיד - " +
+            "כל דבר פחות מזה הוא מילוי, ומילוי גרוע משתיקה, אז SKIP."
+
+    internal companion object {
+        const val MEMORY_SIZE = 8
+        const val AVOID_COUNT = 3
+        const val AVOID_TRUNC = 60
+        val FLAVOR_NUDGES = listOf(
+            "הפעם אפשר זווית אישית קטנה.",
+            "הפעם משפט אחד בלבד, חד ויפה.",
+            "הפעם אפשר פאן קטן על השיר הבא.",
+            "הפעם בלי שאלה רטורית - רק אמירה.",
+            "הפעם תיכנס ישר לעניין, בלי חימום.",
+        )
+    }
 
     // ---- shared prompt fragments ----------------------------------------
 
@@ -90,7 +167,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             "שתשתוק. במקרה כזה החזר בדיוק את המילה SKIP (ותו לא)."
 
     private fun maybeSkip(budget: Int, allowSkip: Boolean): String =
-        if (allowSkip) "\n" + skipLine() + "\n" else ""
+        if (allowSkip) "\n" + skipLine() + "\n" + skipGateLine() + "\n" else ""
 
     /**
      * NEW (Android mood support, no Python counterpart): when [DjContext.mood]
@@ -120,7 +197,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
+            formatLine(budget) + moodLine(ctx)
     }
 
     private fun weatherPrompt(nxt: Song, ctx: DjContext, budget: Int, allowSkip: Boolean = false): String =
@@ -131,7 +208,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
+            formatLine(budget) + moodLine(ctx)
 
     private fun newsPrompt(nxt: Song, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + "\n" +
@@ -142,7 +219,7 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
             witLine() + "\n" +
             oneListenerLine() + "\n" +
             maybeSkip(budget, allowSkip) +
-            formatLine(budget) + moodLine(ctx) + moodLine(ctx)
+            formatLine(budget) + moodLine(ctx)
 
     private fun topicPrompt(nxt: Song, topic: String, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + " אתה אוהב את הנושא '$topic'.\n" +
@@ -208,8 +285,10 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
     /** Python: write_intro. [ctx] (optional) only contributes the mood line. */
     suspend fun writeIntro(prev: Song?, nxt: Song, seconds: Double, ctx: DjContext? = null): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(prompt(prev, nxt, budget, ctx = ctx))
-        return finish(text, budget)
+        val text = client.complete(prompt(prev, nxt, budget, ctx = ctx) + flavorLine() + avoidLine())
+        val out = finish(text, budget)
+        remember(out)
+        return out
     }
 
     /**
@@ -218,8 +297,10 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
      */
     suspend fun writeOpening(nxt: Song, ctx: DjContext, seconds: Double): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(openingPrompt(nxt, ctx, budget))
-        return finish(text, budget)
+        val text = client.complete(openingPrompt(nxt, ctx, budget) + avoidLine())
+        val out = finish(text, budget)
+        remember(out)
+        return out
     }
 
     /**
@@ -240,17 +321,19 @@ class DjBrain(private val client: LlmClient, private val persona: String) {
         val budget = wordsForSeconds(seconds)
         val p = when {
             beat == "weather" && !ctx.weather.isNullOrEmpty() ->
-                weatherPrompt(nxt, ctx, budget, allowSkip)
+                weatherPrompt(nxt, ctx, budget, allowSkip) + backAnnounceLine(prev)
             beat == "news" && !ctx.generalHeadline.isNullOrEmpty() ->
-                newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip, ctx)
+                newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip, ctx) + backAnnounceLine(prev)
             beat == "topic" && topic != null && !ctx.topicHeadlines[topic].isNullOrEmpty() ->
-                topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip, ctx)
+                topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip, ctx) + backAnnounceLine(prev)
             else ->
                 // song beat / fallback -> witty handoff (honors allowSkip too)
                 prompt(prev, nxt, budget, allowSkip, ctx)
         }
-        val raw = client.complete(p)
+        val raw = client.complete(p + flavorLine() + avoidLine())
         if (allowSkip && isSkip(raw)) return null
-        return finish(raw, budget)
+        val out = finish(raw, budget)
+        remember(out)
+        return out
     }
 }
