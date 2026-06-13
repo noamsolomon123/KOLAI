@@ -190,6 +190,21 @@ class DjBrain(
          *  line (BUG 1, dangling song name). Single-letter prefixes (ה/ו/ב/ל/מ)
          *  normally attach to the next word, so a lone trailing one is broken. */
         val DANGLING_CONNECTORS = setOf("עם", "של", "את", "ה", "ו", "ב", "ל", "מ")
+        /**
+         * STRONG (full-word) connectors that, in a naming clause, MUST be
+         * followed by an actual song/artist NAME ("<עם/את> <שם> של <אמן>").
+         * The mid-line dropped-name class (findings-djtext-v3, ~9%) is exactly
+         * one of these sitting where the name should be - adjacent to ANOTHER
+         * connector ("של של" / "של עם"), to a comma/maqaf/empty slot
+         * ("קבל את של, ...", "...ילד של -,"), or to a stripped-Latin-title prefix
+         * ("תגביר ל- של"). A legit "<title> של <artist>" never trips this: its
+         * של is wedged between two REAL name tokens, neither of which is itself
+         * a connector or a bare punctuation slot. Single-letter prefixes
+         * (ה/ו/ב/ל/מ) are deliberately NOT here - a sentence legitimately starts
+         * many words with them; only a prefix written as a maqaf stub ("ל-")
+         * with nothing real after it counts (see isPrefixStub).
+         */
+        val STRONG_CONNECTORS = setOf("של", "עם", "את")
 
         // ---- anti-repetition ring sizes (enlarged 2026-06-13, diversity fix) --
         // The study found 75% of scripts share their FIRST WORD: the old ring
@@ -651,6 +666,11 @@ class DjBrain(
             val b = wholeTokens[k + 1].trim('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—')
             if (a == "עם" && b == "של") return true
         }
+        // v3 MID-LINE dropped-name class (findings-djtext-v3): a strong connector
+        // (of/with/the-direct-object) sitting where the NAME should be - adjacent to
+        // another connector, to a comma/maqaf/empty slot, or after a stripped-Latin-
+        // title prefix stub. Guarded against the legit "<title> connector <artist>".
+        if (midLineDroppedName(line)) return true
         // whole-line end-dangling check.
         if (isEndDangling(line)) return true
         // GAP 1: per-sentence scan - flag if ANY segment is itself end-dangling,
@@ -660,6 +680,84 @@ class DjBrain(
             for (seg in segments) if (isEndDangling(seg)) return true
         }
         return false
+    }
+
+    /**
+     * NEW (2026-06-13, findings-djtext-v3 MID-LINE class): pure, regex-free
+     * whole-token scan for a strong connector ([STRONG_CONNECTORS]: של/עם/את)
+     * sitting where a dropped song/artist NAME should be. Flags ONLY the shapes
+     * where the name is provably gone, never the legit "<title> של <artist>":
+     *   - a strong connector IMMEDIATELY followed by ANOTHER strong connector
+     *     ("של של", "של עם", "את של" - the name between them vanished),
+     *   - a strong connector IMMEDIATELY followed by a bare punctuation slot
+     *     (a token that is ONLY comma/maqaf/dash after trimming, e.g. seq 116
+     *     "...ילד של -, מין") - the slot is where the stripped name was,
+     *   - a strong connector whose own token carries a TRAILING comma and is
+     *     NOT followed by a real name on the same clause (seq 89 "קבל את של,
+     *     אולי...") - "<connector>," mid-sentence has no name attached,
+     *   - a maqaf-prefix STUB ("ל-", "ה-", "ב-" ... a single Hebrew prefix
+     *     letter glued to a dash, left when clean() stripped the Latin title)
+     *     IMMEDIATELY followed by a strong connector (seq 90 "תגביר ל- של") or
+     *     by end / a bare punctuation slot.
+     * FALSE-POSITIVE GUARD: a connector is flagged ONLY when its neighbor is
+     * itself a connector, a prefix stub, or a pure-punctuation slot. In the
+     * legit "<title> של <artist>" both neighbors of של are REAL name tokens
+     * (letters, not connectors, not bare punctuation), so it is never flagged.
+     * No ICU regex - indexOf / char scanning only (Android constraint).
+     */
+    private fun midLineDroppedName(line: String): Boolean {
+        val toks = line.split(' ', '\t', '\n', '\r').filter { it.isNotEmpty() }
+        val edge = charArrayOf('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—', '&', ' ')
+        for (k in toks.indices) {
+            val rawA = toks[k]
+            val a = rawA.trim(*edge)
+            // (1) a strong connector whose OWN token ends on a comma and is not
+            //     followed by a real name on this clause -> "<connector>," (seq 89).
+            if (a in STRONG_CONNECTORS && rawA.trimEnd('.', '!', '?', '…', ' ').endsWith(",")) {
+                val next = if (k + 1 < toks.size) toks[k + 1].trim(*edge) else ""
+                if (next.isEmpty() || next in STRONG_CONNECTORS || isPrefixStub(toks[k + 1])) return true
+            }
+            if (k + 1 >= toks.size) continue
+            val rawB = toks[k + 1]
+            val b = rawB.trim(*edge)
+            // (2) strong connector immediately followed by ANOTHER strong
+            //     connector ("של של" / "של עם" / "את של").
+            if (a in STRONG_CONNECTORS && b in STRONG_CONNECTORS) return true
+            // (3) strong connector immediately followed by a BARE punctuation slot
+            //     (token reduces to nothing once edge punctuation is trimmed),
+            //     e.g. "של -," (seq 116). The slot is the missing name.
+            if (a in STRONG_CONNECTORS && b.isEmpty() && rawB.isNotEmpty()) return true
+            // (4) a maqaf-prefix stub ("ל-"/"ה-"/...) followed by a strong
+            //     connector or a bare slot (seq 90 "תגביר ל- של").
+            if (isPrefixStub(rawA)) {
+                if (b in STRONG_CONNECTORS) return true
+                if (b.isEmpty() && rawB.isNotEmpty()) return true
+            }
+        }
+        // (4b) a prefix stub at the very END (nothing real after it).
+        if (toks.isNotEmpty() && isPrefixStub(toks.last())) return true
+        return false
+    }
+
+    /**
+     * NEW (findings-djtext-v3 helper): true when [token] is a Hebrew
+     * single-letter prefix glued to a maqaf/dash and NOTHING else - e.g. "ל-",
+     * "ה-", "ב-", "מ-", "ו-" (optionally with trailing punctuation). clean()
+     * leaves these stubs behind when it strips a Latin title that the prefix was
+     * attached to ("ל-Language" -> "ל-"). A normal prefixed Hebrew word
+     * ("להקה") is NOT a stub: it has letters after the prefix, not a dash.
+     * Pure char scan, no regex.
+     */
+    private fun isPrefixStub(token: String): Boolean {
+        val prefixes = "הובלמ"
+        val t = token.trimEnd('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', ' ')
+        if (t.length < 2) return false
+        if (prefixes.indexOf(t[0]) < 0) return false
+        for (i in 1 until t.length) {
+            val c = t[i]
+            if (c != '-' && c != '–' && c != '—') return false
+        }
+        return true
     }
 
     /**
@@ -869,7 +967,14 @@ class DjBrain(
         allowSkip: Boolean = false,
     ): String? {
         val budget = wordsForSeconds(seconds)
-        var isNaming = false
+        // ALL writeBreak beats name the upcoming song (the weather/news/topic
+        // prompts each carry "השיר הבא: <title> של <artist>", and the song
+        // fallback is the explicit handoff), so EVERY branch can produce a
+        // dropped/dangling name. v3 FIX: route them ALL through deDangleNaming,
+        // not just the song fallback (findings-djtext-v3 flagged unguarded
+        // weather/news dangles, seq 87/226/234). SKIP semantics are unchanged:
+        // the allowSkip/isSkip check below still short-circuits before any
+        // de-dangle, so a SKIP beat returns null exactly as before.
         val p = when {
             beat == "weather" && !ctx.weather.isNullOrEmpty() ->
                 weatherPrompt(nxt, ctx, budget, allowSkip) + backAnnounceLine(prev)
@@ -877,18 +982,15 @@ class DjBrain(
                 newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip, ctx) + backAnnounceLine(prev)
             beat == "topic" && topic != null && !ctx.topicHeadlines[topic].isNullOrEmpty() ->
                 topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip, ctx) + backAnnounceLine(prev)
-            else -> {
+            else ->
                 // song beat / fallback -> witty handoff (honors allowSkip too).
-                // This is the naming beat, so it gets the dangling-name guard.
-                isNaming = true
                 prompt(prev, nxt, budget, allowSkip, ctx)
-            }
         }
         val base = p + flavorLine(ctx) + avoidLine()
         val raw = client.complete(base, CREATIVE_TEMP)
         if (allowSkip && isSkip(raw)) return null
-        var out = finish(raw, budget)
-        if (isNaming) out = deDangleNaming(out, base, budget)
+        // every beat is a naming beat -> guard the output against a dropped name.
+        val out = deDangleNaming(finish(raw, budget), base, budget)
         remember(out)
         return out
     }

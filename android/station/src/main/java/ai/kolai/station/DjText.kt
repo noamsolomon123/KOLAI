@@ -44,6 +44,7 @@ private val DIRECTION_LINE = Regex(
 private val CODE_FENCE = Regex("```[a-zA-Z]*")
 private val PARENTHETICAL = Regex("[\\(\\[\\{][^\\)\\]\\}]*[\\)\\]\\}]")
 private val LATIN = Regex("[A-Za-z]+")
+
 private val SPACE_BEFORE_PUNCT = Regex("\\s+([,\\.\\!\\?…:;])")
 private val MULTISPACE = Regex("\\s{2,}")
 
@@ -61,6 +62,70 @@ fun isSkip(text: String?): Boolean {
     if (text == null) return true
     val stripped = SKIP_STRIP.replace(text, "").uppercase()
     return stripped == SKIP_TOKEN
+}
+
+/**
+ * NEW (2026-06-13, findings-djtext-v3 ROOT-FIX of the mid-line dropped-name
+ * class): reconcile the old blanket Latin strip with the dangling-name bug.
+ *
+ * The original code did LATIN.replace(t, " ") - it deleted EVERY Latin run so
+ * the Hebrew TTS never tried to read English letters. But that also deleted the
+ * NAME of an intl (Latin-titled) song the DJ was announcing, collapsing
+ * "תגביר ל-Language של ..." into the dangling connector skeleton "תגביר ל- של".
+ * The v3 250-song study traced ~9% of scripts to exactly this.
+ *
+ * TRADEOFF CHOSEN: keep a Latin run ONLY when it sits in the NAME slot of a
+ * naming clause - i.e. the token is glued to a Hebrew maqaf-prefix ("ל-Language",
+ * "ה-Beatles") OR its immediate neighbor is a strong Hebrew connector
+ * (של / עם / את), where a real song/artist name belongs. A TTS reading an
+ * English NAME aloud is far better than airing a meaningless "של של" skeleton.
+ * STRAY leaked English (a word with no connector/prefix context, e.g. a leftover
+ * "world", or a fully-English line) is still stripped, preserving the original
+ * "don't read leaked English" intent. (Parenthetical English notes are removed
+ * upstream in clean() before we get here.)
+ *
+ * Pure scan, no Unicode-aware regex (Android ICU constraint): we test chars
+ * against the Hebrew block and the ASCII [A-Za-z] range directly, and only the
+ * KEPT tokens are passed through untouched - all other tokens still go through
+ * the original LATIN strip.
+ */
+private val STRONG_CONNECTOR_TOKENS = setOf("של", "עם", "את")
+private val LATIN_PREFIX_LETTERS = "הובלמ"
+
+private fun tokenHasLatin(tok: String): Boolean = tok.any { it in 'A'..'Z' || it in 'a'..'z' }
+
+/** A token like "ל-Language" / "ה-Beatles": a Hebrew prefix, a maqaf/dash, then Latin. */
+private fun isPrefixedLatinName(tok: String): Boolean {
+    if (tok.length < 3) return false
+    if (LATIN_PREFIX_LETTERS.indexOf(tok[0]) < 0) return false
+    if (tok[1] != '-' && tok[1] != '–' && tok[1] != '—') return false
+    return tok.substring(2).any { it in 'A'..'Z' || it in 'a'..'z' }
+}
+
+/** The bare word of a token, with edge punctuation/quotes/maqaf trimmed. */
+private fun bareToken(tok: String): String =
+    tok.trim('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—', '&', ' ')
+
+private fun stripStrayLatin(t: String): String {
+    val tokens = t.split(' ')
+    val out = StringBuilder()
+    for (i in tokens.indices) {
+        if (i > 0) out.append(' ')
+        val tok = tokens[i]
+        if (tok.isEmpty() || !tokenHasLatin(tok)) {
+            // no Latin in this token - emit verbatim (Hebrew / digits / punct).
+            out.append(tok)
+            continue
+        }
+        val prev = if (i > 0) bareToken(tokens[i - 1]) else ""
+        val next = if (i + 1 < tokens.size) bareToken(tokens[i + 1]) else ""
+        val isName = isPrefixedLatinName(tok) ||
+            prev in STRONG_CONNECTOR_TOKENS ||
+            next in STRONG_CONNECTOR_TOKENS
+        // KEEP a Latin NAME token in the connector slot; STRIP stray English.
+        out.append(if (isName) tok else LATIN.replace(tok, " "))
+    }
+    return out.toString()
 }
 
 /**
@@ -89,8 +154,10 @@ fun clean(text: String?): String {
     t = t.replace("“", " ").replace("”", " ")
     t = t.replace("‘", " ").replace("’", "'")
     t = t.replace("\"", " ").replace("`", " ")
-    // remove leaked latin words / stray english (keep Hebrew, digits, punctuation)
-    t = LATIN.replace(t, " ")
+    // remove leaked latin words / stray english ONLY on all-Latin lines; keep an
+    // intl song/artist NAME embedded inside a Hebrew utterance (findings-djtext-v3
+    // root-fix: deleting the name produced the dangling connector skeleton).
+    t = stripStrayLatin(t)
     // tidy whitespace and dangling punctuation
     t = SPACE_BEFORE_PUNCT.replace(t) { m -> m.groupValues[1] }
     t = MULTISPACE.replace(t, " ").trim()

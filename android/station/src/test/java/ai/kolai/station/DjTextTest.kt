@@ -109,4 +109,53 @@ class DjTextTest {
         val out = finish(input, budget = 2)
         assertEquals("אחת שתיים", out)
     }
+
+    // ---- findings-djtext-v3: clean() keeps an intl NAME, not a skeleton -------
+
+    @Test
+    fun clean_keeps_prefixed_intl_title_instead_of_dangling_skeleton() {
+        // seq-90 root shape: "תגביר ל-Language של רדיוהד". Pre-fix clean() stripped
+        // "Language" leaving "תגביר ל- של רדיוהד" - a dangling connector skeleton.
+        // Now the prefixed Latin NAME survives so the name is not dropped.
+        val out = clean("תגביר ל-Language של רדיוהד, תהנה")
+        assertTrue("intl title must survive: '$out'", out.contains("Language"))
+        // and the result is NOT the empty connector skeleton.
+        assertFalse("must not collapse to 'ל- של': '$out'", out.contains("ל- של"))
+        assertTrue("Hebrew context kept", out.contains("רדיוהד"))
+    }
+
+    @Test
+    fun clean_keeps_intl_title_adjacent_to_connector() {
+        // "עכשיו עולה Creep של רדיוהד" - the Latin run sits in the name slot
+        // (right after the connector context), so it is KEPT.
+        val out = clean("עכשיו עולה Creep של רדיוהד")
+        assertTrue("intl title must survive: '$out'", out.contains("Creep"))
+        assertTrue(out.contains("רדיוהד"))
+    }
+
+    @Test
+    fun clean_still_strips_stray_leaked_english_inside_hebrew() {
+        // a leaked English word NOT in a name slot (no connector/prefix context)
+        // is still scrubbed, exactly as before.
+        val out = clean("שלום world עולם")
+        assertFalse("stray english must be stripped: '$out'", out.any { it in 'A'..'Z' || it in 'a'..'z' })
+        assertTrue(out.contains("שלום"))
+        assertTrue(out.contains("עולם"))
+    }
+
+    @Test
+    fun clean_still_strips_parenthetical_english_note_and_stray_word() {
+        // the original guard test shape: a parenthetical English note plus a stray
+        // "world" must leave NO latin (note removed upstream, world is stray).
+        val out = clean("**שלום** (note: english) world! `x`")
+        assertFalse("latin leaked: '$out'", out.any { it in 'A'..'Z' || it in 'a'..'z' })
+        assertTrue("Hebrew lost: '$out'", out.contains("שלום"))
+    }
+
+    @Test
+    fun clean_strips_latin_on_fully_english_line() {
+        // a line with NO Hebrew and no connector slot -> all latin scrubbed.
+        val out = clean("hello world")
+        assertFalse("no latin should survive a pure-english line: '$out'", out.any { it in 'A'..'Z' || it in 'a'..'z' })
+    }
 }

@@ -1563,4 +1563,116 @@ class DjBrainTest {
         assertEquals("A", turns.last().first)
         turns.forEach { (_, t) -> assertFalse("turn must not dangle: $t", brain.danglingName(t)) }
     }
+
+    // ---- findings-djtext-v3: MID-LINE dropped-name class (2026-06-13) --------
+
+    @Test
+    fun danglingName_true_for_midline_strong_connector_pairs() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // "של של" adjacency (seq 137) - the name between two connectors vanished.
+        assertTrue(brain.danglingName("השקט בחדר כבד, אז אולי המפלצות של של יגרשו את הצללים."))
+        // "של עם" adjacency (seq 163).
+        assertTrue(brain.danglingName("יובי עשה פה בלאגן, אז הנה של עם וייב אופטימי ומעיף."))
+        // a bare two-token pair on its own.
+        assertTrue(brain.danglingName("של של"))
+        assertTrue(brain.danglingName("של עם"))
+        assertTrue(brain.danglingName("את של"))
+    }
+
+    @Test
+    fun danglingName_true_for_midline_connector_then_comma_or_maqaf() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // connector + comma mid-sentence (seq 89): "קבל את של, אולי..." - the
+        // את is immediately followed by של, and של carries a trailing comma with
+        // no name attached.
+        assertTrue(brain.danglingName("מישהו כאן נשבר בדרך. קבל את של, אולי זה יאחה לך את הלב."))
+        // "של -," maqaf with stripped name (seq 116): connector then a bare
+        // punctuation slot.
+        assertTrue(brain.danglingName("נצלול למחשבות של פעם לפני שחלמתי על ילד של -, מין רגע נוסטלגי."))
+        // a connector ending the line on a trailing comma slot.
+        assertTrue(brain.danglingName("עכשיו עולה של,"))
+    }
+
+    @Test
+    fun danglingName_true_for_midline_prefix_stub_then_connector() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // "ל- של" after a stripped Latin title (seq 90).
+        assertTrue(brain.danglingName("הגיע הזמן לדבר באמת: תגביר ל- של, השיר שחיכית לו."))
+        // a prefix stub at the very end (nothing real after it).
+        assertTrue(brain.danglingName("עכשיו עולה השיר ל-"))
+        // prefix stub immediately followed by a strong connector, no comma.
+        assertTrue(brain.danglingName("תקשיב ל- של רדיוהד"))
+    }
+
+    @Test
+    fun danglingName_false_for_legit_named_lines_no_midline_false_positive() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // legit "<title> של <artist>": של wedged between two REAL name tokens.
+        assertFalse(brain.danglingName("עכשיו עולה קריפ של רדיוהד, תהנה."))
+        assertFalse(brain.danglingName("בוא תקשיב לאישהשלי של צוקוש"))
+        // "<עם> <real title> <של> <real artist>" - the fully-named happy path.
+        assertFalse(brain.danglingName("נסגור את הסט עם ווה של אומה ת'רמן, ענק."))
+        // את followed by a REAL object word, not by a connector/slot.
+        assertFalse(brain.danglingName("בוא נשמע את עומר אדם עכשיו."))
+        assertFalse(brain.danglingName("קח את הזמן שלך ותהנה מהשיר הבא."))
+        // a normal prefixed Hebrew word ("להקה") is NOT a prefix stub.
+        assertFalse(brain.danglingName("זאת להקה של ענקים, תהנה."))
+        // a clean multi-sentence line with no naming defect.
+        assertFalse(brain.danglingName("בוקר טוב לך. איזה כיף שהצטרפת אלינו עכשיו."))
+        assertFalse(brain.danglingName(""))
+        assertFalse(brain.danglingName(null))
+    }
+
+    // ---- findings-djtext-v3: weather / news beats now de-dangled -------------
+
+    @Test
+    fun weather_beat_dangling_output_is_repaired_or_regenerated() = runTest {
+        // seq 87 shape: a weather beat ending on a bare "של". Pre-fix the weather
+        // beat was UNGUARDED; now writeBreak routes every beat through the guard.
+        val client = FakeLlmClient(listOf("עזוב את המפלצות, בוא נדבר בשפה של", "שמונה עשרה מעלות, תהנה מהקצב של רדיוהד"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "07:40", partOfDay = "בוקר", weather = "שמש משוגעת")
+        val out = brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        assertNotNull(out)
+        assertFalse("weather beat must not air a dangling name: $out", brain.danglingName(out))
+        assertEquals("a dangling weather beat must regenerate once", 2, client.prompts.size)
+        assertTrue("retry prompt carries the sharper instruction",
+            client.prompts[1].contains("כתוב משפט שלם שכולל את שם השיר המלא"))
+    }
+
+    @Test
+    fun news_beat_dangling_output_is_repaired_or_regenerated() = runTest {
+        // seq 234 shape: a news beat ending on a bare "של".
+        val client = FakeLlmClient(listOf("עם תקציב התחבורה נגיע לעומר אדם, כי זו תהיה מהפכה של", "תקציב חדש, ותהנה עכשיו מקריפ של רדיוהד"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(generalHeadline = "הממשלה הזרימה כסף לתחבורה")
+        val out = brain.writeBreak(prev, nxt, beat = "news", ctx = ctx, seconds = 8.0)
+        assertNotNull(out)
+        assertFalse("news beat must not air a dangling name: $out", brain.danglingName(out))
+        assertEquals(2, client.prompts.size)
+    }
+
+    @Test
+    fun weather_beat_clean_output_passes_through_without_regen() = runTest {
+        // a clean weather line must NOT trigger an extra LLM call (default path
+        // stays byte-identical to before the de-dangle was added to this beat).
+        val client = FakeLlmClient(listOf("שמונה בבוקר, שמש נעימה - הנה קריפ של רדיוהד, תהנה."))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי")
+        val out = brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        assertEquals("שמונה בבוקר, שמש נעימה - הנה קריפ של רדיוהד, תהנה.", out)
+        assertEquals("clean weather beat must not retry", 1, client.prompts.size)
+    }
+
+    @Test
+    fun weather_beat_skip_still_returns_null_before_dedangle() = runTest {
+        // SKIP semantics intact: a SKIP weather beat returns null without any
+        // de-dangle attempt.
+        val client = FakeLlmClient(listOf("SKIP"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי")
+        val out = brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0, allowSkip = true)
+        assertNull(out)
+        assertEquals("SKIP must not trigger a regen", 1, client.prompts.size)
+    }
 }
