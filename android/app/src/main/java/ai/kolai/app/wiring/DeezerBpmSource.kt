@@ -6,6 +6,11 @@ import ai.kolai.station.parseDeezerTrackId
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 
@@ -29,9 +34,21 @@ import java.util.concurrent.ConcurrentHashMap
  * (positive AND negative: a confirmed-unknown is cached as a tombstone so we do
  * not re-query a song with no Deezer BPM). Logging goes through the JVM-safe
  * helper (android.util.Log is a stub that THROWS on the plain JVM).
+ *
+ * NON-BLOCKING (2026-06-13): so the planner''s plan() never suspends on the
+ * network, this source also offers a SYNCHRONOUS cache read ([cachedBpm], instant
+ * / null on a cold miss) and a fire-and-forget [warm] that resolves in the
+ * BACKGROUND on an internal [Dispatchers.IO] scope. [warm] dedupes in-flight keys
+ * via [inFlight] so a re-fired key launches at most one resolve, and -- like
+ * [bpm] -- it never throws. The cache (positive + negative tombstone) is the
+ * single source of truth shared by all three entry points.
  */
 class DeezerBpmSource(
     private val http: HttpClient,
+    /** Background scope for [warm]; defaults to a daemon SupervisorJob on IO so a
+     *  single warm failure never cancels siblings and the app need not manage a
+     *  lifecycle. Inject one in tests to control / await background work. */
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) : BpmSource {
 
     /** "artistLower|titleLower" -> resolved BPM. NULL VALUE = a cached "unknown"
@@ -39,9 +56,16 @@ class DeezerBpmSource(
      *  it. ConcurrentHashMap forbids null values, so the tombstone is [UNKNOWN]. */
     private val cache = ConcurrentHashMap<String, Double>()
 
+    /** Keys with a [warm] resolve currently launched, so a re-fire does not start
+     *  a second round-trip for the same song. Cleared once the resolve stores. */
+    private val inFlight = ConcurrentHashMap.newKeySet<String>()
+
+    private fun keyOf(artist: String, title: String): String =
+        artist.trim().lowercase() + "|" + title.trim().lowercase()
+
     override suspend fun bpm(artist: String, title: String): Double? {
         if (title.isBlank()) return null
-        val key = (artist.trim().lowercase() + "|" + title.trim().lowercase())
+        val key = keyOf(artist, title)
         cache[key]?.let { return if (it == UNKNOWN) null else it }
 
         val resolved = try {
@@ -53,6 +77,40 @@ class DeezerBpmSource(
         cache[key] = resolved ?: UNKNOWN
         if (resolved != null) logI("bpm '$title' - $artist = $resolved")
         return resolved
+    }
+
+    /** SYNCHRONOUS cache-only read: the resolved BPM, or null on a cold miss /
+     *  tombstone. Never touches the network, never throws. */
+    override fun cachedBpm(artist: String, title: String): Double? {
+        if (title.isBlank()) return null
+        val v = cache[keyOf(artist, title)] ?: return null
+        return if (v == UNKNOWN) null else v
+    }
+
+    /** Fire-and-forget background resolve: launches at most one network resolve
+     *  per uncached, not-in-flight key; stores the result (or a tombstone) so a
+     *  later [cachedBpm] hits. Never blocks, never throws. */
+    override fun warm(artist: String, title: String) {
+        if (title.isBlank()) return
+        val key = keyOf(artist, title)
+        if (cache.containsKey(key)) return            // already resolved (pos/neg)
+        if (!inFlight.add(key)) return                // a resolve is already running
+        scope.launch {
+            val resolved = try {
+                resolveBpm(artist, title)
+            } catch (e: Exception) {
+                null // best-effort; a warm failure is just a cached unknown
+            }
+            cache[key] = resolved ?: UNKNOWN
+            inFlight.remove(key)
+            if (resolved != null) logI("warm bpm '$title' - $artist = $resolved")
+        }
+    }
+
+    /** Cancel the background warm scope; call from a lifecycle hook if one exists
+     *  (the default daemon SupervisorJob is otherwise fine to leave running). */
+    fun close() {
+        try { scope.cancel() } catch (_: Throwable) { }
     }
 
     /** /search/track -> id -> /track/{id} -> bpm (>0), or null. */

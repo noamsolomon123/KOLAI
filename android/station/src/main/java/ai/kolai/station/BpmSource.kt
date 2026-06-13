@@ -25,14 +25,42 @@ package ai.kolai.station
  * RESILIENCE: like [DiscoverySource], implementations MUST be best-effort and
  * MUST NOT throw -- a timeout/network/parse failure simply yields null (treated
  * as "unknown BPM").
+ *
+ * NON-BLOCKING SONG PICKING (2026-06-13): a live device test showed that AWAITING
+ * a pile of cold-cache Deezer round-trips inside plan() slowed a 2-song block to
+ * ~100s, widening the "skip has no next block" window and risking a buffer
+ * underrun. So the planner no longer suspends on the network: it reads
+ * [cachedBpm] SYNCHRONOUSLY (instant; null on a cold cache) and fires [warm] to
+ * populate the cache in the BACKGROUND for next time. Tempo cohesion then builds
+ * up over the session instead of blocking each pick. The suspending [bpm] is kept
+ * for tests and any caller that genuinely wants to await a resolve.
  */
-fun interface BpmSource {
+interface BpmSource {
     /**
      * The track''s tempo in beats-per-minute, or null when unknown (no match,
-     * catalog bpm of 0, network failure). MUST never throw.
+     * catalog bpm of 0, network failure). MUST never throw. SUSPENDS on the
+     * network for a cold-cache lookup -- prefer [cachedBpm] + [warm] on any
+     * latency-sensitive path (e.g. song picking).
      *
      * @param artist the song''s artist (used to disambiguate the catalog match).
      * @param title the song''s title.
      */
     suspend fun bpm(artist: String, title: String): Double?
+
+    /**
+     * SYNCHRONOUS, cache-only tempo: the already-resolved BPM for the track, or
+     * null when it is not yet in the cache (a cold miss -- fire [warm] to fill it
+     * for next time) OR is a confirmed-unknown tombstone. NEVER touches the
+     * network, NEVER suspends, NEVER throws. The default returns null so simple
+     * (e.g. test) implementations need not override it.
+     */
+    fun cachedBpm(artist: String, title: String): Double? = null
+
+    /**
+     * Fire-and-forget: if [artist]/[title] is not already cached (or in-flight),
+     * resolve its BPM in the BACKGROUND and store the result (or a negative
+     * tombstone) so a LATER [cachedBpm] hits. Dedupes concurrent requests for the
+     * same key, never blocks the caller, and never throws. A no-op by default.
+     */
+    fun warm(artist: String, title: String) {}
 }

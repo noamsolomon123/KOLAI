@@ -43,9 +43,17 @@ class KolaiEngine private constructor(
     // planner's run-length easing (so a genre run ends organically). Same instance
     // wired into TastePoolPlanner below, so its cache is shared.
     val genreSource: GenreSource,
+    // Concrete Deezer sources held so their BACKGROUND warm scopes (used for the
+    // planner''s non-blocking BPM/genre cache warming) are cancelled on close().
+    // genreSource above is the same instance, exposed as the interface for the
+    // RollingPlanner labelling; these are the concrete handles for lifecycle.
+    private val bpmSourceImpl: DeezerBpmSource,
+    private val genreSourceImpl: DeezerGenreSource,
 ) {
-    /** Release the underlying HTTP engine. */
+    /** Release the underlying HTTP engine and the background warm scopes. */
     fun close() {
+        try { bpmSourceImpl.close() } catch (_: Throwable) { }
+        try { genreSourceImpl.close() } catch (_: Throwable) { }
         httpClient.close()
     }
 
@@ -191,6 +199,8 @@ class KolaiEngine private constructor(
                 blocksDir = blocksDir,
                 cacheDir = cacheDir,
                 genreSource = genreSource,
+                bpmSourceImpl = bpmSource,
+                genreSourceImpl = genreSource,
             )
         }
     }

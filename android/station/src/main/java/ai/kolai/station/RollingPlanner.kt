@@ -40,9 +40,11 @@ import java.io.File
  * @param genreSource optional [GenreSource] used ONLY to LABEL the songs this
  *   planner returns (so the recentGenres run history is accurate); null leaves
  *   the genre history empty (language cohesion still works -- it needs no
- *   lookup). Best-effort and never throws; a lookup failure simply records no
- *   genre for that song. NOT the planner''s own cohesion source -- that is wired
- *   separately into [TastePoolPlanner].
+ *   lookup). NON-BLOCKING: the label is a CACHE-ONLY read (cachedGenre) and a
+ *   cold miss fires a fire-and-forget warm -- nextSongs never suspends on the
+ *   genre network. Best-effort and never throws; a cold/unknown lookup records no
+ *   genre for that song (a run break that warms in). NOT the planner''s own
+ *   cohesion source -- that is wired separately into [TastePoolPlanner].
  * @param cohesionWindow how many recent genres/languages reach the planner.
  */
 class RollingPlanner(
@@ -185,9 +187,10 @@ class RollingPlanner(
             history.add(key(s))
             val artist = s.artist.trim().lowercase()
             if (artist.isNotEmpty()) artistHistory.add(artist)
-            // LANGUAGE is free (in-code); GENRE is a best-effort lookup so the
-            // run history is accurate. A null/unknown genre records a blank line
-            // (a run break) rather than nothing, keeping the histories aligned.
+            // LANGUAGE is free (in-code); GENRE is a CACHE-ONLY label (never
+            // blocks on the network -- a cold miss fires a background warm and
+            // records a blank line, a run break, that warms in over the session),
+            // keeping the histories aligned.
             languageHistory.add(if (containsHebrew(s.title)) "he" else "int")
             genreHistory.add(labelGenre(s).orEmpty())
         }
@@ -196,13 +199,21 @@ class RollingPlanner(
         return chosen
     }
 
-    /** Best-effort coarse genre of a played song via [genreSource]; null when no
-     *  source or any lookup problem (it must never break or stall selection). */
-    private suspend fun labelGenre(song: Song): String? {
+    /** Best-effort coarse genre of a played song via [genreSource], NON-BLOCKING:
+     *  reads the SYNCHRONOUS cache ([GenreSource.cachedGenre], instant) and, on a
+     *  cold MISS, fires a fire-and-forget [GenreSource.warm] so the label is ready
+     *  for a LATER play -- it NEVER suspends on the network here (a live device
+     *  test showed awaiting genre lookups stalled song picking). null when no
+     *  source, a cold/unknown cache, or any problem (it must never break or stall
+     *  selection). A cold miss therefore records a blank genre (a run break) that
+     *  warms in over the session. */
+    private fun labelGenre(song: Song): String? {
         val src = genreSource ?: return null
         if (song.title.isBlank()) return null
         return try {
-            src.genre(song.artist, song.title)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            val cached = src.cachedGenre(song.artist, song.title)
+            if (cached == null) src.warm(song.artist, song.title)
+            cached?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         } catch (e: Exception) {
             null
         }

@@ -649,23 +649,33 @@ class TastePoolPlannerTest {
 
     // --- TEMPO AWARENESS: BpmSource bias + seed smoothing + ordering ----------
 
-    /** Canned BPMs keyed by title (case-insensitive); counts DISTINCT lookups.
-     *  Any title not in the map returns null (= unknown = neutral), exercising
-     *  the coverage-gap path. NEVER throws. */
-    private class FakeBpm(private val byTitle: Map<String, Double?>) : BpmSource {
-        var calls = 0
-        val titlesSeen = mutableSetOf<String>()
+    /** Cache-aware fake: [warmCache] is the ALREADY-WARMED cache that the planner
+     *  reads SYNCHRONOUSLY via [cachedBpm] (a title absent / mapped to null = a
+     *  cold miss = neutral, exercising the coverage-gap path). The suspend [bpm]
+     *  is the BLOCKING path the planner must NEVER take -- it bumps
+     *  [blockingCalls] (asserted to stay 0). [warm] records the titles the planner
+     *  fired a background fill for. NEVER throws. */
+    private class FakeBpm(private val warmCache: Map<String, Double?> = emptyMap()) : BpmSource {
+        /** Bumped ONLY by the suspend (blocking) path -- must stay 0 inside plan(). */
+        var blockingCalls = 0
+        /** DISTINCT titles a background [warm] was fired for (cold misses). */
+        val warmed = linkedSetOf<String>()
+        /** Total [warm] invocations (incl. would-be dupes -- dedup is in warmed). */
+        var warmCalls = 0
         override suspend fun bpm(artist: String, title: String): Double? {
-            calls++
-            titlesSeen.add(title)
-            return byTitle[title]
+            blockingCalls++
+            return warmCache[title]
         }
+        override fun cachedBpm(artist: String, title: String): Double? = warmCache[title]
+        override fun warm(artist: String, title: String) { warmCalls++; warmed.add(title) }
     }
 
-    /** All-unknown source: every lookup returns null. */
+    /** All-unknown source: cachedBpm always null; the suspend path would also
+     *  return null. Records whether the BLOCKING path was ever taken. */
     private class NullBpm : BpmSource {
-        var calls = 0
-        override suspend fun bpm(artist: String, title: String): Double? { calls++; return null }
+        var blockingCalls = 0
+        override suspend fun bpm(artist: String, title: String): Double? { blockingCalls++; return null }
+        override fun cachedBpm(artist: String, title: String): Double? = null
     }
 
     @Test
@@ -794,11 +804,14 @@ class TastePoolPlannerTest {
             },
             topArtists = emptyList(),
         )
-        val fake = FakeBpm(emptyMap())
+        val fake = FakeBpm(emptyMap()) // cold cache -> every read misses -> warm
         TastePoolPlanner(rng = kotlin.random.Random(1), bpm = fake, bpmLookupCap = 30)
             .plan(big, n = 2, mood = "party")
-        assertTrue("calls=${fake.calls}", fake.calls <= 30)
-        assertEquals("distinct titles looked up", fake.titlesSeen.size, fake.calls) // no dup queries
+        // Non-blocking: plan() never takes the suspend path, it only fires WARMS,
+        // and the number of warms (candidate fills) is bounded by the cap.
+        assertEquals("plan must never block on the BPM network", 0, fake.blockingCalls)
+        assertTrue("warmCalls=${fake.warmCalls}", fake.warmCalls <= 30)
+        assertEquals("distinct titles warmed", fake.warmed.size, fake.warmCalls) // no dup warms
     }
 
     @Test
@@ -845,6 +858,146 @@ class TastePoolPlannerTest {
         }
     }
 
+    // --- NON-BLOCKING BPM/GENRE: cache-only reads + background warm ------------
+    // A live device test showed plan() AWAITING cold-cache Deezer round-trips
+    // stalled song picking. plan() must now read the SYNCHRONOUS cache and fire a
+    // background warm for misses -- it must NEVER take the suspending bpm()/genre()
+    // path. These fakes make the suspend path EXPLODE so any accidental await is
+    // caught loudly, while cachedX serves canned values + warm records misses.
+
+    /** Suspend bpm() THROWS (and would block): proves plan() never awaits it. */
+    private class ExplodingBpm(private val cached: Map<String, Double?> = emptyMap()) : BpmSource {
+        val warmed = linkedSetOf<String>()
+        override suspend fun bpm(artist: String, title: String): Double? =
+            throw AssertionError("plan() must NOT call the suspending bpm() path")
+        override fun cachedBpm(artist: String, title: String): Double? = cached[title]
+        override fun warm(artist: String, title: String) { warmed.add(title) }
+    }
+
+    /** Suspend genre() THROWS: proves plan() never awaits it. */
+    private class ExplodingGenre(private val cached: Map<String, String?> = emptyMap()) : GenreSource {
+        val warmed = linkedSetOf<String>()
+        override suspend fun genre(artist: String, title: String): String? =
+            throw AssertionError("plan() must NOT call the suspending genre() path")
+        override fun cachedGenre(artist: String, title: String): String? = cached[title]
+        override fun warm(artist: String, title: String) { warmed.add(title) }
+    }
+
+    @Test
+    fun plan_uses_cached_bpm_and_warms_misses_without_ever_awaiting_the_suspend_path() = runTest {
+        // Half the tempoTaste titles are pre-warmed (in cache), half are cold.
+        val warmCache = mapOf<String, Double?>(
+            "Fast A" to 130.0, "Fast B" to 130.0, "Fast C" to 130.0, "Fast D" to 130.0,
+        ) // the four "Slow X" are cold misses
+        val src = ExplodingBpm(warmCache)
+        // No throw == the suspend path was never taken. mood=party uses the window
+        // bias, which reads cachedBpm for every candidate.
+        val songs = TastePoolPlanner(rng = kotlin.random.Random(1), bpm = src)
+            .plan(tempoTaste, n = 2, mood = "party")
+        assertEquals(2, songs.size)
+        // The cold-miss titles were warmed for next time; warmed titles are cold ones.
+        assertTrue("expected the cold Slow tracks to be warmed", src.warmed.any { it.startsWith("Slow") })
+        assertTrue("warmed titles must be cold misses only",
+            src.warmed.none { it in warmCache.keys })
+    }
+
+    @Test
+    fun cold_bpm_cache_is_byte_identical_to_no_source_and_fires_warms() = runTest {
+        // A fully COLD cache must bias NOTHING -> the SAME picks the bpm-blind
+        // planner produces (neutral), while still firing warms for next time.
+        for (seed in 0 until 25) {
+            val cold = ExplodingBpm(emptyMap())
+            val withCold = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = cold)
+                .plan(mixedTaste, n = 6, mood = "party")
+            val base = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(mixedTaste, n = 6, mood = "party")
+            assertEquals("rng seed $seed", base, withCold)
+            assertTrue("cold cache must warm misses (rng $seed)", cold.warmed.isNotEmpty())
+        }
+    }
+
+    @Test
+    fun warm_bpm_cache_applies_the_window_bias() = runTest {
+        // A WARM cache (every candidate pre-resolved) tilts party toward in-window
+        // Fast tracks far more than the bpm-blind planner -- the suspend path is
+        // never touched (ExplodingBpm would throw).
+        val warmCache = tempoMap // all eight titles pre-warmed
+        var biasedFast = 0
+        var plainFast = 0
+        for (seed in 0 until 200) {
+            val withWarm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = ExplodingBpm(warmCache))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            if (withWarm.title.startsWith("Fast")) biasedFast++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            if (plain.title.startsWith("Fast")) plainFast++
+        }
+        assertTrue("biasedFast=$biasedFast", biasedFast >= 140)
+        assertTrue("biasedFast=$biasedFast plainFast=$plainFast", biasedFast > plainFast + 30)
+    }
+
+    @Test
+    fun bpm_warm_is_gated_off_the_cold_start_opener() = runTest {
+        // Same gating as before: a no-seed, n=1, no-window pick never peeks/warms.
+        val src = ExplodingBpm(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), bpm = src).plan(mixedTaste, n = 1)
+        assertTrue("opener must not warm bpm", src.warmed.isEmpty())
+    }
+
+    @Test
+    fun plan_uses_cached_genre_and_warms_misses_without_ever_awaiting_the_suspend_path() = runTest {
+        // Seed genre pre-warmed; candidate genres cold -> genre cohesion is neutral
+        // now but warms fire for next time. The suspend genre() must never run.
+        val warmCache = mapOf<String, String?>("Seed Banger" to "Rap/Hip Hop")
+        val src = ExplodingGenre(warmCache)
+        val songs = TastePoolPlanner(rng = kotlin.random.Random(1), genre = src)
+            .plan(genreTaste, n = 2, seed = Song(title = "Seed Banger", artist = "SeedMC"))
+        assertEquals(2, songs.size)
+        assertTrue("cold candidate genres must be warmed", src.warmed.isNotEmpty())
+    }
+
+    @Test
+    fun cold_genre_cache_neutral_genre_cohesion_but_fires_warms() = runTest {
+        // Seed genre KNOWN but candidate genres COLD -> genre cohesion cannot act
+        // (neutral). All-English pool -> language cohesion uniform. So rap is
+        // picked about as often as the genre-blind planner, and warms still fire.
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        val cold = ExplodingGenre(mapOf("Seed Banger" to "Rap/Hip Hop")) // candidates cold
+        var biasedRap = 0
+        for (seed in 0 until 200) {
+            val s = ExplodingGenre(mapOf("Seed Banger" to "Rap/Hip Hop"))
+            val withGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = s)
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (withGenre.title.startsWith("Rap")) biasedRap++
+        }
+        assertTrue("biasedRap=$biasedRap (expected ~100, cold = no genre bias)", biasedRap in 60..140)
+        // a single representative call warms the cold candidates
+        TastePoolPlanner(rng = kotlin.random.Random(1), genre = cold)
+            .plan(genreTaste, n = 1, seed = rapSeed)
+        assertTrue("cold genre cache must warm misses", cold.warmed.isNotEmpty())
+    }
+
+    @Test
+    fun warm_genre_cache_applies_genre_cohesion() = runTest {
+        // A WARM genre cache (candidates + seed pre-resolved) biases toward the
+        // seed''s rap genre far more than the genre-blind planner. ExplodingGenre
+        // proves the suspend path is never taken.
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        val warmCache = rapJazzMap + ("Seed Banger" to "Rap/Hip Hop")
+        var biasedRap = 0
+        var plainRap = 0
+        for (seed in 0 until 200) {
+            val withWarm = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = ExplodingGenre(warmCache))
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (withWarm.title.startsWith("Rap")) biasedRap++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (plain.title.startsWith("Rap")) plainRap++
+        }
+        assertTrue("biasedRap=$biasedRap", biasedRap >= 130)
+        assertTrue("biasedRap=$biasedRap plainRap=$plainRap", biasedRap > plainRap + 40)
+    }
+
     // --- SONG-FLOW COHESION: GenreSource language + genre runs ----------------
     // User ask: songs have a connection playing one after the other (rap songs,
     // jazz songs, english songs). When a GenreSource is wired the planner biases
@@ -853,16 +1006,22 @@ class TastePoolPlannerTest {
     // songs, so cohesion works ACROSS blocks via the seed; these tests exercise
     // the per-call bias that produces that chaining.
 
-    /** Canned coarse genres keyed by title; counts DISTINCT lookups. Unknown
-     *  titles return null (= neutral), exercising the coverage-gap path. */
-    private class FakeGenre(private val byTitle: Map<String, String?>) : GenreSource {
-        var calls = 0
-        val titlesSeen = mutableSetOf<String>()
+    /** Cache-aware fake: [warmCache] is the ALREADY-WARMED genre cache the planner
+     *  reads SYNCHRONOUSLY via [cachedGenre] (a title absent / mapped to null = a
+     *  cold miss = neutral, exercising the coverage-gap path). The suspend [genre]
+     *  is the BLOCKING path the planner must NEVER take -- it bumps [blockingCalls]
+     *  (asserted to stay 0). [warm] records the titles a background fill was fired
+     *  for. NEVER throws. */
+    private class FakeGenre(private val warmCache: Map<String, String?> = emptyMap()) : GenreSource {
+        var blockingCalls = 0
+        val warmed = linkedSetOf<String>()
+        var warmCalls = 0
         override suspend fun genre(artist: String, title: String): String? {
-            calls++
-            titlesSeen.add(title)
-            return byTitle[title]
+            blockingCalls++
+            return warmCache[title]
         }
+        override fun cachedGenre(artist: String, title: String): String? = warmCache[title]
+        override fun warm(artist: String, title: String) { warmCalls++; warmed.add(title) }
     }
 
     @Test
@@ -1033,19 +1192,26 @@ class TastePoolPlannerTest {
     fun genre_lookups_are_gated_off_the_cold_start_opener() = runTest {
         val fake = FakeGenre(emptyMap())
         TastePoolPlanner(rng = kotlin.random.Random(1), genre = fake).plan(mixedTaste, n = 1)
-        assertEquals("cold-start opener must not query the genre source", 0, fake.calls)
+        // Gating unchanged: the no-seed cold-start opener neither peeks the cache
+        // nor fires a warm, and never blocks.
+        assertEquals("opener must not warm the genre source", 0, fake.warmCalls)
+        assertEquals("opener must not block on the genre source", 0, fake.blockingCalls)
     }
 
     @Test
     fun genre_lookups_run_when_a_seed_exists_or_n_is_two() = runTest {
+        // Cold cache: a read misses, so the planner fires a background WARM (never
+        // the blocking suspend path) for the seed / candidates.
         val withSeed = FakeGenre(emptyMap())
         TastePoolPlanner(rng = kotlin.random.Random(1), genre = withSeed)
             .plan(mixedTaste, n = 1, seed = Song(title = "Yesterday", artist = "The Beatles"))
-        assertTrue("a seed should trigger genre lookups", withSeed.calls > 0)
+        assertTrue("a seed should trigger genre warms", withSeed.warmCalls > 0)
+        assertEquals("a seed must not block on genre", 0, withSeed.blockingCalls)
 
         val nTwo = FakeGenre(emptyMap())
         TastePoolPlanner(rng = kotlin.random.Random(1), genre = nTwo).plan(mixedTaste, n = 2)
-        assertTrue("n>=2 should trigger genre lookups", nTwo.calls > 0)
+        assertTrue("n>=2 should trigger genre warms", nTwo.warmCalls > 0)
+        assertEquals("n>=2 must not block on genre", 0, nTwo.blockingCalls)
     }
 
     @Test
@@ -1056,11 +1222,14 @@ class TastePoolPlannerTest {
             },
             topArtists = emptyList(),
         )
-        val fake = FakeGenre(emptyMap())
+        val fake = FakeGenre(emptyMap()) // cold cache -> every read misses -> warm
         TastePoolPlanner(rng = kotlin.random.Random(1), genre = fake, genreLookupCap = 30)
             .plan(big, n = 2, seed = Song(title = "Seed", artist = "Z"))
-        assertTrue("calls=" + fake.calls, fake.calls <= 31)
-        assertEquals("distinct titles looked up", fake.titlesSeen.size, fake.calls)
+        // Non-blocking: plan() fires WARMS (never the suspend path); the count is
+        // bounded by the cap (30 candidates) + the seed''s one extra fill.
+        assertEquals("plan must never block on the genre network", 0, fake.blockingCalls)
+        assertTrue("warmCalls=" + fake.warmCalls, fake.warmCalls <= 31)
+        assertEquals("distinct titles warmed", fake.warmed.size, fake.warmCalls)
     }
 
     @Test

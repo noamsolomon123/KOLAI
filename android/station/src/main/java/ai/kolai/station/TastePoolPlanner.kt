@@ -3,8 +3,6 @@ package ai.kolai.station
 import ai.kolai.core.Song
 import ai.kolai.core.taste.TasteProfile
 import ai.kolai.core.taste.TasteTrack
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 
 /**
  * True when [s] contains at least one Hebrew letter (the basic block א..ת).
@@ -53,6 +51,18 @@ internal fun containsHebrew(s: String): Boolean = s.any { it in 'א'..'ת' }
  *  - RELAX-WHEN-STARVED: prefer fresh picks, fall back to excluded (recently
  *    played) tracks rather than returning fewer than n songs.
  *
+ * NON-BLOCKING BPM/GENRE (2026-06-13): a live device test showed plan() AWAITING
+ * up to ~30 cold-cache Deezer round-trips per pick, slowing a 2-song block to
+ * ~100s and risking a buffer underrun. plan() therefore NO LONGER suspends on any
+ * BPM/genre network. It reads tempo/genre from the source''s SYNCHRONOUS
+ * cache-only accessors ([BpmSource.cachedBpm] / [GenreSource.cachedGenre]) and,
+ * for each cold MISS, fires a fire-and-forget [BpmSource.warm] / [GenreSource.warm]
+ * (capped per call) that fills the cache in the BACKGROUND for next time. The net
+ * effect: the FIRST plays are tempo/genre-NEUTRAL (the cache is cold), and
+ * cohesion/tempo bias WARMS IN over the session as the cache fills -- instead of
+ * blocking each pick. Everything else (weights, relaxation, epsilon, the >=2-song
+ * ordering pass -- which now uses the synchronously-known cand.bpm) is unchanged.
+ *
  * @param discovery optional real-catalog discovery source; null disables it.
  * @param rng injectable randomness; tests pass a seeded Random for determinism.
  * @param curator optional LLM mood curator; null disables mood bias entirely.
@@ -61,8 +71,9 @@ internal fun containsHebrew(s: String): Boolean = s.any { it in 'א'..'ת' }
  * @param bpm optional [BpmSource] for TEMPO AWARENESS; null disables every tempo
  *   behaviour. When wired it adds SOFT, multiplicative, never-shrinking tilts
  *   (per-mood BPM window bias, first-pick seed smoothing, an n>=2 ordering pass),
- *   all no-op on unknown BPM. See the field doc kept from the tempo change.
- * @param bpmLookupCap hard cap on candidate-pool BPM lookups per plan() call.
+ *   all no-op on unknown BPM. Reads are CACHE-ONLY (never blocking); cold misses
+ *   are warmed in the background, so tempo bias warms in over the session.
+ * @param bpmLookupCap hard cap on candidate-pool BPM reads/warms per plan() call.
  * @param genre optional [GenreSource] for SONG-FLOW COHESION -- the Spotify-like
  *   "songs are connected, one after another (rap songs, jazz songs, English
  *   songs)" behaviour. null (the default) DISABLES cohesion entirely: plan() then
@@ -72,8 +83,12 @@ internal fun containsHebrew(s: String): Boolean = s.any { it in 'א'..'ת' }
  *     - LANGUAGE COHESION (REVERSES the old alternation): the next pick is biased
  *       toward the SAME language as the seed (English->English, Hebrew->Hebrew),
  *       so the station settles into a language stretch instead of alternating.
+ *       Language is computed IN-CODE ([containsHebrew], free), so it applies on
+ *       the very first play -- it never waits on a cache.
  *     - GENRE COHESION: the next pick is biased toward the seed''s coarse genre
- *       (rap->rap, jazz->jazz) when both genres are known; unknown = neutral.
+ *       (rap->rap, jazz->jazz) when both genres are ALREADY WARMED (in cache);
+ *       unknown / not-yet-warmed = neutral. Genre cohesion thus WARMS IN over the
+ *       session as background warms fill the cache.
  *     - RUN-LENGTH EASING: a run that is still SHORT (<= [RUN_SHORT_MAX] same
  *       picks in a row, read from the recentGenres / recentLanguages history) gets
  *       the FULL cohesion boost; as the run grows the boost decays linearly to
@@ -87,10 +102,10 @@ internal fun containsHebrew(s: String): Boolean = s.any { it in 'א'..'ת' }
  *   by [RollingPlanner] to know how long the current stretch already is. All
  *   tilts are no-op on unknown genre/language and can never block or shrink a
  *   pick (a coverage gap degrades to neutral, never to an under-delivered list).
- * @param genreLookupCap hard cap on candidate-pool GENRE lookups per plan() call
- *   (highest-ranked first), bounding latency. The source caches across plans; the
- *   seed''s genre is one additional lookup outside this cap. Ignored when [genre]
- *   is null.
+ * @param genreLookupCap hard cap on candidate-pool GENRE reads/warms per plan()
+ *   call (highest-ranked first), bounding the number of background warms fired.
+ *   The source caches across plans; the seed''s genre is one additional read/warm
+ *   outside this cap. Ignored when [genre] is null.
  */
 class TastePoolPlanner(
     private val discovery: DiscoverySource? = null,
@@ -235,21 +250,29 @@ class TastePoolPlanner(
             }
         }
 
-        // --- TEMPO AWARENESS: bounded BPM lookups + per-mood window bias -----
+        // --- TEMPO AWARENESS: CACHE-ONLY reads + background warm -------------
+        // NON-BLOCKING (2026-06-13): plan() must never suspend on the BPM
+        // network. For the seed and each capped candidate we read the
+        // SYNCHRONOUS cache (cachedBpm, instant); on a cold MISS we fire a
+        // fire-and-forget warm() that fills the cache in the background for next
+        // time (capped to bpmLookupCap warms so we never launch a pile of
+        // coroutines). The per-mood window bias / seed smoothing / ordering pass
+        // then act ONLY on already-warmed BPMs -> the first plays are tempo
+        // neutral and tempo cohesion WARMS IN over the session. Gating is
+        // unchanged: skip entirely on the no-seed cold-start opener (no window,
+        // no seed, n<2 -> nothing to bias) so the first pick never even peeks.
         var seedBpm: Double? = null
         val spec = Moods.spec(mood)
         val moodWindow = spec.hasBpmWindow && spec.key == (mood ?: Moods.DEFAULT)
         val tempoActive = bpm != null && (moodWindow || seed != null || n >= 2)
         if (tempoActive) {
+            val src = bpm!!
             val lookupN = minOf(bpmLookupCap, pool.size)
-            coroutineScope {
-                val seedDef = seed?.takeIf { it.title.isNotBlank() }
-                    ?.let { s -> async { bpmOf(s.artist, s.title) } }
-                val candDefs = (0 until lookupN).map { i ->
-                    async { bpmOf(pool[i].track.artist, pool[i].track.title) }
-                }
-                seedBpm = seedDef?.await()
-                for (i in 0 until lookupN) pool[i].bpm = candDefs[i].await()
+            seedBpm = seed?.takeIf { it.title.isNotBlank() }?.let { s ->
+                readOrWarmBpm(src, s.artist, s.title)
+            }
+            for (i in 0 until lookupN) {
+                pool[i].bpm = readOrWarmBpm(src, pool[i].track.artist, pool[i].track.title)
             }
             if (moodWindow) {
                 val lo = spec.bpmLo!!
@@ -265,29 +288,28 @@ class TastePoolPlanner(
             }
         }
 
-        // --- SONG-FLOW COHESION: bounded GENRE lookups + run-length easing ---
+        // --- SONG-FLOW COHESION: CACHE-ONLY reads + background warm ----------
         // ONLY when a [genre] source is wired. Mirrors the BPM gating: skip the
-        // lookups entirely on the cold-start opener (no seed AND n<2 -> nothing
-        // to cohere WITH and no second pick to cohere INTO), so the most
-        // latency-sensitive first pick never waits on the network. When needed
-        // the lookups run CONCURRENTLY (one round-trip, not a serial loop),
-        // bounded to [genreLookupCap]; the source caches across plans. The seed
-        // genre/language anchor the cohesion; unknown genre stays NEUTRAL.
+        // reads/warms entirely on the cold-start opener (no seed AND n<2 ->
+        // nothing to cohere WITH and no second pick to cohere INTO), so the most
+        // latency-sensitive first pick never even peeks. When needed the genre is
+        // read from the SYNCHRONOUS cache (cachedGenre, instant); a cold MISS
+        // fires a fire-and-forget warm() (capped to genreLookupCap) that fills the
+        // cache in the background -> genre cohesion WARMS IN over the session.
+        // Language cohesion (in-code, free) is unaffected and applies immediately.
         var seedGenre: String? = null
         val cohesionActive = genre != null && (seed != null || n >= 2)
         // Seed language is known whenever a seed exists (computed in-code, free).
         val seedHebrew: Boolean? = seed?.takeIf { it.title.isNotBlank() }
             ?.let { containsHebrew(it.title) }
         if (cohesionActive) {
+            val src = genre!!
             val lookupN = minOf(genreLookupCap, pool.size)
-            coroutineScope {
-                val seedDef = seed?.takeIf { it.title.isNotBlank() }
-                    ?.let { s -> async { genreOf(s.artist, s.title) } }
-                val candDefs = (0 until lookupN).map { i ->
-                    async { genreOf(pool[i].track.artist, pool[i].track.title) }
-                }
-                seedGenre = seedDef?.await()
-                for (i in 0 until lookupN) pool[i].genre = candDefs[i].await()
+            seedGenre = seed?.takeIf { it.title.isNotBlank() }?.let { s ->
+                readOrWarmGenre(src, s.artist, s.title)
+            }
+            for (i in 0 until lookupN) {
+                pool[i].genre = readOrWarmGenre(src, pool[i].track.artist, pool[i].track.title)
             }
 
             // RUN-LENGTH EASING factors in [0,1]: 1 while the run is short,
@@ -307,7 +329,7 @@ class TastePoolPlanner(
 
             // GENRE COHESION (soft, multiplicative): boost candidates whose
             // genre EQUALS the seed''s, scaled by the run-length easing. Both
-            // genres must be known; unknown on either side -> neutral.
+            // genres must be KNOWN (already warmed); unknown / cold -> neutral.
             if (gNorm != null && genreEase > 0.0) {
                 val boost = 1.0 + (GENRE_COHESION_BOOST - 1.0) * genreEase
                 for (c in pool) {
@@ -318,8 +340,8 @@ class TastePoolPlanner(
             // LANGUAGE COHESION (soft, multiplicative; REVERSES the old
             // alternation): boost candidates in the SAME language as the seed,
             // scaled by the run-length easing. Seed language is always known
-            // when a seed exists, so this is the workhorse of "English songs,
-            // then Hebrew songs" runs.
+            // when a seed exists (in-code), so this is the workhorse of "English
+            // songs, then Hebrew songs" runs -- and it never waits on a cache.
             if (seedHebrew != null && langEase > 0.0) {
                 val boost = 1.0 + (LANG_COHESION_BOOST - 1.0) * langEase
                 for (c in pool) {
@@ -435,6 +457,39 @@ class TastePoolPlanner(
     private fun sg(g: String?): String? = g?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
 
     /**
+     * SYNCHRONOUS, NON-BLOCKING tempo read: return the cached BPM if it is warm,
+     * else fire a background [BpmSource.warm] (for next time) and return null
+     * (NEUTRAL now). Blank titles are skipped. NEVER suspends, NEVER throws.
+     */
+    private fun readOrWarmBpm(src: BpmSource, artist: String, title: String): Double? {
+        if (title.isBlank()) return null
+        return try {
+            val cached = src.cachedBpm(artist, title)
+            if (cached == null) src.warm(artist, title)
+            cached
+        } catch (e: Exception) {
+            null // a BPM read/warm must never break song selection
+        }
+    }
+
+    /**
+     * SYNCHRONOUS, NON-BLOCKING genre read: return the cached coarse genre if it
+     * is warm, else fire a background [GenreSource.warm] (for next time) and
+     * return null (NEUTRAL now). Blank titles are skipped. NEVER suspends, NEVER
+     * throws.
+     */
+    private fun readOrWarmGenre(src: GenreSource, artist: String, title: String): String? {
+        if (title.isBlank()) return null
+        return try {
+            val cached = src.cachedGenre(artist, title)
+            if (cached == null) src.warm(artist, title)
+            cached
+        } catch (e: Exception) {
+            null // a genre read/warm must never break song selection
+        }
+    }
+
+    /**
      * Length of the trailing run in [history] whose entries equal [value]
      * (case-insensitively, trimmed), i.e. how many of the MOST RECENT plays were
      * the same genre/language as the seed. When [value] is unknown ([enabled]
@@ -480,28 +535,6 @@ class TastePoolPlanner(
             if (r <= 0.0) return c
         }
         return candidates.last()
-    }
-
-    private suspend fun bpmOf(artist: String, title: String): Double? {
-        val src = bpm ?: return null
-        if (title.isBlank()) return null
-        return try {
-            src.bpm(artist, title)
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /** Look up a song''s coarse genre via the wired [genre] source; null when no
-     *  source, blank inputs, or the source returns null/unknown. NEVER throws. */
-    private suspend fun genreOf(artist: String, title: String): String? {
-        val src = genre ?: return null
-        if (title.isBlank()) return null
-        return try {
-            src.genre(artist, title)
-        } catch (e: Exception) {
-            null // a genre lookup must never break song selection
-        }
     }
 
     private fun seedProximityFactor(candidateBpm: Double?, seedBpm: Double?): Double {

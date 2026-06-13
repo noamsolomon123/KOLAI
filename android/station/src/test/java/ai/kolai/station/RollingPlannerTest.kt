@@ -574,9 +574,14 @@ class RollingPlannerTest {
         }
     }
 
-    /** A GenreSource canned by title (lowercased on the way out is fine). */
+    /** A GenreSource canned by title, modelling an ALREADY-WARMED cache: the
+     *  RollingPlanner labels NON-BLOCKING via [cachedGenre] (the suspend [genre]
+     *  must never be taken -- it throws here to prove it). [warm] is a no-op. */
     private class FakeGenreSource(private val byTitle: Map<String, String?>) : GenreSource {
-        override suspend fun genre(artist: String, title: String): String? = byTitle[title]
+        override suspend fun genre(artist: String, title: String): String? =
+            throw AssertionError("RollingPlanner must NOT call the suspending genre() path")
+        override fun cachedGenre(artist: String, title: String): String? = byTitle[title]
+        override fun warm(artist: String, title: String) {}
     }
 
     @Test
@@ -623,6 +628,36 @@ class RollingPlannerTest {
         assertEquals(listOf("rap/hip hop", "jazz"), rolling.genreHistory)
         assertEquals(emptyList<String>(), fake.recentGenresSeen[0])
         assertEquals(listOf("rap/hip hop"), fake.recentGenresSeen[1])
+    }
+
+    /** Cold-cache genre source: cachedGenre is null (a miss) and the suspend
+     *  genre() THROWS, proving RollingPlanner labels NON-BLOCKING. A miss fires a
+     *  warm and records a blank genre (a run break that warms in next time). */
+    private class ColdGenreSource : GenreSource {
+        val warmed = mutableListOf<String>()
+        override suspend fun genre(artist: String, title: String): String? =
+            throw AssertionError("RollingPlanner must NOT block on genre()")
+        override fun cachedGenre(artist: String, title: String): String? = null
+        override fun warm(artist: String, title: String) { warmed.add(title) }
+    }
+
+    @Test
+    fun cold_genre_cache_records_blank_and_warms_without_blocking() = runTest {
+        // A cold genre cache must NOT stall nextSongs (the suspend path throws);
+        // it records a blank genre (a run break) and fires a background warm so a
+        // LATER play is labelled. Language is still labelled in-code (free).
+        val batches = listOf(listOf(Song(title = "Banger", artist = "MC")))
+        val cold = ColdGenreSource()
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = FakeCohesionSource(batches),
+            refreshEvery = 100,
+            genreSource = cold,
+        )
+        rolling.nextSongs(n = 1) // no throw == never blocked on the genre network
+        assertEquals(listOf(""), rolling.genreHistory) // blank: cold = unknown now
+        assertEquals(listOf("int"), rolling.languageHistory) // language is free
+        assertTrue("a cold miss must fire a warm", cold.warmed.contains("Banger"))
     }
 
     @Test

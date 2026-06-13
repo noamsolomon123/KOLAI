@@ -7,6 +7,11 @@ import ai.kolai.station.parseDeezerTrackId
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 
@@ -32,9 +37,19 @@ import java.util.concurrent.ConcurrentHashMap
  * (positive AND negative: a confirmed-unknown is cached as a tombstone so we do
  * not re-resolve a song with no Deezer genre). Logging goes through the JVM-safe
  * helper (android.util.Log is a stub that THROWS on the plain JVM).
+ *
+ * NON-BLOCKING (2026-06-13): mirrors [DeezerBpmSource] -- a SYNCHRONOUS cache read
+ * ([cachedGenre], instant / null on a cold miss) and a fire-and-forget [warm]
+ * that resolves the 3-hop genre in the BACKGROUND on an internal
+ * [Dispatchers.IO] scope, deduped per key via [inFlight]. The planner reads
+ * [cachedGenre] synchronously and fires [warm] for misses, so plan() never
+ * suspends on the genre network.
  */
 class DeezerGenreSource(
     private val http: HttpClient,
+    /** Background scope for [warm]; defaults to a daemon SupervisorJob on IO (see
+     *  [DeezerBpmSource]). Inject one in tests to control / await warm work. */
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) : GenreSource {
 
     /** "artistLower|titleLower" -> resolved genre. The [UNKNOWN] sentinel is a
@@ -42,9 +57,15 @@ class DeezerGenreSource(
      *  values), so a confirmed-unknown is never re-resolved. */
     private val cache = ConcurrentHashMap<String, String>()
 
+    /** Keys whose [warm] resolve is currently launched (dedupe in-flight). */
+    private val inFlight = ConcurrentHashMap.newKeySet<String>()
+
+    private fun keyOf(artist: String, title: String): String =
+        artist.trim().lowercase() + "|" + title.trim().lowercase()
+
     override suspend fun genre(artist: String, title: String): String? {
         if (title.isBlank()) return null
-        val key = (artist.trim().lowercase() + "|" + title.trim().lowercase())
+        val key = keyOf(artist, title)
         cache[key]?.let { return if (it == UNKNOWN) null else it }
 
         val resolved = try {
@@ -55,6 +76,39 @@ class DeezerGenreSource(
         cache[key] = resolved ?: UNKNOWN
         if (resolved != null) logI("genre '" + title + "' - " + artist + " = " + resolved)
         return resolved
+    }
+
+    /** SYNCHRONOUS cache-only read: the resolved coarse genre, or null on a cold
+     *  miss / tombstone. Never touches the network, never throws. */
+    override fun cachedGenre(artist: String, title: String): String? {
+        if (title.isBlank()) return null
+        val v = cache[keyOf(artist, title)] ?: return null
+        return if (v == UNKNOWN) null else v
+    }
+
+    /** Fire-and-forget background resolve: at most one network resolve per
+     *  uncached, not-in-flight key; stores the result (or a tombstone) so a later
+     *  [cachedGenre] hits. Never blocks, never throws. */
+    override fun warm(artist: String, title: String) {
+        if (title.isBlank()) return
+        val key = keyOf(artist, title)
+        if (cache.containsKey(key)) return            // already resolved (pos/neg)
+        if (!inFlight.add(key)) return                // a resolve is already running
+        scope.launch {
+            val resolved = try {
+                resolveGenre(artist, title)
+            } catch (e: Exception) {
+                null // best-effort; a warm failure is just a cached unknown
+            }
+            cache[key] = resolved ?: UNKNOWN
+            inFlight.remove(key)
+            if (resolved != null) logI("warm genre '" + title + "' - " + artist + " = " + resolved)
+        }
+    }
+
+    /** Cancel the background warm scope; call from a lifecycle hook if one exists. */
+    fun close() {
+        try { scope.cancel() } catch (_: Throwable) { }
     }
 
     /** /search/track -> id -> /track/{id} -> album id -> /album/{id} -> genre. */
