@@ -53,11 +53,30 @@ class DjBrain(
     private val recentLines = ArrayDeque<String>()
     private val memoryLock = Any()
 
+    /**
+     * NEW (2026-06-13, diversity fix): a SEPARATE, longer-lived ring of recent
+     * OPENERS (first [OPENER_WORDS] words of each aired line, normalized). The
+     * 75%-shared-first-word finding needs a memory that spans far more lines
+     * than the phrasing ring, so the engine refuses an opener it used dozens of
+     * lines ago. Guarded by the same [memoryLock].
+     */
+    private val recentOpeners = ArrayDeque<String>()
+
+    /** First [OPENER_WORDS] words of [line], whitespace-normalized; "" if blank. */
+    private fun openerOf(line: String): String =
+        line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            .take(OPENER_WORDS).joinToString(" ")
+
     private fun remember(line: String?) {
         if (line.isNullOrBlank()) return
         synchronized(memoryLock) {
             recentLines.addLast(line)
             while (recentLines.size > MEMORY_SIZE) recentLines.removeFirst()
+            val opener = openerOf(line)
+            if (opener.isNotEmpty()) {
+                recentOpeners.addLast(opener)
+                while (recentOpeners.size > OPENER_MEMORY_SIZE) recentOpeners.removeFirst()
+            }
         }
     }
 
@@ -65,24 +84,89 @@ class DjBrain(
     internal fun recentLinesSnapshot(): List<String> =
         synchronized(memoryLock) { recentLines.toList() }
 
+    /** Snapshot of the opener ring for tests/debugging; newest opener last. */
+    internal fun recentOpenersSnapshot(): List<String> =
+        synchronized(memoryLock) { recentOpeners.toList() }
+
     private fun avoidLine(): String {
         val recent = synchronized(memoryLock) { recentLines.toList() }
-        if (recent.isEmpty()) return ""
+        if (recent.isEmpty()) return clicheLine()
         val items = recent.takeLast(AVOID_COUNT)
             .joinToString(" | ") { "\"" + it.take(AVOID_TRUNC) + "\"" }
         return "\n" + "אל תחזור על הפתיחים/הניסוחים האלה מהשורות האחרונות שלך: " +
-            items + ". תפתח ותנסח אחרת לגמרי."
+            items + ". תפתח ותנסח אחרת לגמרי." + openerAvoidLine() + clicheLine()
     }
 
     /**
-     * NEW: one short randomized angle-nudge per spoken line, so consecutive
-     * links don't all share the same flavor. Chosen via the injectable
-     * [random] (tests pass a seeded Random). Nudges are deliberately short
-     * and respect the no-over-talk law.
+     * NEW (2026-06-13, diversity fix): list recent OPENERS and forbid reusing
+     * them. Directly targets the 75%-shared-first-word finding - it is a much
+     * longer-lived memory than the phrasing ring. Empty until something aired.
+     */
+    private fun openerAvoidLine(): String {
+        val openers = synchronized(memoryLock) { recentOpeners.toList() }
+        if (openers.isEmpty()) return ""
+        val items = openers.takeLast(OPENER_AVOID_COUNT)
+            .joinToString(" | ") { "\"" + it.take(AVOID_TRUNC) + "\"" }
+        return "\n" + "ובמיוחד אל תפתח באותו אופן כמו השורות האלה - תמנע מהפתיחים: " +
+            items + ". תמצא מילת פתיחה אחרת לגמרי."
+    }
+
+    /**
+     * NEW (2026-06-13, diversity fix): an always-on ban on the over-used tics
+     * ([CLICHE_PHRASES]) the study flagged as the narrow verbal fingerprint.
+     * Appended via [avoidLine] to every generation prompt (even the first,
+     * before anything has aired).
+     */
+    private fun clicheLine(): String =
+        "\n" + "הימנע מהנדושים האלה ואל תישען עליהם: " +
+            CLICHE_PHRASES.joinToString(", ") { "\"" + it + "\"" } + "."
+
+    /**
+     * NEW (2026-06-13, diversity fix): a short per-mood register/diction hint
+     * woven into prompts so wording differs by mood. "mix" / null / unknown
+     * append NOTHING, so default-mood prompts stay byte-identical.
+     */
+    private fun moodRegisterLine(ctx: DjContext?): String {
+        val hint = ctx?.mood?.let { MOOD_REGISTER[it] }.orEmpty()
+        return if (hint.isEmpty()) "" else "\n" + hint
+    }
+
+    /**
+     * NEW (2026-06-13, diversity fix): a small exclusion ring of the last few
+     * ANGLE indices used, so [flavorLine] never picks an angle it just used.
+     * Guarded by [memoryLock] like the line/opener rings.
+     */
+    private val recentAngles = ArrayDeque<Int>()
+
+    /**
+     * Pick ONE [ANGLES] index via the injected [random], excluding the last
+     * [ANGLE_AVOID] used (seeded-testable). Remembers the choice in
+     * [recentAngles]. Pure index math - no Hebrew here.
+     */
+    private fun nextAngleIndex(): Int = synchronized(memoryLock) {
+        val recent = recentAngles.toSet()
+        val pool = ANGLES.indices.filter { it !in recent }.ifEmpty { ANGLES.indices.toList() }
+        val chosen = pool[random.nextInt(pool.size)]
+        recentAngles.addLast(chosen)
+        while (recentAngles.size > ANGLE_AVOID) recentAngles.removeFirst()
+        chosen
+    }
+
+    /**
+     * NEW (rewritten 2026-06-13, diversity fix): ONE distinct prompt ANGLE per
+     * spoken line, rotated from [ANGLES] via the injected [random] with an
+     * exclusion ring. (The per-mood register hint rides on [moodLine], so it
+     * reaches every prompt site - not only the ones that call this.) The angle
+     * reframes HOW the DJ builds the line (and lets it START differently),
+     * directly
+     * attacking the cloned-opener finding; the old 5-item tone nudge was too
+     * weak. Chosen via the injectable [random] (tests pass a seeded Random) so
+     * rotation is reproducible. Somber days outrank variety: returns "" (no
+     * angle, no register) so the quiet/respectful tone is never undercut.
      */
     private fun flavorLine(ctx: DjContext? = null): String =
-        if (ctx?.somber == true) "" // somber days outrank flavor: no fun-angle nudge at all
-        else "\n" + FLAVOR_NUDGES[random.nextInt(FLAVOR_NUDGES.size)]
+        if (ctx?.somber == true) "" // somber days outrank variety: no angle/register nudge
+        else "\n" + ANGLES[nextAngleIndex()]
 
     /**
      * NEW: when the previous song is known, nudge the model that it may also
@@ -107,15 +191,95 @@ class DjBrain(
          *  normally attach to the next word, so a lone trailing one is broken. */
         val DANGLING_CONNECTORS = setOf("עם", "של", "את", "ה", "ו", "ב", "ל", "מ")
 
-        const val MEMORY_SIZE = 8
-        const val AVOID_COUNT = 3
+        // ---- anti-repetition ring sizes (enlarged 2026-06-13, diversity fix) --
+        // The study found 75% of scripts share their FIRST WORD: the old ring
+        // (last 3 of 8) only fought the immediately-preceding lines. Enlarged so
+        // the engine refuses an opener/phrasing it used dozens of lines ago.
+        const val MEMORY_SIZE = 24
+        const val AVOID_COUNT = 8
         const val AVOID_TRUNC = 60
+
+        // A SEPARATE, longer-lived ring of recent OPENERS (the first few words of
+        // each aired line) - this directly targets the shared-first-word finding.
+        const val OPENER_MEMORY_SIZE = 16
+        const val OPENER_AVOID_COUNT = 16
+        /** How many leading words define an "opener" for the opener ring. */
+        const val OPENER_WORDS = 4
+        /** How many recently-used ANGLE indices to exclude before re-picking. */
+        const val ANGLE_AVOID = 5
+
+        // ---- sampling temperatures per beat-type (2026-06-13, diversity fix) ---
+        // The Gemini request previously carried NO generationConfig, so output
+        // was near-deterministic. DjBrain now passes an explicit temperature:
+        //  - CREATIVE_TEMP: free-text creative lines (intro / opening / handover /
+        //    good-thing narrative / listening-cue / recap opening). Highest, to
+        //    break the cloned openers/phrasings.
+        //  - STRUCTURED_TEMP: the JSON-array beats (banter / trivia / two-truths).
+        //    Lower so the array stays parseable, but still varied; parsing already
+        //    tolerates garbage -> emptyList().
+        //  - PRECISE_TEMP: refine() + the de-dangle regeneration, where format
+        //    fidelity (full sentence, full song name, no dangling connector) is
+        //    critical and creativity is not the goal.
+        const val CREATIVE_TEMP = 1.15
+        const val STRUCTURED_TEMP = 0.9
+        const val PRECISE_TEMP = 0.4
+
+        // ---- ANGLE ROTATION (2026-06-13, diversity fix) -----------------------
+        // Replaces the old 5-item FLAVOR_NUDGES (a tone nudge) with ~12 DISTINCT
+        // angles that reframe HOW the DJ approaches the line - and crucially let
+        // it START differently (a question / a fact / a scene / dry one-liner),
+        // attacking the shared-opener finding. Each call gets exactly ONE angle,
+        // rotated via the injected Random with an exclusion ring. Kept SHORT to
+        // honor the sparse-talk law and within the no-hallucination rules.
+        val ANGLES = listOf(
+            "זווית: תאר במשפט אחד את הווייב של השיר הבא - איך הוא מרגיש, לא מה הוא.",
+            "זווית: פתח בשאלה קצרה ואמיתית אל המאזין, בלי לענות עליה.",
+            "זווית: קשר את השיר לזיכרון או אסוציאציה קטנה - נוסטלגיה זריזה, בלי להמציא שנה.",
+            "זווית: חבר את השיר שהסתיים לבא דרך ניגוד חד (איטי->מהיר, עצוב->שמח).",
+            "זווית: וידוי קטן ואישי שלך כשדרן (האמת? חיכיתי לשיר הזה...).",
+            "זווית: עגן את הרגע בשעה/אור/מזג האוויר ותן לזה לזרום אל השיר.",
+            "זווית: כוון את האוזן לרגע ספציפי בשיר - דרופ, מעבר או סולו.",
+            "זווית: צייר תמונה קטנה של איפה המאזין עכשיו (פקק, מטבח, מקלדת) והכנס את השיר לתוכה.",
+            "זווית: ישר ויבש - בלי קישוט, רק משפט אחד חד שמכריז על השיר. לקוני בכוונה.",
+            "זווית: משחק מילים או אנקדוטה קטנה סביב שם השיר/האמן עצמו.",
+            "זווית: המשכיות - התייחס למה שקרה קודם בשידור ובנה גשר רגשי קטן אל הבא.",
+            "זווית: תאר את מצב הרוח בחדר עכשיו ותן לשיר להמשיך אותו.",
+        )
+
+        // BACKWARD-COMPAT: the original 5-item nudge list, kept so older call
+        // sites / tests that reference DjBrain.FLAVOR_NUDGES still resolve. The
+        // live variety now comes from [ANGLES]; these remain as a tiny secondary
+        // tone hint and are NOT what rotates per call anymore.
         val FLAVOR_NUDGES = listOf(
             "הפעם אפשר זווית אישית קטנה.",
             "הפעם משפט אחד בלבד, חד ויפה.",
             "הפעם אפשר פאן קטן על השיר הבא.",
             "הפעם בלי שאלה רטורית - רק אמירה.",
             "הפעם תיכנס ישר לעניין, בלי חימום.",
+        )
+
+        // ---- ANTI-CLICHE (2026-06-13, diversity fix) --------------------------
+        // The exact tics the study flagged as the over-used verbal fingerprint
+        // (counts in docs/studies/findings-diversity.md). Listed in an avoid
+        // fragment so the model has to find fresh connectors.
+        val CLICHE_PHRASES = listOf(
+            "הגיע הזמן",
+            "תגביר את הווליום",
+            "תרים את הווליום",
+            "אז בוא",
+            "אבל עכשיו",
+        )
+
+        // ---- PER-MOOD REGISTER / DICTION (2026-06-13, diversity fix) ----------
+        // The study found mood barely moved the wording (within-vs-across cosine
+        // delta ~noise). A short register hint per mood is woven into prompts so
+        // the DICTION differs by mood. "mix" is empty so default-mood prompts
+        // stay byte-identical to the pre-diversity prompts.
+        val MOOD_REGISTER = mapOf(
+            "party" to "משלב: מילים קצרות ופאנציות, סלנג ישראלי חי, קצב גבוה.",
+            "late_night" to "משלב: מילים רכות ומושהות, טון לחשני ואינטימי, נשימה ארוכה.",
+            "focus" to "משלב: מינימלי וענייני, מעט מילים, בלי קישוטים.",
+            "morning" to "משלב: חם ומאיר פנים, חיוך רך בקול, מזמין.",
         )
 
         // ---- 2026-06-12 DJ writing capabilities (features 7-12) ----------
@@ -270,8 +434,20 @@ class DjBrain(
      * default-mood prompts stay byte-identical to the pre-mood prompts.
      */
     private fun moodLine(ctx: DjContext?): String {
+        // SOMBER OVERRIDE (2026-06-13, review finding): on somber national days
+        // ([DjContext.somber]) the sacred quiet/respectful tone outranks the
+        // mood. An auto-mood (e.g. 'party') must NOT leak its upbeat djLine NOR
+        // its per-mood register into a Yom HaZikaron/HaShoah prompt - that would
+        // sit beside the calendarLine "no humor / quiet" instruction and
+        // contradict it. So suppress BOTH here, exactly like [flavorLine] does.
+        if (ctx?.somber == true) return ""
         val line = ctx?.mood?.let { Moods.ALL[it] }?.djLine.orEmpty()
-        return if (line.isEmpty()) "" else "\n" + line
+        // PER-MOOD REGISTER (2026-06-13, diversity fix): the diction hint rides
+        // right behind the mood djLine, so every prompt site picks it up once.
+        // mix / null / unknown leave BOTH empty, keeping default prompts
+        // byte-identical to the pre-diversity prompts.
+        val djLine = if (line.isEmpty()) "" else "\n" + line
+        return djLine + moodRegisterLine(ctx)
     }
 
     /**
@@ -413,7 +589,7 @@ class DjBrain(
                 "עד $budget מילים, משפט שלם. החזר רק את השורה המשופרת בעברית " +
                 "מדוברת, בלי מרכאות, אנגלית, עיצוב או הסברים.\n" +
                 oneListenerLine() + moodLine(ctx)
-            val out = finish(client.complete(p), budget)
+            val out = finish(client.complete(p, PRECISE_TEMP), budget)
             if (out.isNotBlank()) return out
         } catch (e: Exception) {
             // fall through to the original line
@@ -598,7 +774,7 @@ class DjBrain(
     private suspend fun deDangleNaming(out: String, basePrompt: String, budget: Int): String {
         if (!danglingName(out)) return out
         val retry = try {
-            finish(client.complete(basePrompt + regenNamingLine()), budget)
+            finish(client.complete(basePrompt + regenNamingLine(), PRECISE_TEMP), budget)
         } catch (e: Exception) {
             ""
         }
@@ -652,7 +828,7 @@ class DjBrain(
     suspend fun writeIntro(prev: Song?, nxt: Song, seconds: Double, ctx: DjContext? = null, allowTasteWink: Boolean = false): String {
         val budget = wordsForSeconds(seconds)
         val base = prompt(prev, nxt, budget, ctx = ctx, allowTasteWink = allowTasteWink) + flavorLine(ctx) + avoidLine()
-        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
+        val out = deDangleNaming(finish(client.complete(base, CREATIVE_TEMP), budget), base, budget)
         remember(out)
         return out
     }
@@ -664,7 +840,7 @@ class DjBrain(
     suspend fun writeOpening(nxt: Song, ctx: DjContext, seconds: Double): String {
         val budget = wordsForSeconds(seconds)
         val base = openingPrompt(nxt, ctx, budget) + avoidLine()
-        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
+        val out = deDangleNaming(finish(client.complete(base, CREATIVE_TEMP), budget), base, budget)
         remember(out)
         return out
     }
@@ -701,7 +877,7 @@ class DjBrain(
             }
         }
         val base = p + flavorLine(ctx) + avoidLine()
-        val raw = client.complete(base)
+        val raw = client.complete(base, CREATIVE_TEMP)
         if (allowSkip && isSkip(raw)) return null
         var out = finish(raw, budget)
         if (isNaming) out = deDangleNaming(out, base, budget)
@@ -740,7 +916,7 @@ class DjBrain(
     suspend fun writeHandover(ctx: DjContext, nxt: Song, seconds: Double = 8.0): String {
         val budget = wordsForSeconds(seconds)
         val base = handoverPrompt(ctx, nxt, budget) + avoidLine()
-        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
+        val out = deDangleNaming(finish(client.complete(base, CREATIVE_TEMP), budget), base, budget)
         remember(out)
         return out
     }
@@ -784,7 +960,7 @@ class DjBrain(
      */
     suspend fun writeGoodThing(ctx: DjContext, nxt: Song, seconds: Double = 15.0): String {
         val budget = minOf(wordsForSeconds(seconds), GOOD_THING_WORD_CAP)
-        val raw = client.complete(goodThingPrompt(ctx, nxt, budget) + avoidLine())
+        val raw = client.complete(goodThingPrompt(ctx, nxt, budget) + avoidLine(), CREATIVE_TEMP)
         if (isSkip(raw)) return ""
         var out = finish(raw, budget)
         if (out.isBlank()) return ""
@@ -913,7 +1089,7 @@ class DjBrain(
         val budget = wordsForSeconds(seconds)
         val sidekick = SIDEKICK_PERSONAS[Math.floorMod(sidekickIndex, SIDEKICK_PERSONAS.size)]
         val raw = try {
-            client.complete(banterPrompt(prev, nxt, ctx, budget, sidekick) + avoidLine())
+            client.complete(banterPrompt(prev, nxt, ctx, budget, sidekick) + avoidLine(), STRUCTURED_TEMP)
         } catch (e: Exception) {
             return emptyList()
         }
@@ -955,7 +1131,7 @@ class DjBrain(
         // dangling-name guard as its 4 opening/handover siblings - the plain
         // finish() alone shared the truncation root cause.
         val base = recapOpeningPrompt(nxt, ctx, budget) + avoidLine()
-        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
+        val out = deDangleNaming(finish(client.complete(base, CREATIVE_TEMP), budget), base, budget)
         remember(out)
         return out
     }
@@ -991,7 +1167,7 @@ class DjBrain(
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
         val raw = try {
-            client.complete(triviaPrompt(nxt, ctx, budget) + avoidLine())
+            client.complete(triviaPrompt(nxt, ctx, budget) + avoidLine(), STRUCTURED_TEMP)
         } catch (e: Exception) {
             return emptyList()
         }
@@ -1024,7 +1200,7 @@ class DjBrain(
         if (ctx.somber) return ""
         val budget = wordsForSeconds(seconds)
         val raw = try {
-            client.complete(listeningCuePrompt(nxt, ctx, budget) + avoidLine())
+            client.complete(listeningCuePrompt(nxt, ctx, budget) + avoidLine(), CREATIVE_TEMP)
         } catch (e: Exception) {
             return ""
         }
@@ -1066,7 +1242,7 @@ class DjBrain(
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
         val raw = try {
-            client.complete(twoTruthsLiePrompt(nxt, ctx, budget) + avoidLine())
+            client.complete(twoTruthsLiePrompt(nxt, ctx, budget) + avoidLine(), STRUCTURED_TEMP)
         } catch (e: Exception) {
             return emptyList()
         }

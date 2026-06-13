@@ -20,14 +20,16 @@ import org.junit.Test
  */
 class DjBrainTest {
 
-    /** Records every prompt; replays canned responses in order (last reused). */
+    /** Records every prompt + temperature; replays canned responses in order. */
     private class FakeLlmClient(
         private val responses: List<String>,
         val prompts: MutableList<String> = mutableListOf(),
+        val temps: MutableList<Double?> = mutableListOf(),
     ) : LlmClient {
         private var i = 0
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             prompts.add(prompt)
+            temps.add(temperature)
             val call = i
             i++
             return responses[call.coerceAtMost(responses.size - 1)]
@@ -254,15 +256,18 @@ class DjBrainTest {
     }
 
     @Test
-    fun memory_keeps_last_8_and_evicts_oldest() = runTest {
-        val responses = (1..10).map { "שורה מספר $it" }
+    fun memory_keeps_last_24_and_evicts_oldest() = runTest {
+        // MEMORY_SIZE enlarged 8 -> 24 (diversity fix): drive 26 lines so the
+        // ring must evict the two oldest and keep the most recent 24.
+        val responses = (1..26).map { "שורה מספר $it" }
         val client = FakeLlmClient(responses)
         val brain = DjBrain(client, persona = "דני")
-        repeat(10) { brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0) }
+        repeat(26) { brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0) }
         val mem = brain.recentLinesSnapshot()
+        assertEquals(24, DjBrain.MEMORY_SIZE)
         assertEquals(DjBrain.MEMORY_SIZE, mem.size)
         assertEquals("שורה מספר 3", mem.first()) // 1 and 2 evicted
-        assertEquals("שורה מספר 10", mem.last())
+        assertEquals("שורה מספר 26", mem.last())
     }
 
     @Test
@@ -300,33 +305,56 @@ class DjBrainTest {
         assertTrue(client.prompts[1].contains("בוקר טוב לך"))
     }
 
-    // ---- variety flavor nudges (seeded Random) -----------------------------
+    // ---- variety: ANGLE rotation (seeded Random) ---------------------------
 
     @Test
-    fun seeded_random_gives_reproducible_flavor_nudge() = runTest {
+    fun there_are_twelve_distinct_angles() = runTest {
+        // the rotation pool replaced the old 5-item nudge with ~12 distinct angles.
+        assertEquals(12, DjBrain.ANGLES.size)
+        assertEquals(DjBrain.ANGLES.size, DjBrain.ANGLES.toSet().size)
+    }
+
+    @Test
+    fun seeded_random_gives_reproducible_angle() = runTest {
         val c1 = FakeLlmClient(listOf("שלום"))
         val c2 = FakeLlmClient(listOf("שלום"))
         val b1 = DjBrain(c1, persona = "דני", random = Random(7))
         val b2 = DjBrain(c2, persona = "דני", random = Random(7))
         b1.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
         b2.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        // same seed -> byte-identical prompt (angle rotation is deterministic)
         assertEquals(c1.prompts[0], c2.prompts[0])
         assertTrue(
-            "prompt must carry one of the flavor nudges",
-            DjBrain.FLAVOR_NUDGES.any { c1.prompts[0].contains(it) },
+            "prompt must carry exactly one rotation angle",
+            DjBrain.ANGLES.any { c1.prompts[0].contains(it) },
         )
     }
 
     @Test
-    fun flavor_nudges_rotate_across_calls() = runTest {
-        // SKIP responses keep the memory empty, so prompts differ only by flavor.
+    fun angles_rotate_across_calls_and_avoid_immediate_repeats() = runTest {
+        // SKIP responses keep the line/opener memory empty, so prompts differ
+        // only by the rotated angle. Over 12 calls the exclusion ring must yield
+        // several DISTINCT angles (the old 5-nudge pool was the diversity bug).
         val client = FakeLlmClient(listOf("SKIP"))
         val brain = DjBrain(client, persona = "דני", random = Random(1))
         repeat(12) {
             brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0, allowSkip = true)
         }
-        val used = DjBrain.FLAVOR_NUDGES.filter { n -> client.prompts.any { it.contains(n) } }
-        assertTrue("expected at least 2 distinct nudges, got ${used.size}", used.size >= 2)
+        val used = DjBrain.ANGLES.filter { a -> client.prompts.any { it.contains(a) } }
+        assertTrue("expected many distinct angles, got ${used.size}", used.size >= 5)
+    }
+
+    @Test
+    fun seed_influences_first_angle_choice_across_seeds() = runTest {
+        // across a spread of seeds the FIRST angle must not be constant - that
+        // would mean the injected Random has no effect on the rotation.
+        val firsts = (1..30).map { seed ->
+            val c = FakeLlmClient(listOf("SKIP"))
+            val b = DjBrain(c, persona = "דני", random = Random(seed.toLong()))
+            b.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0, allowSkip = true)
+            DjBrain.ANGLES.indexOfFirst { c.prompts[0].contains(it) }
+        }.toSet()
+        assertTrue("seed must influence the first angle (got ${firsts.size} distinct)", firsts.size >= 3)
     }
 
     // ---- back-announce of the outgoing song --------------------------------
@@ -1224,4 +1252,205 @@ class DjBrainTest {
         assertEquals("clean line must not trigger a retry", 1, client.prompts.size)
     }
 
+
+    // ---- diversity fix: temperatures at call sites (2026-06-13) -------------
+
+    @Test
+    fun writeIntro_uses_creative_temp() = runTest {
+        val client = FakeLlmClient(listOf("הנה קריפ של רדיוהד, תהנה."))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeIntro(prev, nxt, seconds = 8.0)
+        assertEquals(DjBrain.CREATIVE_TEMP, client.temps.first())
+    }
+
+    @Test
+    fun writeOpening_and_handover_use_creative_temp() = runTest {
+        val client = FakeLlmClient(listOf("בוקר טוב לך, תהנה.", "עשר בלילה, העיר נרגעת."))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeOpening(nxt = nxt, ctx = DjContext(partOfDay = "בוקר"), seconds = 10.0)
+        brain.writeHandover(ctx = DjContext(partOfDay = "לילה"), nxt = nxt)
+        assertEquals(DjBrain.CREATIVE_TEMP, client.temps[0])
+        assertEquals(DjBrain.CREATIVE_TEMP, client.temps[1])
+    }
+
+    @Test
+    fun writeBreak_song_uses_creative_temp() = runTest {
+        val client = FakeLlmClient(listOf("הנה קריפ של רדיוהד."))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertEquals(DjBrain.CREATIVE_TEMP, client.temps.first())
+    }
+
+    @Test
+    fun banter_trivia_twoTruths_use_structured_temp() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBanter(prev, nxt, ctx = DjContext())
+        brain.writeTrivia(nxt, ctx = DjContext())
+        brain.writeTwoTruthsLie(nxt, ctx = DjContext())
+        assertEquals(3, client.temps.size)
+        client.temps.forEach { assertEquals(DjBrain.STRUCTURED_TEMP, it) }
+    }
+
+    @Test
+    fun refine_uses_precise_temp() = runTest {
+        val client = FakeLlmClient(listOf("שורה משופרת ויפה."))
+        val brain = DjBrain(client, persona = "דני")
+        brain.refine("שורת קישור כלשהי", budget = 20)
+        assertEquals(DjBrain.PRECISE_TEMP, client.temps.first())
+    }
+
+    @Test
+    fun dangling_regeneration_uses_precise_temp() = runTest {
+        val client = FakeLlmClient(listOf("תירגע רגע עם של", "תירגע רגע עם ניקלבק"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeIntro(prev, nxt, seconds = 8.0)
+        assertEquals(2, client.temps.size)
+        assertEquals("initial creative call", DjBrain.CREATIVE_TEMP, client.temps[0])
+        assertEquals("regen precise call", DjBrain.PRECISE_TEMP, client.temps[1])
+    }
+
+    @Test
+    fun listeningCue_uses_creative_temp() = runTest {
+        val client = FakeLlmClient(listOf("שים לב לדרופ בדקה השנייה."))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeListeningCue(nxt, ctx = DjContext())
+        assertEquals(DjBrain.CREATIVE_TEMP, client.temps.first())
+    }
+
+    @Test
+    fun temperatures_are_distinct_per_beat_type() = runTest {
+        assertEquals(1.15, DjBrain.CREATIVE_TEMP, 1e-9)
+        assertEquals(0.9, DjBrain.STRUCTURED_TEMP, 1e-9)
+        assertEquals(0.4, DjBrain.PRECISE_TEMP, 1e-9)
+        assertTrue(DjBrain.CREATIVE_TEMP > DjBrain.STRUCTURED_TEMP)
+        assertTrue(DjBrain.STRUCTURED_TEMP > DjBrain.PRECISE_TEMP)
+    }
+
+    // ---- diversity fix: opener ring + cliche + mood register (2026-06-13) ---
+
+    /** Stable marker of the cliche-ban fragment (clicheLine). */
+    private val clicheMarker = "הימנע מהנדושים האלה"
+
+    /** Stable marker of the opener-avoid fragment (openerAvoidLine). */
+    private val openerMarker = "תמנע מהפתיחים"
+
+    @Test
+    fun cliche_ban_present_on_every_prompt_including_the_first() = runTest {
+        val client = FakeLlmClient(listOf("שלום עולם"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        val p = client.prompts.first()
+        assertTrue("cliche ban missing", p.contains(clicheMarker))
+        assertTrue(p.contains("הגיע הזמן"))
+        assertTrue(p.contains("תגביר את הווליום"))
+    }
+
+    @Test
+    fun opener_ring_tracks_openers_and_forbids_them_on_next_prompt() = runTest {
+        val client = FakeLlmClient(listOf("ערב מושלם בדיוק לשיר הזה", "שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertEquals(listOf("ערב מושלם בדיוק לשיר"), brain.recentOpenersSnapshot())
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        val p = client.prompts[1]
+        assertTrue("opener-avoid fragment missing", p.contains(openerMarker))
+        assertTrue("recent opener missing", p.contains("ערב מושלם בדיוק לשיר"))
+    }
+
+    @Test
+    fun opener_ring_keeps_last_16_and_evicts_oldest() = runTest {
+        val responses = (1..18).map { "פתיח ייחודי מספר $it כאן" }
+        val client = FakeLlmClient(responses)
+        val brain = DjBrain(client, persona = "דני")
+        repeat(18) { brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 12.0) }
+        val openers = brain.recentOpenersSnapshot()
+        assertEquals(16, DjBrain.OPENER_MEMORY_SIZE)
+        assertEquals(DjBrain.OPENER_MEMORY_SIZE, openers.size)
+        assertEquals("פתיח ייחודי מספר 3", openers.first())
+        assertEquals("פתיח ייחודי מספר 18", openers.last())
+    }
+
+    @Test
+    fun mood_register_hint_present_for_party_and_absent_for_mix() = runTest {
+        val c1 = FakeLlmClient(listOf("שלום"))
+        val c2 = FakeLlmClient(listOf("שלום"))
+        val b1 = DjBrain(c1, persona = "דני")
+        val b2 = DjBrain(c2, persona = "דני")
+        b1.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "party"), seconds = 8.0)
+        b2.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "mix"), seconds = 8.0)
+        assertTrue("party register missing", c1.prompts.first().contains(DjBrain.MOOD_REGISTER.getValue("party")))
+        assertFalse("mix must add no register", c2.prompts.first().contains("משלב:"))
+    }
+
+    @Test
+    fun mood_register_differs_by_mood() = runTest {
+        val regs = DjBrain.MOOD_REGISTER.values.toList()
+        assertEquals(4, regs.size)
+        assertEquals(4, regs.toSet().size)
+    }
+
+    // ---- FIX 4 (review finding): somber suppresses BOTH the mood djLine AND --
+    // ---- the per-mood register, so an auto-mood (e.g. party) never leaks ----
+    // ---- its upbeat tone into a Yom HaZikaron / HaShoah prompt. -------------
+
+    @Test
+    fun somber_party_prompt_has_neither_party_register_nor_party_djline() = runTest {
+        // an auto-mood of 'party' on a somber day: the party register ("משלב:...")
+        // and the party djLine ("השידור עכשיו במצב...") must BOTH be suppressed,
+        // while the somber respectful-tone line stays. Exercise several prompt
+        // sites that all route through moodLine().
+        val partyRegister = DjBrain.MOOD_REGISTER.getValue("party")
+        val partyDjLine = Moods.ALL.getValue("party").djLine
+        val somberCtx = DjContext(calendarNote = "יום הזיכרון", somber = true, mood = "party")
+        val client = FakeLlmClient(listOf("שלום", "שלום", "שלום", "שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = somberCtx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "weather",
+            ctx = somberCtx.copy(timeStr = "20:00", partOfDay = "ערב", weather = "קריר"), seconds = 8.0)
+        brain.writeOpening(nxt = nxt, ctx = somberCtx.copy(partOfDay = "ערב"), seconds = 10.0)
+        brain.writeHandover(ctx = somberCtx.copy(partOfDay = "ערב"), nxt = nxt)
+        assertEquals(4, client.prompts.size)
+        client.prompts.forEachIndexed { idx, p ->
+            assertFalse("prompt #$idx leaked the party register on a somber day", p.contains("משלב:"))
+            assertFalse("prompt #$idx leaked the exact party register on a somber day", p.contains(partyRegister))
+            assertFalse("prompt #$idx leaked the party djLine on a somber day", p.contains(partyDjLine))
+            assertFalse("prompt #$idx leaked the mood marker on a somber day", p.contains(moodMarker))
+            // the sacred somber tone is still present
+            assertTrue("prompt #$idx lost the somber respectful line", p.contains(somberMarker))
+        }
+    }
+
+    @Test
+    fun non_somber_party_prompt_still_carries_register_and_djline() = runTest {
+        // control: WITHOUT somber, the very same party mood DOES contribute both.
+        val partyRegister = DjBrain.MOOD_REGISTER.getValue("party")
+        val partyDjLine = Moods.ALL.getValue("party").djLine
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(mood = "party"), seconds = 8.0)
+        val p = client.prompts.first()
+        assertTrue("party register missing on a normal day", p.contains(partyRegister))
+        assertTrue("party djLine missing on a normal day", p.contains(partyDjLine))
+        assertTrue("mood marker missing on a normal day", p.contains(moodMarker))
+    }
+
+    // ---- FIX 5 (review finding): CLICHE_PHRASES de-duped + volume variant -----
+
+    @Test
+    fun cliche_phrases_drop_redundant_substring_and_add_volume_variant() = runTest {
+        // the bare "את הווליום" was a substring of "תגביר את הווליום" (no signal,
+        // bloat) - removed; the second volume-bump phrasing "תרים את הווליום"
+        // (study-flagged) added. Both full volume phrasings present; the bare
+        // substring entry gone.
+        assertTrue("kept תגביר את הווליום", DjBrain.CLICHE_PHRASES.contains("תגביר את הווליום"))
+        assertTrue("added תרים את הווליום", DjBrain.CLICHE_PHRASES.contains("תרים את הווליום"))
+        assertFalse("bare substring entry must be gone", DjBrain.CLICHE_PHRASES.contains("את הווליום"))
+        // the rest of the tics survive
+        assertTrue(DjBrain.CLICHE_PHRASES.contains("הגיע הזמן"))
+        assertTrue(DjBrain.CLICHE_PHRASES.contains("אז בוא"))
+        assertTrue(DjBrain.CLICHE_PHRASES.contains("אבל עכשיו"))
+        // no duplicates
+        assertEquals(DjBrain.CLICHE_PHRASES.size, DjBrain.CLICHE_PHRASES.toSet().size)
+    }
 }

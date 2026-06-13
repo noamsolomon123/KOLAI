@@ -347,4 +347,39 @@ class GeminiTtsSynthTest {
         assertTrue(urls[0].contains("key=KEY_A"))
         assertTrue(urls[1].contains("key=KEY_B"))
     }
+
+    // ---- SECURITY: key-free errors, 403 never NPEs (2026-06-13) --------------
+
+    @Test
+    fun synth_all_keys_403_throws_clear_key_free_error_no_npe() = runTest {
+        // A 403 has no `candidates`: the OLD code skipped rotation on 4xx and
+        // fed the body to parsePcm() -> NPE. Now ANY non-2xx rotates and the
+        // final RuntimeException carries NEITHER the key NOR the request URL.
+        val fakeKey = "AIzaSyA_0123456789abcdefghijKLMNOPQRSTU"
+        val urls = mutableListOf<String>()
+        val bodies = mutableListOf<String>()
+        val client = mockClient(
+            listOf(HttpStatusCode.Forbidden to """{"error":{"code":403}}"""),
+            urls, bodies,
+        )
+        val synth = GeminiTtsSynth(
+            apiKeys = listOf(fakeKey, fakeKey + "2"),
+            model = "gemini-tts",
+            voice = "Kore",
+            httpClient = client,
+        )
+        try {
+            synth.synth("hi")
+            org.junit.Assert.fail("expected all keys to be rejected")
+        } catch (e: NullPointerException) {
+            org.junit.Assert.fail("403 must not NPE through parsePcm(): ${e.message}")
+        } catch (e: RuntimeException) {
+            assertEquals(2, urls.size)
+            val msg = e.toString() + "|" + (e.message ?: "")
+            org.junit.Assert.assertFalse("exception leaked an AIza key: $msg", msg.contains("AIza"))
+            org.junit.Assert.assertFalse("exception leaked a key= query: $msg", msg.contains("key="))
+            assertTrue("error should mention HTTP 403", msg.contains("403"))
+            assertTrue("error should say keys rejected", msg.contains("rejected"))
+        }
+    }
 }

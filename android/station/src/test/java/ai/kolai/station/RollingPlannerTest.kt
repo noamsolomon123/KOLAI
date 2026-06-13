@@ -60,7 +60,7 @@ class RollingPlannerTest {
     private class FakeLlmClient(private val replies: List<String>) : LlmClient {
         val prompts = mutableListOf<String>()
         private var i = 0
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             prompts.add(prompt)
             return replies[(i++).coerceAtMost(replies.size - 1)]
         }

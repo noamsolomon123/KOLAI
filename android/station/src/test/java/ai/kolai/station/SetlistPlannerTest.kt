@@ -45,7 +45,7 @@ class SetlistPlannerTest {
         private val throwOnCall: Int? = null,
     ) : LlmClient {
         private var i = 0
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             prompts.add(prompt)
             val call = i
             i++

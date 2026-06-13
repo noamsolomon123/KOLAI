@@ -337,7 +337,7 @@ class TastePoolPlannerTest {
     private class FixedLlm(private val reply: String) : LlmClient {
         var calls = 0
         val prompts = mutableListOf<String>()
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             calls++
             prompts.add(prompt)
             return reply
@@ -395,7 +395,7 @@ class TastePoolPlannerTest {
     @Test
     fun curator_returning_null_yields_unbiased_picks() = runTest {
         val curator = MoodCurator(object : LlmClient {
-            override suspend fun complete(prompt: String): String =
+            override suspend fun complete(prompt: String, temperature: Double?): String =
                 throw RuntimeException("llm down")
         })
         for (seed in 0 until 10) {

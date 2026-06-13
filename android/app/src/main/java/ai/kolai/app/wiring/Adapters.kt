@@ -29,12 +29,15 @@ import java.io.File
 /**
  * Adapts :voice [GeminiTextClient] (suspend complete) to the :station
  * [StationLlmClient] seam consumed by DjBrain + SetlistPlanner. Both are
- * `suspend fun complete(prompt): String`, so this is a straight delegate.
+ * suspend fun complete(prompt, temperature?): String, so this is a straight
+ * delegate that FORWARDS the optional temperature (2026-06-13 diversity fix:
+ * DjBrain passes a per-beat sampling temperature) into the Gemini request.
  */
 class GeminiLlmClient(
     private val textClient: GeminiTextClient,
 ) : StationLlmClient {
-    override suspend fun complete(prompt: String): String = textClient.complete(prompt)
+    override suspend fun complete(prompt: String, temperature: Double?): String =
+        textClient.complete(prompt, temperature = temperature)
 }
 
 /**

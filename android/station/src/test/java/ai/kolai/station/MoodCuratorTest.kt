@@ -18,7 +18,7 @@ class MoodCuratorTest {
     private class FakeLlm(private val replies: MutableList<String>) : LlmClient {
         var calls = 0
         val prompts = mutableListOf<String>()
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             calls++
             prompts.add(prompt)
             check(replies.isNotEmpty()) { "LLM down (no canned reply left)" }
@@ -85,7 +85,7 @@ class MoodCuratorTest {
     @Test
     fun throwing_client_returns_null_never_throws() = runTest {
         val client = object : LlmClient {
-            override suspend fun complete(prompt: String): String =
+            override suspend fun complete(prompt: String, temperature: Double?): String =
                 throw RuntimeException("network down")
         }
         assertNull(MoodCurator(client).fitIndices("party", songs))

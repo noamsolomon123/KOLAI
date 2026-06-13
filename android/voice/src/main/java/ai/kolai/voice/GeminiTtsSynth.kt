@@ -145,9 +145,22 @@ class GeminiTtsSynth(
             }
         }
 
-    /** POST [body], rotating across keys on 429/5xx/exceptions; returns WAV bytes. */
+    /**
+     * POST [body], rotating across keys on ANY non-2xx (and on transport
+     * exceptions); returns WAV bytes.
+     *
+     * KEY-FREE errors (SECURITY, 2026-06-13): same hardening as
+     * [GeminiTextClient] - the key rides in the request URL (`?key=AIza...`),
+     * so NO error here ever carries the URL or the key. Errors are built from
+     * the key INDEX only, Ktor exceptions are rewrapped to a key-free
+     * descriptor, and a non-2xx (e.g. a disabled/leaked key returning 403) is
+     * never fed to [parsePcm] (which would NPE on the missing `candidates`):
+     * it records a key-free error and rotates. If every key is rejected, throw a
+     * clear key-free RuntimeException.
+     */
     private suspend fun postWithKeyRotation(body: String): ByteArray {
         val errors = mutableListOf<String>()
+        var lastStatus = -1
         repeat(keys.size) {
             val key = keys[idx]
             try {
@@ -155,17 +168,21 @@ class GeminiTtsSynth(
                     contentType(ContentType.Application.Json)
                     setBody(body)
                 }
-                if (!resp.status.isTransientFailure()) {
+                if (resp.status.value in 200..299) {
                     val pcm = parsePcm(resp.bodyAsText())
                     return pcmToWav(pcm, sampleRate)
                 }
+                lastStatus = resp.status.value
                 errors.add("HTTP ${resp.status.value} from key #$idx")
             } catch (e: Exception) {
-                errors.add(e.toString())
+                errors.add("transport error from key #$idx (${e.javaClass.simpleName})")
             }
             idx = (idx + 1) % keys.size
         }
-        throw RuntimeException("All Gemini TTS keys failed: $errors")
+        val lastDesc = if (lastStatus >= 0) "HTTP $lastStatus" else "transport error"
+        throw RuntimeException(
+            "All Gemini TTS keys rejected (last: $lastDesc); tried ${keys.size} key(s): $errors"
+        )
     }
 
     private fun parsePcm(responseBody: String): ByteArray {

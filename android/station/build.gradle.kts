@@ -35,7 +35,9 @@ android {
 // would otherwise always Assume-skip. Harmless for the normal suite: when the
 // property is unset the harness still skips.
 tasks.withType<Test>().configureEach {
-    System.getProperty("kolai.corpus")?.let { systemProperty("kolai.corpus", it) }
+    listOf("kolai.corpus", "kolai.corpus.n", "kolai.corpus.out").forEach { key ->
+        System.getProperty(key)?.let { systemProperty(key, it) }
+    }
 }
 
 dependencies {

@@ -40,7 +40,7 @@ class BlockRendererTest {
     private class FakeLlmClient(private val response: String = "ברוכים הבאים לשידור") : LlmClient {
         var calls = 0
         val prompts = mutableListOf<String>()
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             calls++
             prompts.add(prompt)
             return response
@@ -49,7 +49,7 @@ class BlockRendererTest {
 
     /** An LlmClient that always returns SKIP (so allow_skip breaks vanish). */
     private class SkipLlmClient : LlmClient {
-        override suspend fun complete(prompt: String): String = "SKIP"
+        override suspend fun complete(prompt: String, temperature: Double?): String = "SKIP"
     }
 
     /** Routes prompts by a contained marker; [default] otherwise. Records all. */
@@ -58,7 +58,7 @@ class BlockRendererTest {
         private val default: String = "שורה רגילה של רדיו",
     ) : LlmClient {
         val prompts = mutableListOf<String>()
-        override suspend fun complete(prompt: String): String {
+        override suspend fun complete(prompt: String, temperature: Double?): String {
             prompts.add(prompt)
             for ((marker, response) in routes) if (prompt.contains(marker)) return response
             return default

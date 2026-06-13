@@ -37,6 +37,14 @@ import java.util.concurrent.ConcurrentHashMap
  *   .\gradlew :station:testDebugUnitTest \
  *     --tests "ai.kolai.station.CorpusGenerator" -Dkolai.corpus=1 --console=plain
  *
+ * PARAMS (2026-06-13 diversity measurement): -Dkolai.corpus.n=<int> sets the
+ * song count (default 250) and -Dkolai.corpus.out=<absolutePath> the output
+ * JSONL path (default docs/studies/corpus.jsonl) so a regen run with the new
+ * temperatures can write a SEPARATE file without overwriting the baseline:
+ *   .\gradlew :station:testDebugUnitTest --tests "ai.kolai.station.CorpusGenerator" \
+ *     -Dkolai.corpus=1 -Dkolai.corpus.n=120 \
+ *     -Dkolai.corpus.out=C:/dev/RadioAI/docs/studies/corpus-temp.jsonl --console=plain
+ *
  * WIRING NOTE: the production GeminiLlmClient + DeezerDiscovery adapters live in
  * :app (NOT on the :station test classpath). They are trivially thin, so
  * faithful equivalents are inlined ([HarnessLlmClient], [HarnessDeezerDiscovery]
@@ -52,8 +60,24 @@ class CorpusGenerator {
     private val tasteJson = File(androidDir, "app/src/main/assets/taste.json")
     private val envFile = File(repoRoot, "backend/.env")
     private val studiesDir = File(repoRoot, "docs/studies")
-    private val corpusFile = File(studiesDir, "corpus.jsonl")
-    private val summaryFile = File(studiesDir, "corpus-run-summary.json")
+
+    // SECURITY redaction patterns (2026-06-13). ASCII-only - no Unicode regex
+    // flag (ICU would crash on device per the platform constraint).
+    //  - AIZA_KEY: a Google API key shape (`AIza` + >=20 url-safe chars).
+    //  - KEY_QUERY: a `key=<value>` query substring (the leak vector).
+    private val AIZA_KEY = Regex("AIza[0-9A-Za-z_-]{20,}")
+    private val KEY_QUERY = Regex("key=[0-9A-Za-z_-]{6,}")
+
+    // PARAMETRIZED (2026-06-13 diversity measurement): a measurement run can
+    // write to a SEPARATE file via -Dkolai.corpus.out=<absolutePath> (default
+    // the baseline docs/studies/corpus.jsonl) so it never clobbers the baseline.
+    // -Dkolai.corpus.n=<int> sets the song count (default 250). The summary is
+    // written next to the corpus file, derived from its name, for the same reason.
+    private val corpusFile: File =
+        System.getProperty("kolai.corpus.out")?.takeIf { it.isNotBlank() }?.let { File(it) }
+            ?: File(studiesDir, "corpus.jsonl")
+    private val summaryFile: File =
+        File(corpusFile.parentFile ?: studiesDir, corpusFile.nameWithoutExtension + "-run-summary.json")
 
     @Test
     fun generateCorpus() {
@@ -61,8 +85,34 @@ class CorpusGenerator {
         runBlocking { run() }
     }
 
+    /**
+     * SECURITY (2026-06-13): proves [redactSecrets] scrubs a leaked Gemini key
+     * BEFORE anything is persisted. UNGATED - it runs in the normal
+     * :station:testDebugUnitTest pass, so a regression in the redaction is
+     * caught offline. The leak vector was an error string carrying the request
+     * URL (`...generateContent?key=AIza...`).
+     */
+    @Test
+    fun redactSecrets_scrubs_api_keys_and_key_query_before_persist() {
+        val fakeKey = "AIzaSyA_0123456789abcdefghijKLMNOPQRSTU"
+        val leaked = "HTTP 403 calling " +
+            "https://generativelanguage.googleapis.com/v1beta/models/m:generateContent?key=" + fakeKey
+        val red = redactSecrets(leaked)!!
+        org.junit.Assert.assertFalse("AIza key must be redacted", red.contains("AIza"))
+        org.junit.Assert.assertFalse("the raw key value must be gone", red.contains(fakeKey))
+        org.junit.Assert.assertTrue("redaction marker present", red.contains("[REDACTED]"))
+        // a bare key= value with no AIza prefix is also scrubbed.
+        val bare = redactSecrets("error key=supersecretvalue123 here")!!
+        org.junit.Assert.assertFalse(bare.contains("supersecretvalue123"))
+        org.junit.Assert.assertTrue(bare.contains("key=[REDACTED]"))
+        // null + clean strings pass through untouched.
+        org.junit.Assert.assertEquals(null, redactSecrets(null))
+        org.junit.Assert.assertEquals("just a normal error", redactSecrets("just a normal error"))
+    }
+
     private class HarnessLlmClient(private val textClient: GeminiTextClient) : LlmClient {
-        override suspend fun complete(prompt: String): String = textClient.complete(prompt)
+        override suspend fun complete(prompt: String, temperature: Double?): String =
+            textClient.complete(prompt, temperature = temperature)
     }
     private suspend fun run() {
         val startMs = System.currentTimeMillis()
@@ -139,14 +189,17 @@ class CorpusGenerator {
                 append(",\"deezerGenre\":").append(jstr(deezerGenre))
                 append(",\"djScript\":").append(jstr(djScript))
                 append(",\"djWordCount\":").append(wordCount(djScript))
-                append(",\"error\":").append(jstr(error))
+                append(",\"error\":").append(jstr(redactSecrets(error)))
                 append("}")
             }
             out.append(obj).append("\n")
         }
         val moodPlan = listOf("mix", "party", "late_night", "focus", "morning")
-        val songsPerMood = 50
-        val targetSongs = moodPlan.size * songsPerMood // 250
+        // -Dkolai.corpus.n sets the total song count (default 250). songsPerMood
+        // is derived (ceil n/moods) so n=250 stays byte-identical (50 per mood);
+        // the broadcast loop still caps at targetSongs via break@outer.
+        val targetSongs = System.getProperty("kolai.corpus.n")?.toIntOrNull()?.coerceAtLeast(1) ?: 250
+        val songsPerMood = (targetSongs + moodPlan.size - 1) / moodPlan.size
 
         val partsOfDay = listOf(
             Pair("morning", "07:40"),
@@ -463,6 +516,23 @@ class CorpusGenerator {
 
     private fun wordCount(s: String?): Int =
         s?.trim()?.split(Regex("\\s+"))?.count { it.isNotBlank() } ?: 0
+
+    /**
+     * SECURITY defense-in-depth (2026-06-13): a real Gemini key once leaked into
+     * a committed corpus because a surfaced request URL (which carries
+     * `?key=AIza...`) reached this harness `error` field and was written to
+     * disk. So BEFORE anything is persisted, scrub any Gemini key shape
+     * (`AIza` + >=20 url-safe chars) and any `key=<value>` query substring to
+     * `[REDACTED]`. Even if some future error carries a key, the corpus never
+     * keeps it. ASCII-only patterns (no Unicode regex flag - ICU would crash on
+     * device per the platform constraint).
+     */
+    private fun redactSecrets(s: String?): String? {
+        if (s == null) return null
+        var out = AIZA_KEY.replace(s, "[REDACTED]")
+        out = KEY_QUERY.replace(out, "key=[REDACTED]")
+        return out
+    }
 
     private fun jstr(s: String?): String {
         if (s == null) return "null"
