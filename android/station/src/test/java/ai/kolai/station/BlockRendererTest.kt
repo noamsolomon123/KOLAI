@@ -890,6 +890,112 @@ class BlockRendererTest {
         assertTrue("loads must actually run in parallel", maxSeen.get() >= 2)
     }
 
+    // ---- cold-start overlap: DJ gen/TTS overlaps song load (2026-06-13) -------
+    //
+    // A true cold start has two long, INDEPENDENT legs: the per-song
+    // download+decode+analyze (loadTracks) and the DJ text+TTS (brain + voice).
+    // They used to run SEQUENTIALLY (load all, THEN voice each break in the
+    // assembly), so cold start ~= load + dj. render() now OVERLAPS them: the
+    // moment song 0 is decoded it plans + voices the WHOLE block's DJ audio
+    // while songs 1..n are still loading. These tests use timed fakes (real
+    // Thread.sleep on the IO dispatcher, like the parallel-load tests) and
+    // assert the render wall-time is ~= max(load, dj), NOT the sum.
+
+    /** A fetcher where S0 is FAST and every other song is SLOW: lets the DJ leg
+     *  (which only needs song 0 decoded) start while songs 1..n still load. */
+    private class FastFirstSlowRestFetcher(private val slowMs: Long) : AudioFetcher {
+        override fun fetch(song: Song): String {
+            if (song.title != "S0") Thread.sleep(slowMs)
+            return "/fake/${song.title}.m4a"
+        }
+    }
+
+    /** A voice whose render/renderDialogue blocks for [ttsMs] (the slow TTS leg). */
+    private class SlowVoice(private val ttsMs: Long, private val djSamples: Int) : VoiceRenderer {
+        override fun render(text: String, style: String?, voiceName: String?): DJSlot {
+            Thread.sleep(ttsMs)
+            return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
+        }
+    }
+
+    @Test
+    fun render_dj_generation_overlaps_song_loading() = runTest {
+        // 4 songs: S0 fast, S1..S3 slow (150 ms each, concurrency 3 -> ~150 ms
+        // wall for all loads). maxSilence 1 forces a break at every boundary, so
+        // there are 4 talk events (open + 3 breaks); the slow TTS (120 ms each)
+        // runs CONCURRENTLY (renderDjPcm) and CONCURRENTLY with the song loads.
+        // Sequential lower bound would be load(150) + 4*tts(120)=480 = 630 ms;
+        // overlapped it is ~= max(150 load, song0 + concurrent tts ~120). We
+        // assert well under the sequential sum to prove the overlap.
+        val r = newRenderer(
+            fetcher = FastFirstSlowRestFetcher(slowMs = 150),
+            voice = SlowVoice(ttsMs = 120, djSamples = djSamples),
+            talkChance = 0.0, maxSilence = 1, write = false,
+        )
+        val t0 = System.currentTimeMillis()
+        val result = r.render(songs(4), index = 0, prevTrack = null)
+        val elapsed = System.currentTimeMillis() - t0
+        // sanity: the talk actually rendered (so the TTS really ran)
+        assertTrue("opening + breaks expected", result.meta.talk.size >= 2)
+        // sequential would be >= 150 + 4*120 = 630 ms; overlapped is far less.
+        assertTrue(
+            "DJ TTS must overlap song loading (elapsed=${elapsed}ms, sequential>=630ms)",
+            elapsed < 450,
+        )
+    }
+
+    @Test
+    fun render_talk_event_tts_render_concurrently() = runTest {
+        // All loads fast; only the TTS is slow. With 3 forced breaks + 1 opening
+        // = 4 slow (120 ms) TTS calls: sequential would be ~480 ms; rendered
+        // CONCURRENTLY (renderDjPcm) it is ~= one TTS (~120 ms) plus mix.
+        val r = newRenderer(
+            voice = SlowVoice(ttsMs = 120, djSamples = djSamples),
+            talkChance = 0.0, maxSilence = 1, write = false,
+        )
+        val t0 = System.currentTimeMillis()
+        val result = r.render(songs(4), index = 0, prevTrack = null)
+        val elapsed = System.currentTimeMillis() - t0
+        assertTrue("opening + breaks expected", result.meta.talk.size >= 2)
+        assertTrue(
+            "talk-event TTS must render in parallel (elapsed=${elapsed}ms, sequential>=480ms)",
+            elapsed < 360,
+        )
+    }
+
+    @Test
+    fun render_overlap_preserves_sample_accurate_meta() = runTest {
+        // The overlap must not perturb the assembly: with the same fixtures as
+        // the non-overlap timing-free tests, the segment + talk meta is exactly
+        // what the sequential renderer produced. 2 songs, forced break at
+        // boundary 1 -> tight talk-over segue (1.5 s) -> 18.5 s total, and the
+        // boundary segment starts at the full outgoing-song length.
+        val result = newRenderer(talkChance = 0.0, maxSilence = 1)
+            .render(songs(2), index = 0, prevTrack = null)
+        assertEquals(18.5, result.meta.durationS, 0.01)
+        assertEquals(10.0, result.meta.segments[1].startS, 0.01)
+        // talk meta sample-accurate: a break ducked at tail, start_s <= end_s.
+        for (tk in result.meta.talk) assertTrue("talk start <= end", tk.startS <= tk.endS)
+    }
+
+    @Test
+    fun render_overlap_still_skips_a_failed_song_load() = runTest {
+        // The reconcile path: S1 fails to load -> it is dropped, the remaining
+        // 3 songs play, and the cadence is recomputed over the LOADED songs
+        // exactly like the pre-overlap renderer (no double talk, no crash).
+        val r = newRenderer(
+            fetcher = FakeFetcher(failTitles = setOf("S1")),
+            talkChance = 0.0, write = false,
+        )
+        val result = r.render(songs(4), index = 0, prevTrack = null)
+        val titles = result.meta.segments.map { it.title }
+        assertFalse("failed fetch must be skipped", titles.contains("S1"))
+        assertEquals(3, result.meta.segments.size)
+        // monotonic segments + valid talk meta after the reconcile re-plan.
+        val starts = result.meta.segments.map { it.startS }
+        for (k in 1 until starts.size) assertTrue(starts[k] > starts[k - 1])
+    }
+
     // ---- show formats (wave 3): recap opening + day-part handover -----------
 
     /** Songs whose tasteRank equals their index (all < TASTE_WINK_MAX_RANK). */

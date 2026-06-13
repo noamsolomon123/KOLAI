@@ -229,6 +229,58 @@ class BlockRenderer(
         lastMs == null || nowMs() - lastMs >= spacingMs
 
     /**
+     * Snapshot of the cross-block CADENCE state that [planEvents] mutates
+     * (cold-start overlap, 2026-06-13). [render] runs [planEvents] SPECULATIVELY
+     * over the picked [songs] CONCURRENTLY with the loads; on the common path
+     * (every song loaded) the speculative plan is the real plan. On the RARE
+     * load-failure path (the loaded set differs from the picked set) the plan
+     * must be recomputed over the LOADED songs to keep cadence/latch behavior
+     * byte-identical to the pre-overlap renderer - so we capture this snapshot
+     * BEFORE the speculative run and RESTORE it before re-planning. The
+     * [pendingBanter]/[pendingDialogue]/[pendingSidekickVoice] maps need no
+     * capture: [planEvents] clears them at its top, so a re-run rebuilds them.
+     */
+    private data class CadenceState(
+        val songsSinceTalk: Int,
+        val talkCount: Int,
+        val beatK: Int,
+        val topicK: Int,
+        val sidekickRot: Int,
+        val lastAnchor: String?,
+        val lastPartOfDay: String?,
+        val lastWinkMs: Long?,
+        val lastGoodThingMs: Long?,
+        val lastCalendarMentionMs: Long?,
+        val lastTriviaMs: Long?,
+        val lastCueMs: Long?,
+        val blockTtsStyle: String?,
+        val blockVoice: String?,
+    )
+
+    private fun snapshotCadence(): CadenceState = CadenceState(
+        songsSinceTalk, talkCount, beatK, topicK, sidekickRot, lastAnchor,
+        lastPartOfDay, lastWinkMs, lastGoodThingMs, lastCalendarMentionMs,
+        lastTriviaMs, lastCueMs, blockTtsStyle, blockVoice,
+    )
+
+    private fun restoreCadence(s: CadenceState) {
+        songsSinceTalk = s.songsSinceTalk
+        talkCount = s.talkCount
+        beatK = s.beatK
+        topicK = s.topicK
+        sidekickRot = s.sidekickRot
+        lastAnchor = s.lastAnchor
+        lastPartOfDay = s.lastPartOfDay
+        lastWinkMs = s.lastWinkMs
+        lastGoodThingMs = s.lastGoodThingMs
+        lastCalendarMentionMs = s.lastCalendarMentionMs
+        lastTriviaMs = s.lastTriviaMs
+        lastCueMs = s.lastCueMs
+        blockTtsStyle = s.blockTtsStyle
+        blockVoice = s.blockVoice
+    }
+
+    /**
      * Feature 7: the ctx actually handed to DjBrain. While the calendar gate
      * is CLOSED (a talk mentioned the note less than
      * [CALENDAR_MENTION_SPACING_MS] ago) the calendarNote is stripped so the
@@ -313,35 +365,52 @@ class BlockRenderer(
         // blocks never serves a stale window.
         safeIntroByPath.clear()
         val gate = Semaphore(LOAD_CONCURRENCY)
-        songs.map { song ->
-            async(loadDispatcher) {
-                gate.withPermit {
-                    try {
-                        val path = fetcher.fetch(song)
-                        val audio = Dsp.microFadeEdges(
-                            Dsp.trimTrailingSilence(
-                                Dsp.normalizeLoudness(loadFn(path), targetRms = songTargetRms, maxGain = LOUDNESS_MAX_GAIN),
-                                sr = Dsp.SR,
-                            )
-                        )
-                        // VOCAL-ONSET (task 3, 2026-06-13): measure the safe
-                        // instrumental window at this song's start on the
-                        // CONDITIONED PCM (the audio the listener hears), so the
-                        // opener / intro talk-over never lands over a singer.
-                        // Computed here because loadTracks is the only place the
-                        // decoded PCM exists. SAFETY-biased inside VocalOnset.
-                        safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
-                        LoadedTrack(song, analyzeFn(path), audio, path)
-                    } catch (e: CancellationException) {
-                        throw e // cooperative cancellation must propagate
-                    } catch (e: Exception) {
-                        // Python prints "  [skip] ..."; we silently drop (no stdout in lib).
-                        null
-                    }
-                }
-            }
-        }.awaitAll().filterNotNull()
+        songs.map { song -> async(loadDispatcher) { loadOne(gate, song) } }
+            .awaitAll().filterNotNull()
     }
+
+    /**
+     * Load + condition + analyze ONE song under the in-flight [gate], returning
+     * null on failure (Python skip-on-failure). Extracted from [loadTracks] so
+     * [render] can launch the per-song loads as INDIVIDUAL deferreds (task
+     * 2026-06-13, cold-start overlap): the DJ text+TTS leg only needs song 0''s
+     * decoded audio (the opener''s vocal-onset/budget) plus the [Song] objects,
+     * so it can run CONCURRENTLY while songs 1..n are still downloading/decoding.
+     *
+     * Per-song audio conditioning, in order:
+     *  1. normalizeLoudness - YouTube masters differ by many dB; radio is
+     *     loudness-consistent.
+     *  2. trimTrailingSilence (feature 13a) - YouTube-muxed files often carry a
+     *     long silent music-video tail; drop it (keeping 0.5 s of breath) so
+     *     crossfades never blend into dead air.
+     *  3. microFadeEdges - decoded-AAC boundaries never click (runs LAST so the
+     *     trimmed edge is what gets faded to exactly zero).
+     */
+    private suspend fun loadOne(gate: Semaphore, song: Song): LoadedTrack? =
+        gate.withPermit {
+            try {
+                val path = fetcher.fetch(song)
+                val audio = Dsp.microFadeEdges(
+                    Dsp.trimTrailingSilence(
+                        Dsp.normalizeLoudness(loadFn(path), targetRms = songTargetRms, maxGain = LOUDNESS_MAX_GAIN),
+                        sr = Dsp.SR,
+                    )
+                )
+                // VOCAL-ONSET (task 3, 2026-06-13): measure the safe
+                // instrumental window at this song''s start on the
+                // CONDITIONED PCM (the audio the listener hears), so the
+                // opener / intro talk-over never lands over a singer.
+                // Computed here because loadTracks is the only place the
+                // decoded PCM exists. SAFETY-biased inside VocalOnset.
+                safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
+                LoadedTrack(song, analyzeFn(path), audio, path)
+            } catch (e: CancellationException) {
+                throw e // cooperative cancellation must propagate
+            } catch (e: Exception) {
+                // Python prints "  [skip] ..."; we silently drop (no stdout in lib).
+                null
+            }
+        }
     // -------------------------------------------------------------------- plan
     /**
      * Python: _plan. Decide the timeline of events for this block. The opening
@@ -358,6 +427,25 @@ class BlockRenderer(
      */
     suspend fun planFor(
         tracks: List<LoadedTrack>,
+        prevTrack: LoadedTrack?,
+        openingStartS: Double = 0.5,
+    ): List<PlanEvent> = planEvents(tracks.map { it.song }, tracks[0], prevTrack, openingStartS)
+
+    /**
+     * The DECIDE step (the body of [planFor]) driven by the picked [songs] +
+     * the opener's loaded [song0] instead of the full loaded track list. This
+     * is what makes the cold-start overlap (2026-06-13) honest and SAFE: the
+     * per-boundary cadence reads ONLY [Song] objects ([songs]), and the only
+     * decoded-audio dependency is the OPENER (song 0's vocal-onset/budget), so
+     * [render] can run this CONCURRENTLY with the still-in-flight loads of
+     * songs 1..n the moment song 0 is decoded. [planFor] (public, for tests)
+     * delegates here with `tracks.map { it.song }` + `tracks[0]`, so behavior
+     * is byte-identical to before: the boundary loop never touched anything but
+     * `tracks[i].song` / `tracks[i-1].song`.
+     */
+    suspend fun planEvents(
+        songs: List<Song>,
+        song0: LoadedTrack,
         prevTrack: LoadedTrack?,
         openingStartS: Double = 0.5,
     ): List<PlanEvent> {
@@ -411,14 +499,14 @@ class BlockRenderer(
         // safe placement) still carries the DJ. recapBrief openings keep their
         // own budget but are guarded too. We never block the opener purely on
         // the introEndS budget - only the true vocal onset.
-        val openerSafe = safeIntroFor(tracks[0]) >= SAFE_INTRO_MIN_S
-        val firstSong = tracks[0].song
+        val openerSafe = safeIntroFor(song0) >= SAFE_INTRO_MIN_S
+        val firstSong = song0.song
         if (prevTrack != null) {
             val prevSong = prevTrack.song
             val openCtx = gatedCtx(ctx)
             val text = if (openerSafe) brain.writeBreak(
                 prev = prevSong, nxt = firstSong, beat = "song", ctx = openCtx,
-                seconds = openingSeconds(tracks[0], openingStartS, defaultS = 8.0),
+                seconds = openingSeconds(song0, openingStartS, defaultS = 8.0),
                 topic = null, allowSkip = false,
             ) else null
             if (!text.isNullOrEmpty()) {
@@ -442,7 +530,7 @@ class BlockRenderer(
                     brain.writeRecapOpening(nxt = firstSong, ctx = openCtx, seconds = 20.0)
                 else -> brain.writeOpening(
                     nxt = firstSong, ctx = openCtx,
-                    seconds = openingSeconds(tracks[0], openingStartS, defaultS = 10.0),
+                    seconds = openingSeconds(song0, openingStartS, defaultS = 10.0),
                 )
             }
             if (text.isNotEmpty()) {
@@ -455,7 +543,7 @@ class BlockRenderer(
         events.add(PlanEvent(kind = "song", i = 0))
 
         // ---- per-boundary cadence ----------------------------------------
-        for (i in 1 until tracks.size) {
+        for (i in 1 until songs.size) {
             songsSinceTalk = if (songsSinceTalk == Int.MAX_VALUE) Int.MAX_VALUE else songsSinceTalk + 1
             val forced = songsSinceTalk >= maxSilence
             // never talk two boundaries in a row (>= 2 since last talk) unless
@@ -469,7 +557,7 @@ class BlockRenderer(
             if (eligible && handoverPending) {
                 handoverPending = false
                 val hCtx = gatedCtx(ctx)
-                val text = brain.writeHandover(ctx = hCtx, nxt = tracks[i].song)
+                val text = brain.writeHandover(ctx = hCtx, nxt = songs[i])
                 if (text.isNotEmpty()) {
                     events.add(PlanEvent(kind = "break", i = i, text = text, beat = "handover"))
                     recordTalk(hCtx)
@@ -485,7 +573,7 @@ class BlockRenderer(
                 latchOpen(lastGoodThingMs, GOOD_THING_SPACING_MS)
             ) {
                 val gCtx = gatedCtx(ctx)
-                val text = brain.writeGoodThing(ctx = gCtx, nxt = tracks[i].song)
+                val text = brain.writeGoodThing(ctx = gCtx, nxt = songs[i])
                 if (text.isNotEmpty()) {
                     events.add(PlanEvent(kind = "break", i = i, text = text, beat = "good_thing"))
                     recordTalk(gCtx)
@@ -505,7 +593,7 @@ class BlockRenderer(
                 latchOpen(lastTriviaMs, TRIVIA_SPACING_MS)
             ) {
                 val tCtx = gatedCtx(ctx)
-                val turns = brain.writeTrivia(nxt = tracks[i].song, ctx = tCtx)
+                val turns = brain.writeTrivia(nxt = songs[i], ctx = tCtx)
                 if (turns.isNotEmpty()) {
                     pendingDialogue[i] = turns
                     events.add(PlanEvent(kind = "break", i = i, text = joinDialogue(turns), beat = "trivia"))
@@ -538,7 +626,7 @@ class BlockRenderer(
                     // effort (empty list -> the single constructor voiceB).
                     val sidekickIndex = sidekickRot
                     val turns = brain.writeBanter(
-                        prev = tracks[i - 1].song, nxt = tracks[i].song,
+                        prev = songs[i - 1], nxt = songs[i],
                         ctx = bCtx, seconds = 14.0, sidekickIndex = sidekickIndex,
                     )
                     if (turns.isNotEmpty()) {
@@ -555,7 +643,7 @@ class BlockRenderer(
                         val seconds = if (forced) 16.0 else 12.0
                         val fCtx = gatedCtx(ctx)
                         val text = brain.writeBreak(
-                            prev = tracks[i - 1].song, nxt = tracks[i].song, beat = "song",
+                            prev = songs[i - 1], nxt = songs[i], beat = "song",
                             ctx = fCtx, seconds = seconds, topic = topic,
                             allowSkip = !forced,
                         )
@@ -580,7 +668,7 @@ class BlockRenderer(
                     val cue = if (beat == "song" && prevTrack != null && !ctx.somber &&
                         latchOpen(lastCueMs, LISTENING_CUE_SPACING_MS)
                     ) {
-                        brain.writeListeningCue(nxt = tracks[i].song, ctx = bCtx)
+                        brain.writeListeningCue(nxt = songs[i], ctx = bCtx)
                     } else {
                         ""
                     }
@@ -597,17 +685,17 @@ class BlockRenderer(
                         // the wink allowed; the brain still gates
                         // rank < TASTE_WINK_MAX_RANK. The latch is recorded on
                         // ENABLING, not on render/rank success - simpler, fine.
-                        val wink = beat == "song" && tracks[i].song.tasteRank != null &&
+                        val wink = beat == "song" && songs[i].tasteRank != null &&
                             latchOpen(lastWinkMs, TASTE_WINK_SPACING_MS)
                         val text = if (wink) {
                             lastWinkMs = nowMs()
                             brain.writeIntro(
-                                prev = tracks[i - 1].song, nxt = tracks[i].song,
+                                prev = songs[i - 1], nxt = songs[i],
                                 seconds = seconds, ctx = bCtx, allowTasteWink = true,
                             )
                         } else {
                             brain.writeBreak(
-                                prev = tracks[i - 1].song, nxt = tracks[i].song, beat = beat,
+                                prev = songs[i - 1], nxt = songs[i], beat = beat,
                                 ctx = bCtx, seconds = seconds, topic = topic,
                                 allowSkip = !forced,
                             )
@@ -759,18 +847,40 @@ class BlockRenderer(
         return if (n in 1 until audio.size) audio.copyOfRange(n, audio.size) else audio
     }
     // ----------------------------------------------------------------- render
-    /** Python: render. */
-    suspend fun render(songs: List<Song>, index: Int, prevTrack: LoadedTrack? = null): BlockResult {
-        // 1. load + analyze each song IN PARALLEL (order kept), skipping failures
-        val tracks = loadTracks(songs)
-        if (tracks.isEmpty()) {
-            throw IllegalArgumentException("No playable tracks in block")
-        }
+    /**
+     * Python: render. COLD-START OVERLAP (2026-06-13): the two long, INDEPENDENT
+     * legs of a block-0 render are (a) the per-song download + decode + Essentia
+     * analysis ([loadTracks], itself 3-way parallel) and (b) the DJ TEXT
+     * generation + TTS synthesis (the brain.write* LLM calls + voice.render /
+     * renderDialogue + prepareVoice). On a true cold start these used to run
+     * SEQUENTIALLY (load ALL tracks, THEN plan, THEN voice each talk event in
+     * the assembly loop), so cold start was ~= load + dj. They are now
+     * OVERLAPPED: we launch the per-song loads, and the moment SONG 0 is decoded
+     * (all the opener's vocal-onset / intro-budget needs) we plan + synthesize
+     * the WHOLE block's DJ audio CONCURRENTLY while songs 1..n are still
+     * downloading/decoding/analyzing. Cold start becomes ~= max(load, dj) + mix.
+     *
+     * What MUST stay sequential, and why:
+     *  - The OPENER's vocal-onset guard + intro-budget ([openingSeconds]) need
+     *    song 0's DECODED audio, so DJ generation waits for song 0 (only song 0,
+     *    not the whole setlist).
+     *  - The final ASSEMBLY (outro cuts, beat-snapped crossfades, the duck
+     *    placement + sample-accurate startS/endS meta) needs BOTH the decoded
+     *    songs AND the DJ PCM, so it still runs after both legs finish - only the
+     *    GENERATION of the DJ audio moved earlier/concurrent; the placement math
+     *    is byte-identical to before.
+     *  - On the RARE load-FAILURE path (a fetched/decoded song dropped) the
+     *    speculative plan was computed over the picked setlist, not the loaded
+     *    one; we then RESTORE the cadence state and re-plan + re-voice over the
+     *    loaded songs sequentially, exactly like the pre-overlap renderer.
+     */
+    suspend fun render(songs: List<Song>, index: Int, prevTrack: LoadedTrack? = null): BlockResult = coroutineScope {
+        require(songs.isNotEmpty()) { "No songs to render in block" }
 
         // session ident (deviation 6): rendered BEFORE planning so the opening
         // duck start is known to planFor's vocal-aware budget (feature 15).
         // The opening DJ duck shifts right by (identDur - overlap) so the DJ
-        // speaks just as the music takes over.
+        // speaks just as the music takes over. Pure code-gen, cheap, synchronous.
         var openingDuckStartS = 0.5
         var identAudio: FloatArray? = null
         val identFn = ident
@@ -780,10 +890,51 @@ class BlockRenderer(
             openingDuckStartS = identDur - IDENT_OVERLAP_S + 0.5
         }
 
-        // 2. plan the cadence
-        val events = planFor(tracks, prevTrack, openingDuckStartS)
+        // 1. launch the per-song loads as INDIVIDUAL deferreds (still capped at
+        // LOAD_CONCURRENCY in-flight via the shared gate, still IO-dispatched,
+        // still order-preserving). song 0's deferred is awaited early by the DJ
+        // leg; the rest keep loading while the DJ is generated + voiced.
+        safeIntroByPath.clear()
+        val gate = Semaphore(LOAD_CONCURRENCY)
+        val loadDeferreds = songs.map { song -> async(loadDispatcher) { loadOne(gate, song) } }
 
-        // 3. assemble audio + collect timings
+        // 2. DJ leg: as soon as SONG 0 is decoded, plan the cadence over the
+        // picked songs (the boundary text needs only Song titles/artists) and
+        // synthesize EVERY talk event's DJ PCM concurrently - all while songs
+        // 1..n are still loading. Speculative over the picked setlist; the
+        // cadence snapshot lets render() recompute on the rare load-failure path.
+        val cadenceBefore = snapshotCadence()
+        val djDeferred = async {
+            val song0 = loadDeferreds[0].await()
+                ?: throw IllegalArgumentException("No playable tracks in block")
+            val events = planEvents(songs, song0, prevTrack, openingDuckStartS)
+            DjPlan(events, renderDjPcm(events))
+        }
+
+        // 3. await everything: the full loaded track list (skip-on-failure) and
+        // the speculative DJ leg.
+        val tracks = loadDeferreds.awaitAll().filterNotNull()
+        if (tracks.isEmpty()) {
+            djDeferred.cancel()
+            throw IllegalArgumentException("No playable tracks in block")
+        }
+        var djPlan = djDeferred.await()
+
+        // RECONCILE: the speculative plan + DJ were built over the PICKED songs.
+        // If every song loaded (the common cold-start case) the loaded order is
+        // identical and the speculative work IS the real work. If a song was
+        // dropped, restore the cadence state and re-plan + re-voice over the
+        // LOADED songs - byte-identical to the pre-overlap sequential renderer.
+        if (tracks.size != songs.size || tracks.map { it.song } != songs) {
+            restoreCadence(cadenceBefore)
+            val loadedSongs = tracks.map { it.song }
+            val events = planEvents(loadedSongs, tracks[0], prevTrack, openingDuckStartS)
+            djPlan = DjPlan(events, renderDjPcm(events))
+        }
+        val events = djPlan.events
+        val dj = djPlan.dj
+
+        // 4. assemble audio + collect timings (needs BOTH decoded songs + DJ PCM)
         var timeline = tracks[0].audio
         val songEvents = ArrayList<SongEvent>()
         val talk = ArrayList<TalkEntry>()
@@ -793,12 +944,14 @@ class BlockRenderer(
             timeline = Dsp.equalPowerCrossfade(identAudio, timeline, overlapS = IDENT_OVERLAP_S)
         }
 
-        // opening talkover (if any) - DJ over the intro of song 0
+        // opening talkover (if any) - DJ over the intro of song 0. The DJ PCM
+        // was already synthesized (concurrently with the loads); placement +
+        // duck math + meta are unchanged.
         val opening = events.firstOrNull { it.kind == "open" }
-        if (opening != null) {
-            // PER-MOOD VOICE (task 1): the opening rides the block's mood voice.
-            val slot = voice.render(opening.text!!, style = blockTtsStyle, voiceName = blockVoice)
-            val djAudio = prepareVoice(slot.audioPath)
+        val openingDj = opening?.let { dj[it.i to "open"] }
+        if (opening != null && openingDj != null) {
+            val rendered = openingDj
+            val djAudio = rendered.pcm
             val djDur = djAudio.size.toDouble() / Dsp.SR
             val startS = openingDuckStartS
             timeline = Dsp.duck(
@@ -807,7 +960,7 @@ class BlockRenderer(
             )
             talk.add(
                 TalkEntry(
-                    beat = "song", text = slot.text,
+                    beat = "song", text = rendered.text,
                     startS = round2(startS), endS = round2(startS + djDur),
                 )
             )
@@ -827,7 +980,12 @@ class BlockRenderer(
             val track = tracks[i]
             val song = track.song
 
-            val talkEvent = events.firstOrNull { it.i == i && it.kind == "break" }
+            // A planned break whose TTS failed to synthesize degrades like the
+            // pre-overlap renderer: it is treated as NO talk at this boundary
+            // (the song still plays, the outro cut + musical segue apply).
+            val plannedBreak = events.firstOrNull { it.i == i && it.kind == "break" }
+            val breakDj = plannedBreak?.let { dj[i to "break"] }
+            val talkEvent = if (breakDj != null) plannedBreak else null
 
             // ANALYSIS-DRIVEN OUTRO CUT (feature 13a), pure-music segues only:
             // the timeline currently ends with the OUTGOING song's tail, so
@@ -848,35 +1006,14 @@ class BlockRenderer(
             val boundary = round2(timeline.size.toDouble() / Dsp.SR)
 
             if (talkEvent != null) {
-                // TWO-HOST BANTER (feature 11): a "banter" beat carries the
-                // planned turns in [pendingBanter]; with a configured [voiceB]
-                // they render through the dialogue seam (the :app adapter
-                // overrides it with multi-speaker TTS in wave 4 - the seam
-                // DEFAULT body is still single-voice). Without a voiceB the
-                // joined script (the event text) renders single-voice - the
-                // pre-wave-3 substitute behavior.
-                // A "banter" or "trivia" beat carries planned two-host turns
-                // (banter in [pendingBanter], trivia in [pendingDialogue]); with
-                // a configured co-host voice they render through the dialogue
-                // seam, with the MAIN host on the block's mood voice ([voiceA] =
-                // blockVoice) and the sidekick on the rotated voiceB (banter)
-                // or the constructor [voiceB]. Without a voiceB the joined
-                // script renders single-voice in the mood voice.
-                val dialogueTurns = when (talkEvent.beat) {
-                    "banter" -> pendingBanter.remove(i)
-                    "trivia" -> pendingDialogue.remove(i)
-                    else -> null
-                }
-                val sidekick = pendingSidekickVoice.remove(i) ?: voiceB
-                val slot = if (dialogueTurns != null && sidekick != null) {
-                    voice.renderDialogue(dialogueTurns, sidekick, style = blockTtsStyle, voiceA = blockVoice)
-                } else {
-                    voice.render(talkEvent.text!!, style = blockTtsStyle, voiceName = blockVoice)
-                }
-                val djAudio = prepareVoice(slot.audioPath)
+                // The talk event's DJ PCM was already synthesized (concurrently
+                // with the loads, via renderDjPcm, which made the banter/trivia
+                // dialogue-vs-single-voice decision exactly as the assembly used
+                // to). Here we only PLACE it: duck the DJ over the TAIL of the
+                // current timeline (talkover), then crossfade into the next song.
+                val rendered = breakDj!!
+                val djAudio = rendered.pcm
                 val djDur = djAudio.size.toDouble() / Dsp.SR
-                // duck the DJ over the TAIL of the current timeline (talkover),
-                // then crossfade into the next song.
                 val duckStart = maxOf(
                     0.0, timeline.size.toDouble() / Dsp.SR - djDur - segueS - 0.3
                 )
@@ -886,7 +1023,7 @@ class BlockRenderer(
                 )
                 talk.add(
                     TalkEntry(
-                        beat = talkEvent.beat ?: "song", text = slot.text,
+                        beat = talkEvent.beat ?: "song", text = rendered.text,
                         startS = round2(duckStart), endS = round2(duckStart + djDur),
                     )
                 )
@@ -911,7 +1048,7 @@ class BlockRenderer(
             )
         }
 
-        // 4. soft-limit the assembled block: crossfade overlaps + ducked
+        // 5. soft-limit the assembled block: crossfade overlaps + ducked
         // voice + normalization gain can push instantaneous peaks past 1.0
         // (hard clip = audible crackle). softClip is bit-exact below 0.95 and
         // tanh-knees only the overshoot. Then write (.m4a / AAC) + meta.
@@ -925,8 +1062,71 @@ class BlockRenderer(
         val segments = buildSegments(songEvents, totalS)
         val meta = BlockMeta(index = index, durationS = totalS, segments = segments, talk = talk)
 
-        return BlockResult(audio = timeline, meta = meta, path = path, lastTrack = tracks.last())
+        BlockResult(audio = timeline, meta = meta, path = path, lastTrack = tracks.last())
     }
+
+    /** One talk event's synthesized DJ artifact: the on-air [text] (from the
+     *  voiced [DJSlot]) and the conditioned mono PCM ready to duck. */
+    private data class RenderedDj(val text: String, val pcm: FloatArray)
+
+    /** The planned events + every talk event's pre-synthesized DJ audio, keyed
+     *  by `(event.i to event.kind)` ("open"/"break"). */
+    private data class DjPlan(
+        val events: List<PlanEvent>,
+        val dj: Map<Pair<Int, String>, RenderedDj>,
+    )
+
+    /**
+     * Synthesize the DJ audio for EVERY talk event CONCURRENTLY (cold-start
+     * overlap, 2026-06-13). This is the network-bound TTS leg (voice.render /
+     * renderDialogue is Gemini TTS in prod) that used to run one-event-at-a-time
+     * inside the assembly loop AFTER all songs loaded; rendering the talk events
+     * in parallel (and concurrently with the song loads, see [render]) is the
+     * cold-start win. The banter/trivia dialogue-vs-single-voice DECISION is made
+     * here exactly as the assembly used to (reading the [pendingBanter] /
+     * [pendingDialogue] / [pendingSidekickVoice] maps planEvents filled), so the
+     * voiced text + meta are byte-identical to before; only the GENERATION moved.
+     *
+     * A per-event TTS failure must DEGRADE like before (skip that talk, not
+     * crash): the events map simply omits the event, and the assembly skips any
+     * talk event with no rendered audio. prepareVoice (the decode + broadcast
+     * chain) runs on [loadDispatcher] since it is blocking I/O + DSP.
+     */
+    private suspend fun renderDjPcm(events: List<PlanEvent>): Map<Pair<Int, String>, RenderedDj> =
+        coroutineScope {
+            // Resolve the dialogue selection SEQUENTIALLY first (cheap map
+            // lookups; concurrent remove() on a plain HashMap is unsafe), then
+            // fire the actual TTS concurrently.
+            val jobs = events.filter { it.kind == "open" || it.kind == "break" }.map { ev ->
+                val i = ev.i
+                val dialogueTurns = when (ev.beat) {
+                    "banter" -> pendingBanter.remove(i)
+                    "trivia" -> pendingDialogue.remove(i)
+                    else -> null
+                }
+                val sidekick = pendingSidekickVoice.remove(i) ?: voiceB
+                Triple(ev, dialogueTurns, sidekick)
+            }
+            jobs.map { (ev, dialogueTurns, sidekick) ->
+                async(loadDispatcher) {
+                    try {
+                        val slot = if (ev.kind == "break" && dialogueTurns != null && sidekick != null) {
+                            voice.renderDialogue(dialogueTurns, sidekick, style = blockTtsStyle, voiceA = blockVoice)
+                        } else {
+                            voice.render(ev.text!!, style = blockTtsStyle, voiceName = blockVoice)
+                        }
+                        val pcm = prepareVoice(slot.audioPath)
+                        (ev.i to ev.kind) to RenderedDj(slot.text, pcm)
+                    } catch (e: CancellationException) {
+                        throw e // cooperative cancellation must propagate
+                    } catch (e: Exception) {
+                        // DJ-gen failure degrades like today: skip this talk
+                        // (the assembly omits any event with no rendered audio).
+                        null
+                    }
+                }
+            }.awaitAll().filterNotNull().toMap()
+        }
 
     companion object {
         /** Equal-power overlap (s) between the session ident and song 0. */
