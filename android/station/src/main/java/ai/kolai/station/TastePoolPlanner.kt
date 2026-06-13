@@ -117,6 +117,10 @@ class TastePoolPlanner(
     private val bpmLookupCap: Int = 30,
     private val genre: GenreSource? = null,
     private val genreLookupCap: Int = 30,
+    // ARTIST BANLIST (2026-06-14): normalized (lowercase/trimmed) artist names
+    // that must NEVER be picked -- filtered from BOTH the taste pool and
+    // discovery. Empty disables it. Wired from DevConfig.bannedArtists.
+    private val bannedArtists: Set<String> = emptySet(),
 ) : SetlistSource {
 
     private companion object {
@@ -207,6 +211,8 @@ class TastePoolPlanner(
         taste.topTracks.forEachIndexed { index, t ->
             val title = t.title.trim()
             if (title.isEmpty()) return@forEachIndexed
+            val artistLower = t.artist.trim().lowercase()
+            if (artistLower in bannedArtists) return@forEachIndexed
             val key = baseTitle(title)
             if (key.isEmpty() || !poolKeys.add(key)) return@forEachIndexed
             pool.add(
@@ -214,7 +220,7 @@ class TastePoolPlanner(
                     track = t,
                     rank = index,
                     key = key,
-                    artistLower = t.artist.trim().lowercase(),
+                    artistLower = artistLower,
                     hebrew = containsHebrew(title),
                     weight = 1.0 / (index + 6),
                 ),
@@ -370,12 +376,14 @@ class TastePoolPlanner(
                         excludeArtists = buildSet {
                             picks.forEach { p -> if (p.artist.isNotBlank()) add(p.artist) }
                             seed?.artist?.takeIf { it.isNotBlank() }?.let { add(it) }
+                            bannedArtists.forEach { add(it) }
                         },
                     )
                 } catch (e: Exception) {
                     null
                 }
-                if (found != null && found.title.isNotBlank() && found.artist.isNotBlank()) {
+                if (found != null && found.title.isNotBlank() && found.artist.isNotBlank() &&
+                    found.artist.trim().lowercase() !in bannedArtists) {
                     val key = baseTitle(found.title)
                     if (key !in excludeKeys && key !in chosenKeys) {
                         picks.add(found)

@@ -99,6 +99,9 @@ class KolaiEngine private constructor(
             // Sidekick co-host voices rotated alongside the banter persona
             // (2026-06-13). Empty -> the single ttsVoiceB is always used.
             sidekickVoices: List<String> = emptyList(),
+            // ARTIST BANLIST (2026-06-14): normalized artist names the picker must
+            // never select (taste pool + discovery). Empty -> no bans.
+            bannedArtists: Set<String> = emptySet(),
         ): KolaiEngine {
             require(geminiKeys.isNotEmpty()) { "KolaiEngine needs at least one Gemini key" }
             cacheDir.mkdirs()
@@ -161,6 +164,7 @@ class KolaiEngine private constructor(
                 curator = MoodCurator(llm),
                 bpm = bpmSource,
                 genre = genreSource,
+                bannedArtists = bannedArtists,
             )
 
             // PER-MOOD VOICE resolver: an override wins, else the Moods

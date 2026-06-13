@@ -33,6 +33,13 @@ data class DevConfig(
      * the BlockRenderer call sites.
      */
     val moodVoices: Map<String, String>,
+    /**
+     * OPTIONAL artist BANLIST (ans.artists, comma-separated). Any song whose
+     * artist matches (case-insensitive, trimmed) is NEVER picked -- from the taste
+     * pool OR discovery. Empty when unset. Edit kolai_dev.properties to ban/unban
+     * without recompiling the picker.
+     */
+    val bannedArtists: List<String>,
 ) {
     companion object {
         private const val ASSET = "kolai_dev.properties"
@@ -69,6 +76,13 @@ data class DevConfig(
                     ?.let { mood to it }
             }.toMap()
 
+            // OPTIONAL artist banlist: comma-separated ans.artists. Trimmed,
+            // blanks dropped; lowercase normalization happens at the picker boundary.
+            val bannedArtists = (props.getProperty("bans.artists") ?: "")
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+
             return DevConfig(
                 geminiKeys = keys,
                 llmModel = props.getProperty("gemini.llm.model")?.trim()
@@ -82,6 +96,7 @@ data class DevConfig(
                 ttsVoiceB = props.getProperty("gemini.tts.voice.b")?.trim()
                     ?.takeIf { it.isNotEmpty() } ?: "Iapetus",
                 moodVoices = moodVoices,
+                bannedArtists = bannedArtists,
             )
         }
     }

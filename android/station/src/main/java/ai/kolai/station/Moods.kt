@@ -99,11 +99,11 @@ object Moods {
             key = "late_night",
             talkChance = 0.3, banterChance = 0.1, maxSilence = 5,
             voiceName = "Enceladus",
-            ttsStyle = "Read this softly and slowly, like an intimate late-night " +
-                "radio host. Low, gentle, almost whispered, unhurried and " +
+            ttsStyle = "Read this calmly, warmly and slowly, like a relaxed late-night " +
+                "radio host. Gentle, unhurried, in a normal soft voice - NOT whispered, NOT breathy, NOT intimate, and " +
                 "calming. Do NOT raise your energy or sound excited. Speak " +
                 "only the Hebrew, naturally:",
-            djLine = "השידור עכשיו במצב לילה - דבר רך, איטי ואינטימי, טון נמוך ורגוע.",
+            djLine = "השידור עכשיו במצב לילה - דבר רך, רגוע וחם, טון נמוך ונעים - לא לוחשני ולא אינטימי.",
             curationHint = "low-energy, slow, smooth, intimate late-night songs - mellow " +
                 "R&B, downtempo, soft ballads, chill electronic, dreamy vibes; " +
                 "avoid loud high-tempo bangers",

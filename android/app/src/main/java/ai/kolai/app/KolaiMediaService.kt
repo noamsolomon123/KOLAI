@@ -310,6 +310,12 @@ class KolaiMediaService : MediaLibraryService() {
                 // PER-MOOD VOICE overrides from kolai_dev.properties: an
                 // override wins over the Moods default; empty keeps stock.
                 moodVoices = cfg.moodVoices,
+                // ARTIST BANLIST from kolai_dev.properties (bans.artists),
+                // normalized so the picker compares lowercase/trimmed.
+                bannedArtists = cfg.bannedArtists
+                    .map { it.trim().lowercase() }
+                    .filter { it.isNotEmpty() }
+                    .toSet(),
                 ctxFactory = { http ->
                     val live = LiveDjContext(
                         http = http,
@@ -360,6 +366,12 @@ class KolaiMediaService : MediaLibraryService() {
                 // run already is (language is computed in-code, needs no source).
                 genreSource = engine.genreSource,
             )
+            // GENRE COHESION WARM-UP (2026-06-14): proactively warm the taste
+            // pool's Deezer genres so the planner's genre cohesion has DATA.
+            // Reactive warm-on-miss fired AFTER the pick it would have shaped,
+            // so history.genres stayed empty and genre runs never formed.
+            // Background, off the cold-start path, rate-limited.
+            warmPoolGenres(taste, engine.genreSource)
 
             stationEngine = StationEngine(
                 nextSongs = rollingPlanner::nextSongs,
@@ -387,6 +399,53 @@ class KolaiMediaService : MediaLibraryService() {
         } catch (e: Throwable) {
             Log.e(TAG, "engine build FAILED", e)
             KolaiState.setError("engine init failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Proactive GENRE cache warm-up for the taste pool (2026-06-14). The
+     * planner only applies genre cohesion when a candidate's genre is ALREADY
+     * cached ([GenreSource.cachedGenre]); the reactive warm-on-miss fired AFTER
+     * a pick (too late to shape it), so the pool's genres never populated and
+     * runs (rap->rap, Mizrahi->Mizrahi) never formed. This walks the (expanding)
+     * pool in the BACKGROUND -- off the cold-start path, rate-limited -- so
+     * genres are warm before picks score cohesion. Purely additive: only fills
+     * the cache, never blocks a pick, cancelled with serviceScope.
+     */
+    private fun warmPoolGenres(
+        taste: ai.kolai.station.TasteSource,
+        genre: ai.kolai.station.GenreSource,
+    ) {
+        serviceScope.launch {
+            try {
+                // Let the cold-start opener + first block win the network first.
+                kotlinx.coroutines.delay(20_000L)
+                // A few rounds so the pool's background expansion (base ~20 ->
+                // ~60-80) is also covered once it lands; stop early once warm.
+                repeat(6) { round ->
+                    val pool = try {
+                        taste.getProfile(useCache = true).topTracks
+                    } catch (_: Throwable) {
+                        emptyList()
+                    }
+                    var requested = 0
+                    for (track in pool) {
+                        if (track.artist.isBlank() || track.title.isBlank()) continue
+                        if (genre.cachedGenre(track.artist, track.title) == null) {
+                            genre.warm(track.artist, track.title)
+                            requested++
+                            kotlinx.coroutines.delay(400L) // gentle on Deezer
+                        }
+                    }
+                    Log.i(TAG, "pool genre warm round $round: $requested fetches (pool=${pool.size})")
+                    if (requested == 0 && round >= 1) return@launch
+                    kotlinx.coroutines.delay(30_000L)
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // serviceScope cancelled on destroy -- expected.
+            } catch (e: Throwable) {
+                Log.w(TAG, "pool genre warm failed: ${e.message}")
+            }
         }
     }
 

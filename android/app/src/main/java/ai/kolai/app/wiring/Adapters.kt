@@ -137,7 +137,9 @@ class AacBlockEncoder : StationBlockEncoder {
  */
 val analyzeFn: (String) -> ai.kolai.core.TrackAnalysis = { path ->
     ai.kolai.analyze.Analyzer().analyze(
-        ai.kolai.analyze.AudioDecoder.decodeToPcm(path, 44100),
+        ai.kolai.analyze.AudioDecoder.decodeToPcm(
+            path, 44100, maxSeconds = ai.kolai.analyze.AudioDecoder.ANALYZE_DECODE_SECONDS,
+        ),
         44100,
         path,
     )

@@ -17,9 +17,13 @@ android {
         versionCode = 1
         versionName = "0.1"
 
-        // Single ABI for the OnePlus 15.
+        // arm64-v8a: the OnePlus 15 device. x86_64: standard Android emulator
+        // for unattended behavior/soak tests on the PC (no physical phone).
+        // The :dsp native lib (kolaidsp.so) statically links a per-ABI
+        // prebuilt libessentia.a; see dsp/ESSENTIA_BUILD.md.
         ndk {
             abiFilters += "arm64-v8a"
+            abiFilters += "x86_64"
         }
 
         // On-device integration test (EndToEndBlockTest): real LLM + YouTube + TTS.

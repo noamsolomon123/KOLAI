@@ -40,7 +40,18 @@ object AudioDecoder {
      * cap is reached. 10 min is comfortably above any real single, so a normal
      * song NEVER hits this path - it is purely a guard.
      */
-    const val MAX_DECODE_SECONDS: Int = 600
+    const val MAX_DECODE_SECONDS: Int = 420
+
+    /**
+     * ANALYZE-decode cap (OOM fix, 2026-06-14). BPM/key are GLOBAL song
+     * properties; Essentia's beat/key extractors need only a representative
+     * window, not the whole track. analyzeFn RE-decodes the file while loadFn's
+     * full-song PCM is still retained, so an over-long track's SECOND ~200 MB
+     * decode is exactly what OOM'd the render (analyzeFn -> decodeToPcm ->
+     * growTo). Capping analyze to ~2 min keeps that allocation ~42 MB and is
+     * still far more beats than the tempo/key estimators need.
+     */
+    const val ANALYZE_DECODE_SECONDS: Int = 120
 
     /**
      * The ceiling on the number of INTERLEAVED Float samples we will ever
@@ -96,9 +107,9 @@ object AudioDecoder {
      * @throws IllegalStateException if [path] has no decodable audio track or
      *   decoding fails. (Callers / BlockRenderer skip such files.)
      */
-    fun decodeToPcm(path: String, targetSr: Int = 44_100): FloatArray {
+    fun decodeToPcm(path: String, targetSr: Int = 44_100, maxSeconds: Int = MAX_DECODE_SECONDS): FloatArray {
         require(targetSr > 0) { "targetSr must be > 0, was $targetSr" }
-        val (interleaved, channels, decodedSr) = decodeWithSampleRate(path)
+        val (interleaved, channels, decodedSr) = decodeWithSampleRate(path, maxSeconds)
         val mono = downmixToMono(interleaved, channels)
         val out = resampleSinc(mono, decodedSr, targetSr)
         Log.i(
@@ -140,7 +151,7 @@ object AudioDecoder {
         }
     }
 
-    internal fun decodeWithSampleRate(path: String): DecodedPcm {
+    internal fun decodeWithSampleRate(path: String, maxSeconds: Int = MAX_DECODE_SECONDS): DecodedPcm {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
         try {
@@ -195,7 +206,7 @@ object AudioDecoder {
             } else {
                 0L
             }
-            val preSize = preSizeSamples(durationUs, sampleRate, channels, MAX_DECODE_SECONDS)
+            val preSize = preSizeSamples(durationUs, sampleRate, channels, maxSeconds)
             val initialCapacity = if (preSize > 0) preSize else estimateSampleCapacity(inputFormat, channels)
             var collected = FloatArray(initialCapacity)
             var collectedLen = 0
@@ -203,7 +214,7 @@ object AudioDecoder {
             // if INFO_OUTPUT_FORMAT_CHANGED reports a different (true) rate, so
             // the cap always tracks the real stream. Int.MAX_VALUE == no cap yet
             // (rate unknown) - the input-format guess almost always sets it.
-            var sampleCeiling = cappedSampleCeiling(sampleRate, channels, MAX_DECODE_SECONDS)
+            var sampleCeiling = cappedSampleCeiling(sampleRate, channels, maxSeconds)
 
             var inputDone = false
             var outputDone = false
@@ -249,7 +260,7 @@ object AudioDecoder {
                             sampleRate = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         }
                         // The decode cap follows the REAL rate/channels.
-                        sampleCeiling = cappedSampleCeiling(sampleRate, channels, MAX_DECODE_SECONDS)
+                        sampleCeiling = cappedSampleCeiling(sampleRate, channels, maxSeconds)
                         Log.i(TAG, "output format changed: channels=$channels sampleRate=$sampleRate")
                     }
 
@@ -295,7 +306,7 @@ object AudioDecoder {
                         if (capped) {
                             Log.w(
                                 TAG,
-                                "decode CAPPED at ${MAX_DECODE_SECONDS}s " +
+                                "decode CAPPED at ${maxSeconds}s " +
                                     "(${collectedLen} samples, sr=$sampleRate ch=$channels) for $path - " +
                                     "likely a mix/compilation; returning truncated PCM",
                             )

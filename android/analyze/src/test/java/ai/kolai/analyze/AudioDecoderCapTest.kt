@@ -23,15 +23,15 @@ import org.junit.Test
  */
 class AudioDecoderCapTest {
 
-    private val maxSeconds = AudioDecoder.MAX_DECODE_SECONDS // 600
+    private val maxSeconds = AudioDecoder.MAX_DECODE_SECONDS // 420 (global decode cap)
 
     // ---- cappedSampleCeiling -------------------------------------------------
 
     @Test
     fun ceiling_is_maxSeconds_times_rate_times_channels_for_mono_44k() {
-        // mono 44.1k, 600 s -> 26,460,000 interleaved samples (~100 MB Float).
+        // mono 44.1k -> maxSeconds * rate interleaved samples (tracks the global cap).
         val ceil = AudioDecoder.cappedSampleCeiling(44_100, 1, maxSeconds)
-        assertEquals(44_100 * 1 * 600, ceil)
+        assertEquals(44_100 * 1 * maxSeconds, ceil)
     }
 
     @Test

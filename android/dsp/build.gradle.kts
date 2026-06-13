@@ -17,7 +17,11 @@ android {
         minSdk = 31
 
         ndk {
+            // arm64-v8a: real device (OnePlus 15). x86_64: standard Android
+            // emulator for unattended soak tests. Each ABI links its own
+            // prebuilt essentia per-ABI libessentia.a (see CMakeLists.txt).
             abiFilters += "arm64-v8a"
+            abiFilters += "x86_64"
         }
 
         externalNativeBuild {

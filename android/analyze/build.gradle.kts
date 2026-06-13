@@ -15,7 +15,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
+            // Both real-device (arm64-v8a) and x86_64 emulator so instrumented
+            // Essentia tests run the NATIVE binary for each arch (no ARM translation).
             abiFilters += "arm64-v8a"
+            abiFilters += "x86_64"
         }
     }
 
