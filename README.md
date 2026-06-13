@@ -41,21 +41,32 @@ demonstrate the open-source pipeline.*
 - **Endless personal station** — Hebrew AI radio, fully on-device (Kotlin /
   Compose). Plays back-to-back and gapless, with the screen off, on the lock
   screen, and in the car.
-- **Your taste, real songs only** — songs are picked *in code* from your Spotify
-  taste plus real-catalog discovery via Deezer; the LLM never invents a track,
-  so zero hallucinated songs.
-- **A real-feeling DJ** — Gemini writes *and* voices the host in Hebrew, with
-  live time / weather / news context and Israeli-radio craft: addressing one
-  listener, show openings, hourly anchors and a signature station ident —
-  without over-talking.
-- **5 mood modes** — מיקס · מסיבה · לילה · ריכוז · בוקר reshape the song
-  selection, the DJ's energy and the voice delivery (hear them above).
-- **Sounds like broadcast** — loudness normalization to a broadcast target plus
-  a soft limiter across songs and speech; album covers from Deezer.
+- **Your taste, never repetitive** — songs are picked *in code* from your Spotify
+  taste, with the pool grown via Deezer (favourite artists + related) so the
+  station does not loop the same dozen tracks; the LLM never invents a song, so
+  zero hallucinated tracks.
+- **Flows like a curated set** — consecutive songs cohere by genre / style /
+  language (a rap stretch, an English stretch…) with tempo-smoothed transitions
+  and per-mood BPM, so it feels sequenced, not shuffled.
+- **A real-feeling DJ** — Gemini writes *and* voices the host in Hebrew with
+  live time / weather / news context and Israeli-radio craft (one-listener
+  address, show openings, hourly anchors, station ident). Sampling temperature
+  + rotating prompt angles keep it from repeating itself, and it knows the
+  Israeli calendar (ערב שבת, holidays, a quiet tone on memorial days).
+- **Segments, not just back-announces** — occasional two-host banter (a second
+  Gemini voice), a trivia game, listening cues, a «משהו טוב לדרך» drop, a taste
+  wink on your favourites, and a Friday weekly-recap opening — all rare and
+  quality-gated.
+- **5 mood modes** — מיקס · מסיבה · לילה · ריכוז · בוקר, each with its OWN voice,
+  tempo window, talk cadence and diction (hear them above).
+- **Sounds like broadcast** — loudness normalization to a broadcast target, a
+  soft limiter and micro-fades across songs and speech, beat-snapped crossfades,
+  vocal-aware ducking (the DJ won't talk over a singer), album covers from Deezer.
 - **Android Auto** — the station on the car screen: steering-wheel skip,
   per-song metadata and cover art.
-- **Self-healing playback** — a render watchdog and retries keep the station on
-  air even when a song or an API misbehaves.
+- **Fast + rock-solid** — tunes in in ~20-25s (DJ voice renders in parallel with
+  the download), memory-bounded decoding, plus a render watchdog + retries so the
+  station stays on air when a song or an API misbehaves.
 - **Liquid-glass RTL UI** — Hebrew-first design with a mood-reactive palette.
 - **Free stack** — Gemini LLM + TTS, Spotify, Deezer and YouTube, all on free
   tiers; you bring your own keys.
@@ -111,7 +122,8 @@ endless station with a Hebrew DJ — gapless, with mood modes, Android Auto, and
 mood-reactive liquid-glass UI.
 
 **Planned next:** live Spotify login (today it seeds from cached taste), on-device
-API-key entry, full-quality audio, two-host banter, and a one-tap "new station".
+API-key entry, full-quality audio (NewPipe currently serves muxed 360p), and a
+skip/like feedback loop that learns from what you skip.
 
 ## Running it yourself
 
