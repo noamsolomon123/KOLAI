@@ -1326,7 +1326,11 @@ class BlockRendererTest {
         val t2 = loadTracks(r, songs(7))
         val e2 = r.planFor(t2, prevTrack = t1.last())
         assertTrue(e2.none { it.beat == "trivia" })
-        assertEquals(2, client.prompts.count { it.contains("פינת טריוו") })
+        // Each trivia attempt that parses to emptyList() (here the routed [])
+        // now fires ONE empty-parse retry (DjBrain regression-1 fix), so the
+        // two attempts (blocks 1 and 2) issue two prompts each = 4. The latch
+        // is still not consumed - trivia is skipped in both blocks.
+        assertEquals(4, client.prompts.count { it.contains("פינת טריוו") })
     }
 
     @Test

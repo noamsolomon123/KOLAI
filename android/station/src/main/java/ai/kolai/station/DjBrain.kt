@@ -216,12 +216,20 @@ class DjBrain(
         //    break the cloned openers/phrasings.
         //  - STRUCTURED_TEMP: the JSON-array beats (banter / trivia / two-truths).
         //    Lower so the array stays parseable, but still varied; parsing already
-        //    tolerates garbage -> emptyList().
+        //    tolerates garbage -> emptyList(). Lowered 0.9 -> 0.7 (2026-06-13,
+        //    findings-diversity-v2 regression 1): at 0.9 the strict-JSON beats
+        //    occasionally produced output the balanced-bracket parser could not
+        //    use (2 empty banter rows / 1.7% in the proof corpus, vs 0 baseline).
+        //  - STRUCTURED_RETRY_TEMP: the ONE retry temperature for a JSON-array beat
+        //    whose first parse came back emptyList() - slightly lower than
+        //    STRUCTURED_TEMP so the retry is more likely to parse, while a twice-
+        //    empty result still degrades gracefully to emptyList().
         //  - PRECISE_TEMP: refine() + the de-dangle regeneration, where format
         //    fidelity (full sentence, full song name, no dangling connector) is
         //    critical and creativity is not the goal.
         const val CREATIVE_TEMP = 1.15
-        const val STRUCTURED_TEMP = 0.9
+        const val STRUCTURED_TEMP = 0.7
+        const val STRUCTURED_RETRY_TEMP = 0.5
         const val PRECISE_TEMP = 0.4
 
         // ---- ANGLE ROTATION (2026-06-13, diversity fix) -----------------------
@@ -1063,7 +1071,74 @@ class DjBrain(
         var kept: List<Pair<String, String>> = turns.take(maxTurns)
         while (kept.isNotEmpty() && kept.last().first != "A") kept = kept.dropLast(1)
         if (kept.size < 2) return emptyList()
+        return deDangleTurns(kept, maxTurns)
+    }
+
+    /**
+     * NEW (2026-06-13, findings-diversity-v2 regression 2 / seq 41): the
+     * JSON-array beats (banter / trivia / two-truths) build a multi-turn
+     * dialogue and previously returned the parsed turns WITHOUT any
+     * dangling-name guard - unlike every single-voice naming beat, which goes
+     * through [deDangleNaming]. The proof corpus caught seq 41, a trivia bit
+     * whose closing A turn trailed off on a bare connector ("...תהנה מהקצב של!"),
+     * the song name dropped. Guard every turn here with the SAME pure, regex-free
+     * detector ([danglingName]) and the SAME no-LLM repair ([repairDangling] then
+     * [finalDeDangle]) used by the single-voice path - no extra model call, in
+     * keeping with these beats' graceful-skip contract. A turn that cannot be
+     * repaired to a non-dangling, non-blank line is DROPPED whole together with
+     * everything after it (turns are dropped whole, words are never cut - same as
+     * [parseTurns]); the survivors are then re-trimmed so A still closes into the
+     * music, and fewer than 2 surviving turns is not a bit -> emptyList().
+     */
+    private fun deDangleTurns(turns: List<Pair<String, String>>, maxTurns: Int): List<Pair<String, String>> {
+        val cleaned = mutableListOf<Pair<String, String>>()
+        for ((speaker, text) in turns) {
+            if (!danglingName(text)) {
+                cleaned.add(speaker to text)
+                continue
+            }
+            // dangling turn: repair WITHOUT an LLM call (these beats skip rather
+            // than retry text). Prefer the trailing-token repair; if that still
+            // dangles, the per-sentence finalDeDangle guarantees a clean result.
+            var fixed = repairDangling(text)
+            if (fixed.isBlank() || danglingName(fixed)) fixed = finalDeDangle(text)
+            if (fixed.isBlank()) break // unrepairable -> drop this turn and all after
+            cleaned.add(speaker to fixed)
+        }
+        var kept: List<Pair<String, String>> = cleaned.take(maxTurns)
+        while (kept.isNotEmpty() && kept.last().first != "A") kept = kept.dropLast(1)
+        if (kept.size < 2) return emptyList()
         return kept
+    }
+
+    /**
+     * NEW (2026-06-13, findings-diversity-v2 regression 1): shared run-with-retry
+     * for the strict-JSON two-voice beats. Calls the LLM once at [STRUCTURED_TEMP]
+     * and parses; if the parse comes back emptyList() (un-usable / empty JSON -
+     * the 1.7% drop the proof corpus flagged), re-calls the LLM ONCE on the SAME
+     * [prompt] at the slightly lower [STRUCTURED_RETRY_TEMP] and re-parses. If the
+     * retry is also empty, returns emptyList() (graceful skip preserved, never
+     * throws). A network/LLM exception on EITHER call is swallowed to emptyList(),
+     * exactly as the call sites did before. SKIP on either response also yields
+     * emptyList(). The somber short-circuit (no LLM call) stays in the callers.
+     */
+    private suspend fun runTurnsWithRetry(prompt: String, maxTurns: Int): List<Pair<String, String>> {
+        val first = try {
+            client.complete(prompt, STRUCTURED_TEMP)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (isSkip(first)) return emptyList()
+        val turns = parseTurns(first, maxTurns)
+        if (turns.isNotEmpty()) return turns
+        // first parse empty -> ONE retry at a slightly lower temperature.
+        val second = try {
+            client.complete(prompt, STRUCTURED_RETRY_TEMP)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (isSkip(second)) return emptyList()
+        return parseTurns(second, maxTurns)
     }
 
     /**
@@ -1088,13 +1163,8 @@ class DjBrain(
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
         val sidekick = SIDEKICK_PERSONAS[Math.floorMod(sidekickIndex, SIDEKICK_PERSONAS.size)]
-        val raw = try {
-            client.complete(banterPrompt(prev, nxt, ctx, budget, sidekick) + avoidLine(), STRUCTURED_TEMP)
-        } catch (e: Exception) {
-            return emptyList()
-        }
-        if (isSkip(raw)) return emptyList()
-        val turns = parseBanterTurns(raw)
+        val prompt = banterPrompt(prev, nxt, ctx, budget, sidekick) + avoidLine()
+        val turns = runTurnsWithRetry(prompt, BANTER_MAX_TURNS)
         if (turns.isNotEmpty()) remember(turns.joinToString(" / ") { it.second })
         return turns
     }
@@ -1166,13 +1236,8 @@ class DjBrain(
     suspend fun writeTrivia(nxt: Song, ctx: DjContext, seconds: Double = 18.0): List<Pair<String, String>> {
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
-        val raw = try {
-            client.complete(triviaPrompt(nxt, ctx, budget) + avoidLine(), STRUCTURED_TEMP)
-        } catch (e: Exception) {
-            return emptyList()
-        }
-        if (isSkip(raw)) return emptyList()
-        val turns = parseTurns(raw, TRIVIA_MAX_TURNS)
+        val prompt = triviaPrompt(nxt, ctx, budget) + avoidLine()
+        val turns = runTurnsWithRetry(prompt, TRIVIA_MAX_TURNS)
         if (turns.isNotEmpty()) remember(turns.joinToString(" / ") { it.second })
         return turns
     }
@@ -1241,13 +1306,8 @@ class DjBrain(
     suspend fun writeTwoTruthsLie(nxt: Song, ctx: DjContext, seconds: Double = 16.0): List<Pair<String, String>> {
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
-        val raw = try {
-            client.complete(twoTruthsLiePrompt(nxt, ctx, budget) + avoidLine(), STRUCTURED_TEMP)
-        } catch (e: Exception) {
-            return emptyList()
-        }
-        if (isSkip(raw)) return emptyList()
-        val turns = parseTurns(raw, TWO_TRUTHS_MAX_TURNS)
+        val prompt = twoTruthsLiePrompt(nxt, ctx, budget) + avoidLine()
+        val turns = runTurnsWithRetry(prompt, TWO_TRUTHS_MAX_TURNS)
         if (turns.isNotEmpty()) remember(turns.joinToString(" / ") { it.second })
         return turns
     }

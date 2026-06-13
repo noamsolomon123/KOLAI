@@ -891,8 +891,10 @@ class DjBrainTest {
     @Test
     fun banter_persona_rotation_injects_distinct_persona_text_per_index() = runTest {
         // one client, three calls with indices 0/1/2; each prompt must carry
-        // its own persona and not the others'.
-        val client = FakeLlmClient(listOf("[]"))
+        // its own persona and not the others'. A VALID array parses on the first
+        // call so the empty-parse retry never fires - one prompt per beat.
+        val ok = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(ok))
         val brain = DjBrain(client, persona = "דני")
         brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 0)
         brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 1)
@@ -907,7 +909,10 @@ class DjBrainTest {
 
     @Test
     fun banter_persona_index_wraps_modulo_and_never_throws() = runTest {
-        val client = FakeLlmClient(listOf("[]"))
+        // VALID array parses on the first call so the empty-parse retry never
+        // fires - one prompt per beat, keeping prompts[0]/[1] aligned to calls.
+        val ok = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(ok))
         val brain = DjBrain(client, persona = "דני")
         // index 3 wraps to 0, index -1 wraps to last
         brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 3)
@@ -1136,7 +1141,10 @@ class DjBrainTest {
 
     @Test
     fun plural_address_ban_present_in_trivia_banter_handover_prompts() = runTest {
-        val client = FakeLlmClient(listOf("[]"))
+        // VALID array parses on the first call so the empty-parse retry never
+        // fires; trivia + banter are one call each (+ handover) -> 3 prompts.
+        val ok = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(ok))
         val brain = DjBrain(client, persona = "דני")
         brain.writeTrivia(nxt, ctx = DjContext())
         brain.writeBanter(prev, nxt, ctx = DjContext())
@@ -1153,7 +1161,10 @@ class DjBrainTest {
 
     @Test
     fun hallucination_forbid_present_in_trivia_and_goodThing_prompts() = runTest {
-        val client = FakeLlmClient(listOf("[]", "SKIP"))
+        // VALID trivia array parses on the first call (no empty-parse retry),
+        // then goodThing SKIPs -> exactly two prompts.
+        val ok = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(ok, "SKIP"))
         val brain = DjBrain(client, persona = "דני")
         brain.writeTrivia(nxt, ctx = DjContext())
         brain.writeGoodThing(ctx = DjContext(), nxt = nxt)
@@ -1283,7 +1294,12 @@ class DjBrainTest {
 
     @Test
     fun banter_trivia_twoTruths_use_structured_temp() = runTest {
-        val client = FakeLlmClient(listOf("[]"))
+        // a VALID (non-empty) array parses on the FIRST call, so the
+        // empty-parse retry (regression 1) never fires - one call per beat,
+        // each at STRUCTURED_TEMP. (The retry temperature is asserted
+        // separately in json_beat_retry_*.)
+        val ok = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(ok))
         val brain = DjBrain(client, persona = "דני")
         brain.writeBanter(prev, nxt, ctx = DjContext())
         brain.writeTrivia(nxt, ctx = DjContext())
@@ -1320,11 +1336,15 @@ class DjBrainTest {
 
     @Test
     fun temperatures_are_distinct_per_beat_type() = runTest {
+        // STRUCTURED_TEMP lowered 0.9 -> 0.7 (regression 1) for more reliable
+        // JSON; the retry temp sits just below it; ordering still holds.
         assertEquals(1.15, DjBrain.CREATIVE_TEMP, 1e-9)
-        assertEquals(0.9, DjBrain.STRUCTURED_TEMP, 1e-9)
+        assertEquals(0.7, DjBrain.STRUCTURED_TEMP, 1e-9)
+        assertEquals(0.5, DjBrain.STRUCTURED_RETRY_TEMP, 1e-9)
         assertEquals(0.4, DjBrain.PRECISE_TEMP, 1e-9)
         assertTrue(DjBrain.CREATIVE_TEMP > DjBrain.STRUCTURED_TEMP)
-        assertTrue(DjBrain.STRUCTURED_TEMP > DjBrain.PRECISE_TEMP)
+        assertTrue(DjBrain.STRUCTURED_TEMP > DjBrain.STRUCTURED_RETRY_TEMP)
+        assertTrue(DjBrain.STRUCTURED_RETRY_TEMP > DjBrain.PRECISE_TEMP)
     }
 
     // ---- diversity fix: opener ring + cliche + mood register (2026-06-13) ---
@@ -1452,5 +1472,95 @@ class DjBrainTest {
         assertTrue(DjBrain.CLICHE_PHRASES.contains("אבל עכשיו"))
         // no duplicates
         assertEquals(DjBrain.CLICHE_PHRASES.size, DjBrain.CLICHE_PHRASES.toSet().size)
+    }
+
+    // ---- findings-diversity-v2 REGRESSION 1: empty-JSON retry on the beats --
+
+    @Test
+    fun json_beat_retry_fires_on_first_empty_then_succeeds_on_second_call() = runTest {
+        // regression 1: the strict-JSON beats occasionally returned un-parseable
+        // / empty JSON at the old 0.9 temperature, silently dropping the beat.
+        // Now an empty first parse triggers ONE retry; a good second reply wins.
+        val good = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf("סתם טקסט שאינו מערך בכלל", good))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext())
+        assertEquals("retry must produce the second-call dialogue", 3, turns.size)
+        assertEquals("A", turns.last().first)
+        assertEquals("exactly one retry after a first-empty parse", 2, client.prompts.size)
+        assertEquals(client.prompts[0], client.prompts[1])
+    }
+
+    @Test
+    fun json_beat_retry_uses_structured_retry_temp_on_the_second_call() = runTest {
+        val good = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf("לא מערך", good))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTrivia(nxt, ctx = DjContext())
+        assertEquals(2, client.temps.size)
+        assertEquals("first call at structured temp", DjBrain.STRUCTURED_TEMP, client.temps[0])
+        assertEquals("retry at the lower retry temp", DjBrain.STRUCTURED_RETRY_TEMP, client.temps[1])
+    }
+
+    @Test
+    fun json_beat_twice_empty_returns_empty_list_after_one_retry() = runTest {
+        val client = FakeLlmClient(listOf("בכלל לא מערך"))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTwoTruthsLie(nxt, ctx = DjContext())
+        assertTrue("twice-empty must skip", turns.isEmpty())
+        assertEquals("first call + exactly one retry, then stop", 2, client.prompts.size)
+    }
+
+    @Test
+    fun json_beat_no_retry_when_first_parse_succeeds() = runTest {
+        val good = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואלה."},{"s":"A","t":"מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(good))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext())
+        assertEquals(3, turns.size)
+        assertEquals("a parseable first reply must not retry", 1, client.prompts.size)
+    }
+
+    @Test
+    fun json_beat_empty_array_retries_once_then_skips() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext())
+        assertTrue(turns.isEmpty())
+        assertEquals(2, client.prompts.size)
+    }
+
+    // ---- findings-diversity-v2 REGRESSION 2 (seq 41): a JSON-beat closing ---
+    // ---- turn that trails off on a bare connector is de-dangled (no LLM). ---
+
+    @Test
+    fun seq41_trivia_closing_turn_does_not_air_bare_trailing_connector() = runTest {
+        // seq 41 in corpus-v2: the trivia closing A turn trailed off on a bare
+        // connector (the song name dropped). The JSON beats now run every turn
+        // through the SAME dangling guard as the single-voice path (no LLM).
+        val client = FakeLlmClient(listOf("""[{"s":"A","t":"שאלה כיפית על האמן?"},{"s":"B","t":"אין לי מושג, נשמע מגניב."},{"s":"A","t":"מסתורי. תהנה מהקצב של!"}]"""))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTrivia(nxt, ctx = DjContext())
+        assertTrue("bit must survive (>=2 turns)", turns.size >= 2)
+        assertEquals("A still closes into the music", "A", turns.last().first)
+        turns.forEach { (_, t) ->
+            assertFalse("turn must not dangle: $t", brain.danglingName(t))
+        }
+        val last = turns.last().second.trimEnd('.', '!', '?', ' ')
+        assertFalse("must not air a bare trailing connector", last.endsWith(" של"))
+        assertTrue("opening question must survive", turns.first().second.contains("שאלה כיפית"))
+        assertEquals(1, client.prompts.size)
+    }
+
+    @Test
+    fun banter_closing_turn_dangling_is_repaired_without_extra_llm_call() = runTest {
+        val reply = """[{"s":"A","t":"שמעת את זה?"},{"s":"B","t":"בטח."},{"s":"A","t":"קדימה, תהנה עם של!"}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext())
+        assertEquals("no extra LLM call for the no-LLM repair", 1, client.prompts.size)
+        assertTrue(turns.size >= 2)
+        assertEquals("A", turns.last().first)
+        turns.forEach { (_, t) -> assertFalse("turn must not dangle: $t", brain.danglingName(t)) }
     }
 }
