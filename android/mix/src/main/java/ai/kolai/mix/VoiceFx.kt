@@ -199,12 +199,14 @@ fun compress(
 }
 
 /**
- * The full broadcast voice chain (see file kdoc): high-pass 90 Hz ->
- * presence high-shelf +2.5 dB @ 3.5 kHz -> soft-knee compressor (defaults
- * -18 dBFS, 3:1, 5/80 ms). Pure function; returns a new array.
+ * The DJ/TTS voice chain. Per user preference (2026-06-13: "the EQ is bad,
+ * make it default") the TONAL COLORING was removed - the Gemini TTS voice
+ * already sounds broadcast-natural, and the presence shelf (+2.5 dB) plus the
+ * compressor made it harsh/pumpy on air. We now apply ONLY a transparent
+ * 90 Hz high-pass that strips sub-voice rumble / TTS DC wander (inaudible on
+ * speech) so the voice keeps its natural Gemini timbre. [Biquad.highShelf] and
+ * [compress] remain defined + unit-tested and can be re-enabled here if a
+ * future tuning wants them. Pure function; returns a new array.
  */
-fun voiceBroadcastChain(x: FloatArray, sr: Int): FloatArray {
-    val rumbleFree = Biquad.highPass(90.0f, sr).process(x)
-    val present = Biquad.highShelf(3500.0f, sr, 2.5f).process(rumbleFree)
-    return compress(present, sr)
-}
+fun voiceBroadcastChain(x: FloatArray, sr: Int): FloatArray =
+    Biquad.highPass(90.0f, sr).process(x)

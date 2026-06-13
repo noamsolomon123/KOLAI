@@ -199,24 +199,25 @@ class VoiceFxTest {
     }
 
     @Test
-    fun chain_boosts_presence_over_voice_band() {
-        // Both below the compressor threshold so only the EQ acts.
+    fun chain_does_not_color_voice_band() {
+        // EQ defaulted (2026-06-13): no presence shelf -> mid and high voice
+        // bands pass at ~unity (no tonal coloring), only the 90 Hz HP acts.
         val lo = sine(sr / 2, 0.05f, 1000.0)
         val hi = sine(sr / 2, 0.05f, 8000.0)
         val gLo = rmsTail(voiceBroadcastChain(lo, sr)) / rmsTail(lo)
         val gHi = rmsTail(voiceBroadcastChain(hi, sr)) / rmsTail(hi)
         val ratio = gHi / gLo
-        assertTrue("presence boost present, ratio=" + ratio, ratio > 1.15f)
-        assertTrue("presence boost bounded, ratio=" + ratio, ratio < 1.45f)
+        assertTrue("no presence boost (flat), ratio=" + ratio, ratio < 1.08f)
+        assertTrue("not attenuated either, ratio=" + ratio, ratio > 0.92f)
     }
 
     @Test
-    fun chain_compresses_loud_voice() {
+    fun chain_does_not_compress_loud_voice() {
+        // EQ defaulted: no compressor -> a loud 1 kHz tone passes essentially
+        // unchanged (the 90 Hz HP barely touches 1 kHz), no level reduction.
         val x = sine(sr / 2, 0.5f, 1000.0)
-        val eqOnly = Biquad.highShelf(3500.0f, sr, 2.5f)
-            .process(Biquad.highPass(90.0f, sr).process(x))
         val y = voiceBroadcastChain(x, sr)
-        assertTrue("compressor must engage on a -6 dBFS voice", rmsTail(y) < 0.8f * rmsTail(eqOnly))
+        assertTrue("no compression: level preserved", rmsTail(y) > 0.95f * rmsTail(x))
     }
 
     @Test
