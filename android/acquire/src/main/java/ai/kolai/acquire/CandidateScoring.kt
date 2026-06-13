@@ -224,9 +224,22 @@ fun candidateScore(song: Song, cand: Candidate): Double {
  * BlockRenderer skip the song. A skipped song is invisible to the listener;
  * playing the WRONG song (label says X, audio plays Y) destroys trust.
  */
+/** Hard ceiling (seconds) for a pickable track: anything longer is a mix /
+ *  compilation / hour-loop, never a radio single. Belt-and-suspenders to the
+ *  decode-length cap in AudioDecoder: rejecting it here avoids downloading +
+ *  decoding (and ever airing a truncated) over-long upload at all. Matches the
+ *  -35 duration-sanity penalty's 12-min threshold in [candidateScore]. */
+internal const val MAX_TRACK_SECONDS = 720.0
+
 fun pickBestCandidate(song: Song, candidates: List<Candidate>): Candidate? {
     if (candidates.isEmpty()) return null
     val best = candidates.maxByOrNull { candidateScore(song, it) } ?: return null
     if (titleCoverage(song, best) < 0.5) return null
+    // Hard reject an over-long best pick (known duration only): a >12min upload
+    // is a mix/compilation. Returning null -> NewPipeSource FetchException ->
+    // BlockRenderer skips the song. This prevents the 24-min/252MB decode that
+    // OOM'd the process from ever being chosen (decode cap is the safety net).
+    val d = best.durationS
+    if (d != null && d > MAX_TRACK_SECONDS) return null
     return best
 }

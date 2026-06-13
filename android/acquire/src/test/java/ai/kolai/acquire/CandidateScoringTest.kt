@@ -356,4 +356,33 @@ class CandidateScoringTest {
         assertNotNull(best)
         assertEquals("half", best!!.id)
     }
+
+    @Test
+    fun overLongBestPick_isRejected_evenAsOnlyCandidate() {
+        // A 24-min "extended mix" is the only candidate and fully covers the
+        // title (would otherwise win), but >12min => compilation => reject
+        // (null -> NewPipeSource FetchException -> song skipped). Pick-time
+        // guard preventing the 252MB decode OOM.
+        val requested = Song(title = "waiting for love", artist = "avicii")
+        val longMix = Candidate(
+            title = "avicii - waiting for love extended mix",
+            durationS = 1440.0, viewCount = 5_000_000L, id = "long",
+        )
+        assertNull(pickBestCandidate(requested, listOf(longMix)))
+    }
+
+    @Test
+    fun overLongCandidate_doesNotBlockAValidShorterSingle() {
+        val requested = Song(title = "waiting for love", artist = "avicii")
+        val longMix = Candidate(
+            title = "avicii - waiting for love one hour", durationS = 3600.0, viewCount = 9_000_000L, id = "long",
+        )
+        val single = Candidate(
+            title = "avicii - waiting for love", durationS = 230.0, viewCount = 1000L, id = "single",
+        )
+        val best = pickBestCandidate(requested, listOf(longMix, single))
+        assertNotNull(best)
+        assertEquals("single", best!!.id)
+    }
+
 }
