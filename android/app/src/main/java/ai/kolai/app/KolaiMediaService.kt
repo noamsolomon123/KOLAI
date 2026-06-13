@@ -338,6 +338,10 @@ class KolaiMediaService : MediaLibraryService() {
                 // what recently played, so a relaunch does NOT re-open with the
                 // same favourite picks.
                 persistFile = File(cacheRoot, "history.txt"),
+                // SONG-FLOW COHESION: label the genres of played songs so the
+                // planner's run-length easing knows how long the current genre
+                // run already is (language is computed in-code, needs no source).
+                genreSource = engine.genreSource,
             )
 
             stationEngine = StationEngine(

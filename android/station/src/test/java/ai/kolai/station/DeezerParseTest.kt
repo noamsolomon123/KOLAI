@@ -148,4 +148,65 @@ class DeezerParseTest {
         assertTrue(parseDeezerTopTracks("").isEmpty())
         assertTrue(parseDeezerTopTracks("""{"data":[42,"str",null]}""").isEmpty())
     }
+
+    // --- parseDeezerAlbumIdFromTrack (GET /track/{id}) -----------------------
+
+    @Test
+    fun albumId_happy_path_returns_nested_album_id() {
+        val json = """
+            {"id":3135556,"title":"Harder, Better, Faster, Stronger","bpm":123.5,
+             "artist":{"id":27,"name":"Daft Punk"},
+             "album":{"id":302127,"title":"Discovery","type":"album"},"type":"track"}
+        """.trimIndent()
+        assertEquals(302127L, parseDeezerAlbumIdFromTrack(json))
+    }
+
+    @Test
+    fun albumId_tolerates_missing_album_and_malformed_input() {
+        assertNull(parseDeezerAlbumIdFromTrack("""{"id":1,"title":"No Album"}"""))
+        assertNull(parseDeezerAlbumIdFromTrack("""{"album":{"title":"No Id"}}"""))
+        assertNull(parseDeezerAlbumIdFromTrack("""{"album":{"id":"abc"}}""")) // non-numeric
+        assertNull(parseDeezerAlbumIdFromTrack("""{}"""))
+        assertNull(parseDeezerAlbumIdFromTrack("""[1,2,3]"""))
+        assertNull(parseDeezerAlbumIdFromTrack("garbage"))
+        assertNull(parseDeezerAlbumIdFromTrack(""))
+    }
+
+    // --- parseDeezerAlbumGenre (GET /album/{id}) -----------------------------
+
+    @Test
+    fun albumGenre_happy_path_returns_first_genre_name() {
+        val json = """
+            {"id":302127,"title":"Discovery",
+             "genres":{"data":[
+               {"id":113,"name":"Dance","type":"genre"},
+               {"id":132,"name":"Pop","type":"genre"}
+             ]},"type":"album"}
+        """.trimIndent()
+        assertEquals("Dance", parseDeezerAlbumGenre(json))
+    }
+
+    @Test
+    fun albumGenre_skips_blank_names_and_picks_first_non_blank() {
+        val json = """
+            {"genres":{"data":[
+              {"id":1,"name":""},
+              {"id":2,"name":"   "},
+              {"id":3,"name":"Jazz"}
+            ]}}
+        """.trimIndent()
+        assertEquals("Jazz", parseDeezerAlbumGenre(json))
+    }
+
+    @Test
+    fun albumGenre_tolerates_empty_genre_list_and_malformed_input() {
+        assertNull(parseDeezerAlbumGenre("""{"genres":{"data":[]}}""")) // untagged album
+        assertNull(parseDeezerAlbumGenre("""{"genres":{}}"""))
+        assertNull(parseDeezerAlbumGenre("""{"id":1}""")) // no genres
+        assertNull(parseDeezerAlbumGenre("""{}"""))
+        assertNull(parseDeezerAlbumGenre("""[1,2,3]"""))
+        assertNull(parseDeezerAlbumGenre("garbage"))
+        assertNull(parseDeezerAlbumGenre(""))
+        assertNull(parseDeezerAlbumGenre("""{"genres":{"data":[{"id":5}]}}""")) // entry has no name
+    }
 }

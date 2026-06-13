@@ -170,7 +170,12 @@ class TastePoolPlannerTest {
         assertNull(songs.first { it.title == "Beta" }.durationS)
     }
 
-    // --- Hebrew/international alternation -------------------------------------
+    // --- Hebrew/international ALTERNATION (LEGACY no-GenreSource path) ---------
+    // INTENTIONAL BEHAVIOUR CHANGE (2026-06-13 cohesion): when a GenreSource is
+    // wired the planner REVERSES this -- it COHERES to the seed's language
+    // (English->English) instead of alternating (see the cohesion tests below).
+    // These two tests construct planners with NO GenreSource, so they pin the
+    // PRESERVED legacy alternation that the null-source config still relies on.
 
     @Test
     fun adjacent_picks_alternate_hebrew_and_international_when_both_groups_available() = runTest {
@@ -837,6 +842,251 @@ class TastePoolPlannerTest {
             assertEquals(2, songs.size)
             assertEquals("known-BPM song must lead (rng $seed)", "Known Hit", songs[0].title)
             assertEquals("unknown-BPM song parked last (rng $seed)", "Mystery Track", songs[1].title)
+        }
+    }
+
+    // --- SONG-FLOW COHESION: GenreSource language + genre runs ----------------
+    // User ask: songs have a connection playing one after the other (rap songs,
+    // jazz songs, english songs). When a GenreSource is wired the planner biases
+    // the next pick toward the SEED language AND genre (soft, multiplicative,
+    // run-length-eased), chaining picks into a coherent RUN. A block is 1-2
+    // songs, so cohesion works ACROSS blocks via the seed; these tests exercise
+    // the per-call bias that produces that chaining.
+
+    /** Canned coarse genres keyed by title; counts DISTINCT lookups. Unknown
+     *  titles return null (= neutral), exercising the coverage-gap path. */
+    private class FakeGenre(private val byTitle: Map<String, String?>) : GenreSource {
+        var calls = 0
+        val titlesSeen = mutableSetOf<String>()
+        override suspend fun genre(artist: String, title: String): String? {
+            calls++
+            titlesSeen.add(title)
+            return byTitle[title]
+        }
+    }
+
+    @Test
+    fun same_language_cohesion_reverses_alternation_english_seed_favours_english() = runTest {
+        // INTENTIONAL REVERSAL of adjacent_picks_alternate...: with a GenreSource
+        // wired and an ENGLISH seed, the first pick is ENGLISH far more often than
+        // the legacy alternation (which forced Hebrew). Short run -> FULL boost.
+        val englishSeed = Song(title = "Yesterday Reprise", artist = "Some Band")
+        var cohered = 0
+        var legacy = 0
+        for (seed in 0 until 200) {
+            val withGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = FakeGenre(emptyMap()))
+                .plan(mixedTaste, n = 1, seed = englishSeed).single()
+            if (!containsHebrew(withGenre.title)) cohered++
+            val old = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(mixedTaste, n = 1, seed = englishSeed).single()
+            if (!containsHebrew(old.title)) legacy++
+        }
+        assertTrue("cohered=" + cohered, cohered >= 130)
+        assertTrue("legacy=" + legacy, legacy <= 20)
+        assertTrue("cohered=" + cohered + " legacy=" + legacy, cohered > legacy + 60)
+    }
+
+    @Test
+    fun same_language_cohesion_hebrew_seed_favours_hebrew() = runTest {
+        val hebrewSeed = Song(title = "שיר של יום חולין", artist = "אריק איינשטין")
+        var cohered = 0
+        for (seed in 0 until 200) {
+            val withGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = FakeGenre(emptyMap()))
+                .plan(mixedTaste, n = 1, seed = hebrewSeed).single()
+            if (containsHebrew(withGenre.title)) cohered++
+        }
+        assertTrue("cohered=" + cohered, cohered >= 130)
+    }
+
+    /** 8 English-titled tracks, distinct artists; 4 tagged rap, 4 jazz. */
+    private val genreTaste = TasteProfile(
+        topTracks = listOf(
+            TasteTrack(title = "Rap One", artist = "RA", durationS = 100.0),
+            TasteTrack(title = "Jazz One", artist = "JA", durationS = 100.0),
+            TasteTrack(title = "Rap Two", artist = "RB", durationS = 100.0),
+            TasteTrack(title = "Jazz Two", artist = "JB", durationS = 100.0),
+            TasteTrack(title = "Rap Three", artist = "RC", durationS = 100.0),
+            TasteTrack(title = "Jazz Three", artist = "JC", durationS = 100.0),
+            TasteTrack(title = "Rap Four", artist = "RD", durationS = 100.0),
+            TasteTrack(title = "Jazz Four", artist = "JD", durationS = 100.0),
+        ),
+        topArtists = emptyList(),
+    )
+
+    private val rapJazzMap: Map<String, String?> = mapOf(
+        "Rap One" to "Rap/Hip Hop", "Rap Two" to "Rap/Hip Hop",
+        "Rap Three" to "Rap/Hip Hop", "Rap Four" to "Rap/Hip Hop",
+        "Jazz One" to "Jazz", "Jazz Two" to "Jazz", "Jazz Three" to "Jazz", "Jazz Four" to "Jazz",
+    )
+
+    @Test
+    fun same_genre_cohesion_rap_seed_favours_rap_when_known() = runTest {
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        val genreFor = FakeGenre(rapJazzMap + ("Seed Banger" to "Rap/Hip Hop"))
+        var biasedRap = 0
+        var plainRap = 0
+        for (seed in 0 until 200) {
+            val withGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreFor)
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (withGenre.title.startsWith("Rap")) biasedRap++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (plain.title.startsWith("Rap")) plainRap++
+        }
+        assertTrue("biasedRap=" + biasedRap, biasedRap >= 130)
+        assertTrue("biasedRap=" + biasedRap + " plainRap=" + plainRap, biasedRap > plainRap + 40)
+    }
+
+    @Test
+    fun unknown_genre_is_neutral_genre_cohesion_does_not_act() = runTest {
+        // Seed genre KNOWN (rap) but candidate genres UNKNOWN -> genre cohesion
+        // cannot act. All-English pool -> language cohesion is uniform. Result:
+        // rap is picked about as often as the genre-blind planner (no rap bias).
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        val onlySeedKnown = FakeGenre(mapOf("Seed Banger" to "Rap/Hip Hop"))
+        var biasedRap = 0
+        for (seed in 0 until 200) {
+            val withGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = onlySeedKnown)
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (withGenre.title.startsWith("Rap")) biasedRap++
+        }
+        assertTrue("biasedRap=" + biasedRap + " (expected ~100, no genre bias)", biasedRap in 60..140)
+    }
+
+    @Test
+    fun run_length_easing_relaxes_language_cohesion_once_a_run_is_long() = runTest {
+        val englishSeed = Song(title = "Long Run Track", artist = "Band X")
+        val genreSrc = FakeGenre(emptyMap())
+        val longRun = List(8) { "int" }
+        var shortRunEnglish = 0
+        var longRunEnglish = 0
+        for (seed in 0 until 300) {
+            val short = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreSrc)
+                .plan(mixedTaste, n = 1, exclude = null, seed = englishSeed, mood = null,
+                    recentArtists = null, recentGenres = null, recentLanguages = null).single()
+            if (!containsHebrew(short.title)) shortRunEnglish++
+            val long = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreSrc)
+                .plan(mixedTaste, n = 1, exclude = null, seed = englishSeed, mood = null,
+                    recentArtists = null, recentGenres = null, recentLanguages = longRun).single()
+            if (!containsHebrew(long.title)) longRunEnglish++
+        }
+        assertTrue("shortRunEnglish=" + shortRunEnglish, shortRunEnglish >= 130)
+        assertTrue(
+            "shortRunEnglish=" + shortRunEnglish + " longRunEnglish=" + longRunEnglish,
+            longRunEnglish + 40 < shortRunEnglish,
+        )
+    }
+
+    @Test
+    fun run_length_easing_relaxes_genre_cohesion_once_a_run_is_long() = runTest {
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        val genreFor = FakeGenre(rapJazzMap + ("Seed Banger" to "Rap/Hip Hop"))
+        val longRapRun = List(8) { "rap/hip hop" }
+        var shortRunRap = 0
+        var longRunRap = 0
+        for (seed in 0 until 300) {
+            val short = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreFor)
+                .plan(genreTaste, n = 1, seed = rapSeed).single()
+            if (short.title.startsWith("Rap")) shortRunRap++
+            val long = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreFor)
+                .plan(genreTaste, n = 1, exclude = null, seed = rapSeed, mood = null,
+                    recentArtists = null, recentGenres = longRapRun, recentLanguages = null).single()
+            if (long.title.startsWith("Rap")) longRunRap++
+        }
+        assertTrue("shortRunRap=" + shortRunRap, shortRunRap >= 130)
+        assertTrue(
+            "shortRunRap=" + shortRunRap + " longRunRap=" + longRunRap,
+            longRunRap + 40 < shortRunRap,
+        )
+    }
+
+    @Test
+    fun null_genre_source_is_byte_identical_to_today_legacy_alternation() = runTest {
+        // The LEGACY alternation is preserved byte-for-byte when NO source is
+        // wired: the no-source planner equals the bare planner across seeds.
+        val seedSong = Song(title = "שיר פתיחה", artist = "A")
+        for (seed in 0 until 25) {
+            val bare = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(mixedTaste, n = 6, seed = seedSong, mood = "party")
+            val explicitNullGenre = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = null)
+                .plan(mixedTaste, n = 6, seed = seedSong, mood = "party")
+            assertEquals("rng seed " + seed, bare, explicitNullGenre)
+        }
+    }
+
+    @Test
+    fun cohesion_history_overload_default_nulls_match_the_six_arg_plan() = runTest {
+        val genreSrc = FakeGenre(rapJazzMap)
+        val rapSeed = Song(title = "Seed Banger", artist = "SeedMC")
+        for (seed in 0 until 15) {
+            val sixArg = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreSrc)
+                .plan(genreTaste, n = 4, exclude = null, seed = rapSeed, mood = null,
+                    recentArtists = emptyList())
+            val eightArg = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreSrc)
+                .plan(genreTaste, n = 4, exclude = null, seed = rapSeed, mood = null,
+                    recentArtists = emptyList(), recentGenres = null, recentLanguages = null)
+            assertEquals("rng seed " + seed, sixArg, eightArg)
+        }
+    }
+
+    @Test
+    fun genre_lookups_are_gated_off_the_cold_start_opener() = runTest {
+        val fake = FakeGenre(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), genre = fake).plan(mixedTaste, n = 1)
+        assertEquals("cold-start opener must not query the genre source", 0, fake.calls)
+    }
+
+    @Test
+    fun genre_lookups_run_when_a_seed_exists_or_n_is_two() = runTest {
+        val withSeed = FakeGenre(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), genre = withSeed)
+            .plan(mixedTaste, n = 1, seed = Song(title = "Yesterday", artist = "The Beatles"))
+        assertTrue("a seed should trigger genre lookups", withSeed.calls > 0)
+
+        val nTwo = FakeGenre(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), genre = nTwo).plan(mixedTaste, n = 2)
+        assertTrue("n>=2 should trigger genre lookups", nTwo.calls > 0)
+    }
+
+    @Test
+    fun genre_lookups_are_bounded_to_the_cap_and_deduped() = runTest {
+        val big = TasteProfile(
+            topTracks = (0 until 70).map { i ->
+                TasteTrack(title = "Song" + i + " Unique", artist = "Artist" + i, durationS = 100.0)
+            },
+            topArtists = emptyList(),
+        )
+        val fake = FakeGenre(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), genre = fake, genreLookupCap = 30)
+            .plan(big, n = 2, seed = Song(title = "Seed", artist = "Z"))
+        assertTrue("calls=" + fake.calls, fake.calls <= 31)
+        assertEquals("distinct titles looked up", fake.titlesSeen.size, fake.calls)
+    }
+
+    @Test
+    fun cohesion_composes_with_mood_curator_without_breaking_it() = runTest {
+        val llm = FixedLlm("[7]")
+        val curator = MoodCurator(llm)
+        var biased = 0
+        for (seed in 0 until 200) {
+            val withBoth = TastePoolPlanner(
+                rng = kotlin.random.Random(seed),
+                curator = curator,
+                genre = FakeGenre(emptyMap()),
+            ).plan(eightTaste, n = 1, mood = "party", seed = Song(title = "Track A", artist = "Z"))
+            if (withBoth.single().title == "Track H") biased++
+        }
+        assertTrue("biased=" + biased, biased >= 60)
+    }
+
+    @Test
+    fun cohesion_still_delivers_n_and_never_under_delivers() = runTest {
+        val genreFor = FakeGenre(rapJazzMap + ("Seed Banger" to "Rap/Hip Hop"))
+        for (seed in 0 until 20) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed), genre = genreFor)
+                .plan(genreTaste, n = 8, seed = Song(title = "Seed Banger", artist = "SeedMC"))
+            assertEquals(8, songs.size)
+            assertEquals(8, songs.map { baseTitle(it.title) }.toSet().size)
         }
     }
 }

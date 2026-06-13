@@ -552,4 +552,106 @@ class RollingPlannerTest {
         assertEquals(canned, rolling.nextSongs(n = 1))
         assertEquals(listOf("b"), rolling.artistHistory) // fatigue still tracked
     }
+
+    // --- cohesion history: genre + language threading -----------------------
+
+    /** Records the recentGenres/recentLanguages each 8-arg plan() received. */
+    private class FakeCohesionSource(private val batches: List<List<Song>>) : SetlistSource {
+        val recentGenresSeen = mutableListOf<List<String>?>()
+        val recentLanguagesSeen = mutableListOf<List<String>?>()
+        private var i = 0
+        override suspend fun plan(
+            taste: TasteProfile, n: Int, exclude: List<String>?, seed: Song?, mood: String?,
+        ): List<Song> = plan(taste, n, exclude, seed, mood, null, null, null)
+
+        override suspend fun plan(
+            taste: TasteProfile, n: Int, exclude: List<String>?, seed: Song?, mood: String?,
+            recentArtists: List<String>?, recentGenres: List<String>?, recentLanguages: List<String>?,
+        ): List<Song> {
+            recentGenresSeen.add(recentGenres)
+            recentLanguagesSeen.add(recentLanguages)
+            return batches[(i++).coerceAtMost(batches.size - 1)]
+        }
+    }
+
+    /** A GenreSource canned by title (lowercased on the way out is fine). */
+    private class FakeGenreSource(private val byTitle: Map<String, String?>) : GenreSource {
+        override suspend fun genre(artist: String, title: String): String? = byTitle[title]
+    }
+
+    @Test
+    fun language_history_is_recorded_and_forwarded_even_without_a_genre_source() = runTest {
+        // No GenreSource: genre history stays blank, but LANGUAGE is computed
+        // in-code and threaded -- language cohesion needs no network.
+        val englishTitle = "English Hit"
+        val batches = listOf(
+            listOf(Song(title = englishTitle, artist = "A")),
+            listOf(Song(title = "Another One", artist = "B")),
+        )
+        val fake = FakeCohesionSource(batches)
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+        )
+        rolling.nextSongs(n = 1)
+        rolling.nextSongs(n = 1)
+        assertEquals(listOf("int", "int"), rolling.languageHistory)
+        // first call had no history; second saw the first language.
+        assertEquals(emptyList<String>(), fake.recentLanguagesSeen[0])
+        assertEquals(listOf("int"), fake.recentLanguagesSeen[1])
+        // genre history is blank (no source) -> blank entries recorded.
+        assertEquals(listOf("", ""), rolling.genreHistory)
+    }
+
+    @Test
+    fun genre_history_is_labelled_via_the_genre_source_and_forwarded() = runTest {
+        val batches = listOf(
+            listOf(Song(title = "Banger", artist = "MC")),
+            listOf(Song(title = "Smooth", artist = "Sax")),
+        )
+        val fake = FakeCohesionSource(batches)
+        val genreSrc = FakeGenreSource(mapOf("Banger" to "Rap/Hip Hop", "Smooth" to "Jazz"))
+        val rolling = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = fake,
+            refreshEvery = 100,
+            genreSource = genreSrc,
+        )
+        rolling.nextSongs(n = 1)
+        rolling.nextSongs(n = 1)
+        assertEquals(listOf("rap/hip hop", "jazz"), rolling.genreHistory)
+        assertEquals(emptyList<String>(), fake.recentGenresSeen[0])
+        assertEquals(listOf("rap/hip hop"), fake.recentGenresSeen[1])
+    }
+
+    @Test
+    fun genre_and_language_histories_persist_in_sibling_files_and_restore() = runTest {
+        val file = newHistoryFile()
+        val batches = listOf(listOf(Song(title = "Banger", artist = "MC")))
+        val genreSrc = FakeGenreSource(mapOf("Banger" to "Rap/Hip Hop"))
+        val p1 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = FakeCohesionSource(batches),
+            refreshEvery = 100,
+            persistFile = file,
+            genreSource = genreSrc,
+        )
+        p1.nextSongs(n = 1)
+        val genreSibling = File(file.parentFile, file.name + ".genres")
+        val langSibling = File(file.parentFile, file.name + ".langs")
+        assertTrue(genreSibling.exists())
+        assertTrue(langSibling.exists())
+
+        // A SECOND planner over the same file restores both histories.
+        val p2 = RollingPlanner(
+            tasteSource = FakeTasteSource(profile("p")),
+            setlistPlanner = FakeCohesionSource(batches),
+            refreshEvery = 100,
+            persistFile = file,
+            genreSource = genreSrc,
+        )
+        assertEquals(listOf("rap/hip hop"), p2.genreHistory)
+        assertEquals(listOf("int"), p2.languageHistory)
+    }
 }

@@ -5,6 +5,7 @@ import ai.kolai.station.DjBrain
 import ai.kolai.station.DjContext
 import ai.kolai.station.MoodCurator
 import ai.kolai.station.Moods
+import ai.kolai.station.GenreSource
 import ai.kolai.station.SetlistSource
 import ai.kolai.station.TastePoolPlanner
 import ai.kolai.voice.GeminiTextClient
@@ -37,6 +38,11 @@ class KolaiEngine private constructor(
     val blockRenderer: BlockRenderer,
     val blocksDir: File,
     val cacheDir: File,
+    // SONG-FLOW COHESION source (Deezer genre), exposed so the RollingPlanner can
+    // LABEL the genres of the songs it returns -- that genre history feeds the
+    // planner's run-length easing (so a genre run ends organically). Same instance
+    // wired into TastePoolPlanner below, so its cache is shared.
+    val genreSource: GenreSource,
 ) {
     /** Release the underlying HTTP engine. */
     fun close() {
@@ -133,6 +139,12 @@ class KolaiEngine private constructor(
             // survives across plan() calls. Best-effort: unknown BPM (the
             // ~57-70% catalog gap) is neutral and never blocks a pick.
             val bpmSource = DeezerBpmSource(http)
+            // SONG-FLOW COHESION (2026-06-13): a Deezer genre source feeds the
+            // planner's language + genre cohesion (chaining picks into rap / jazz /
+            // English RUNS), run-length-eased so a stretch ends organically.
+            // LONG-LIVED so its genre cache survives across plan() calls.
+            // Best-effort: unknown genre is neutral and never blocks a pick.
+            val genreSource = DeezerGenreSource(http)
             // MoodCurator is LONG-LIVED on purpose: it keeps an in-memory
             // verdict cache, so one instance for the engine's lifetime means
             // repeated mood checks for the same songs cost zero LLM calls.
@@ -140,6 +152,7 @@ class KolaiEngine private constructor(
                 discovery = discovery,
                 curator = MoodCurator(llm),
                 bpm = bpmSource,
+                genre = genreSource,
             )
 
             // PER-MOOD VOICE resolver: an override wins, else the Moods
@@ -177,6 +190,7 @@ class KolaiEngine private constructor(
                 blockRenderer = blockRenderer,
                 blocksDir = blocksDir,
                 cacheDir = cacheDir,
+                genreSource = genreSource,
             )
         }
     }

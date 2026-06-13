@@ -7,53 +7,43 @@ import java.io.File
 /**
  * Endless, taste-refreshing, non-repeating song selection.
  *
- * Ported 1:1 from `backend/radioai/planner_rolling.py` class `RollingPlanner`.
  * Wraps a [TasteSource] (Spotify taste) and a [SetlistSource] (LLM
- * [SetlistPlanner] or pure-code [TastePoolPlanner]). Re-pulls
- * the taste every [refreshEvery] songs OR after [refreshTtlS] seconds so the
- * station keeps learning, and excludes the last [noRepeatWindow] titles so the
- * station does not repeat itself; it relaxes (accepts the planner's picks)
- * rather than stalling when the planner is starved.
+ * [SetlistPlanner] or pure-code [TastePoolPlanner]). Re-pulls the taste every
+ * [refreshEvery] songs OR after [refreshTtlS] seconds so the station keeps
+ * learning, and excludes the last [noRepeatWindow] titles so the station does
+ * not repeat itself; it relaxes (accepts the planner''s picks) rather than
+ * stalling when the planner is starved.
  *
- * Deviations from the Python, deliberate per the Android task spec:
- *  - History/exclude key is [baseTitle] of the song title (Python keyed on the
- *    raw "title — artist"). baseTitle matches [SetlistPlanner]'s own
- *    [parseSetlist] dedup, so the no-repeat window collapses alternate versions
- *    (Live/Remix/feat.) of the same underlying song to one key.
- *  - The clock is injected via [nowMs] (epoch millis) instead of Python's
- *    `time.monotonic` (seconds), so refresh-by-TTL is testable without real
- *    time. TTL is therefore compared in milliseconds ([refreshTtlS] * 1000).
- *  - CROSS-LAUNCH HISTORY (Android addition): when [persistFile] is set, the
- *    no-repeat history is loaded from it on construction and re-saved (last
- *    [noRepeatWindow] * 2 keys, one per line, atomic tmp+rename) after every
- *    [nextSongs]. A fresh process therefore still hands the LLM the recently
- *    played exclude list, so every launch does not re-open with the planner's
- *    default favourites. Corrupt/unreadable files never crash (worst case the
- *    history starts empty); persistence failures are swallowed.
+ * CROSS-CALL SIGNALS handed to the planner so it can shape the on-air flow:
+ *  - recentArtists (artist fatigue): the last [artistWindow] played artists.
+ *  - recentGenres / recentLanguages (SONG-FLOW COHESION): the last
+ *    [cohesionWindow] played coarse genres and languages ("he"/"int"), most
+ *    recent last. [TastePoolPlanner] reads the trailing RUN from them to know how
+ *    long the current genre/language stretch already is, so it can bias toward
+ *    cohesion while a run is short and EASE off once it is long (Spotify-like
+ *    runs of rap / jazz / English that drift, rather than ping-pong). Language is
+ *    computed in-code via [containsHebrew] (free); genre via the optional
+ *    [genreSource] (best-effort, never blocks, cached). With no [genreSource] the
+ *    genre history stays empty and the planner -- if itself wired without a
+ *    GenreSource -- keeps its legacy alternation behaviour, byte-for-byte.
  *
- * Faithfully preserved from the Python:
- *  - First profile load uses cache (`getProfile(useCache=true)`); periodic
- *    refresh forces a re-learn (`getProfile(useCache=false)`).
- *  - The refresh counter counts SONGS, not calls: it advances by the number of
- *    songs actually chosen (`_songs_since_refresh += len(chosen)`), and the
- *    refresh fires when `songsSinceRefresh >= refreshEvery`. (The spec phrases
- *    this as "every refreshEvery calls"; with the common one-song-per-call
- *    cadence the two coincide, but the Python counts songs and we match it.)
- *  - Trigger conditions: `songsSinceRefresh >= refreshEvery` (>=) OR
- *    `(now - lastRefresh) > ttl` (strict >).
- *  - The exclude list is the TAIL of history (last [noRepeatWindow] keys);
- *    relax-when-starved keeps all picks if fewer than [n] are fresh.
+ * CROSS-LAUNCH HISTORY: when [persistFile] is set, the no-repeat title history,
+ * the artist history, and (new) the genre + language histories are loaded on
+ * construction and re-saved after every [nextSongs] in DERIVED sibling files
+ * ("<name>.artists" / ".genres" / ".langs"). Corrupt/unreadable files never
+ * crash; persistence failures are swallowed.
  *
- * @param mood MVP: passed through to [SetlistSource.plan] unchanged; the moods
- *   table is not ported, so the planner currently ignores it (see moodBlock).
+ * @param mood passed through to [SetlistSource.plan] unchanged.
  * @param nowMs injectable clock returning epoch millis; defaults to the real one.
- * @param persistFile optional cross-launch history file (see class doc). The
- *   artist history is persisted alongside it in a DERIVED sibling file
- *   ("<name>.artists"), so wiring stays a single-file concern.
- * @param artistWindow how many recently played artists are handed to the
- *   planner as [SetlistSource.plan]'s recentArtists for cross-call artist
- *   fatigue (a soft DEMOTION in [TastePoolPlanner], never an exclusion;
- *   [SetlistPlanner]'s default overload simply ignores it).
+ * @param persistFile optional cross-launch history file (see class doc).
+ * @param artistWindow how many recently played artists reach the planner.
+ * @param genreSource optional [GenreSource] used ONLY to LABEL the songs this
+ *   planner returns (so the recentGenres run history is accurate); null leaves
+ *   the genre history empty (language cohesion still works -- it needs no
+ *   lookup). Best-effort and never throws; a lookup failure simply records no
+ *   genre for that song. NOT the planner''s own cohesion source -- that is wired
+ *   separately into [TastePoolPlanner].
+ * @param cohesionWindow how many recent genres/languages reach the planner.
  */
 class RollingPlanner(
     private val tasteSource: TasteSource,
@@ -65,6 +55,8 @@ class RollingPlanner(
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     private val persistFile: File? = null,
     private val artistWindow: Int = 12,
+    private val genreSource: GenreSource? = null,
+    private val cohesionWindow: Int = 8,
 ) {
     /** Current station vibe; affects FUTURE song selection. Public like Python. */
     var mood: String? = mood
@@ -77,35 +69,43 @@ class RollingPlanner(
     /** Rolling no-repeat history of recently played keys ([baseTitle] of title). */
     val history: MutableList<String> = mutableListOf()
 
-    /** Rolling history of recently played artists (lowercased, most recent
-     *  last). Soft signal: the last [artistWindow] entries reach the planner
-     *  as recentArtists so it can DEMOTE (not exclude) fatigued artists. */
+    /** Rolling history of recently played artists (lowercased, most recent last). */
     val artistHistory: MutableList<String> = mutableListOf()
 
-    /** Artist history persists in a sibling of [persistFile] ("<name>.artists"). */
+    /** Rolling history of recently played coarse GENRES (lowercased, most recent
+     *  last). Empty entries mark a song whose genre was unknown -- they still
+     *  occupy a slot so the trailing-run computation sees a stretch break. */
+    val genreHistory: MutableList<String> = mutableListOf()
+
+    /** Rolling history of recently played LANGUAGES ("he"/"int", most recent
+     *  last). Always known (computed in-code), so it never has blank entries. */
+    val languageHistory: MutableList<String> = mutableListOf()
+
     private val artistPersistFile: File? =
         persistFile?.let { File(it.parentFile, it.name + ".artists") }
+    private val genrePersistFile: File? =
+        persistFile?.let { File(it.parentFile, it.name + ".genres") }
+    private val languagePersistFile: File? =
+        persistFile?.let { File(it.parentFile, it.name + ".langs") }
 
     init {
         loadHistory()
     }
 
-    /** Switch the station's vibe; affects FUTURE song selection. */
+    /** Switch the station''s vibe; affects FUTURE song selection. */
     fun setMood(mood: String?) {
         this.mood = mood
     }
 
-    /** No-repeat key for a song: base title (matches SetlistPlanner dedup). */
     private fun key(song: Song): String = baseTitle(song.title)
 
-    /** Load persisted history (one key per line). Corruption-tolerant: any IO
-     *  or decode problem just leaves the history empty. */
     private fun loadHistory() {
         loadLinesInto(persistFile, history)
         loadLinesInto(artistPersistFile, artistHistory)
+        loadLinesInto(genrePersistFile, genreHistory)
+        loadLinesInto(languagePersistFile, languageHistory)
     }
 
-    /** Read [f]'s non-blank lines into [into]; any problem leaves it empty. */
     private fun loadLinesInto(f: File?, into: MutableList<String>) {
         if (f == null) return
         try {
@@ -115,51 +115,42 @@ class RollingPlanner(
                 .filter { it.isNotEmpty() }
                 .forEach { into.add(it) }
         } catch (e: Exception) {
-            // corrupt/unreadable history -> start empty, never crash
             into.clear()
         }
     }
 
-    /** Persist the last [noRepeatWindow] * 2 history keys (bounds file growth).
-     *  Best-effort: failures are swallowed. */
     private fun saveHistory() {
-        val f = persistFile
-        if (f != null) {
-            try {
-                val keep = history.takeLast(noRepeatWindow * 2)
-                StationPersistence.writeAtomic(f, keep.joinToString("\n"))
-            } catch (e: Exception) {
-                // best-effort persistence; never fail song selection over it
-            }
-        }
-        val af = artistPersistFile
-        if (af != null) {
-            try {
-                val keep = artistHistory.takeLast(artistWindow * 2)
-                StationPersistence.writeAtomic(af, keep.joinToString("\n"))
-            } catch (e: Exception) {
-                // best-effort persistence; never fail song selection over it
-            }
+        saveBounded(persistFile, history, noRepeatWindow * 2)
+        saveBounded(artistPersistFile, artistHistory, artistWindow * 2)
+        saveBounded(genrePersistFile, genreHistory, cohesionWindow * 2)
+        saveBounded(languagePersistFile, languageHistory, cohesionWindow * 2)
+    }
+
+    /** Persist the last [keep] entries of [list] to [f] (bounds file growth).
+     *  Best-effort: failures are swallowed. Blank-only tails are filtered so a
+     *  trailing unknown-genre line is not re-read as a real entry. */
+    private fun saveBounded(f: File?, list: List<String>, keep: Int) {
+        if (f == null) return
+        try {
+            val tail = list.takeLast(keep)
+            StationPersistence.writeAtomic(f, tail.joinToString("\n"))
+        } catch (e: Exception) {
+            // best-effort persistence; never fail song selection over it
         }
     }
 
-    /**
-     * Load the profile, forcing a fresh re-learn when a refresh is due. Mirrors
-     * Python `_ensure_profile`: first load may use cache; thereafter refresh when
-     * enough songs have played OR the TTL has elapsed.
-     */
     private suspend fun ensureProfile(): TasteProfile {
         val now = nowMs()
         val current = profile
         if (current == null) {
-            val loaded = tasteSource.getProfile(useCache = true) // first load: cache ok
+            val loaded = tasteSource.getProfile(useCache = true)
             profile = loaded
             lastRefreshMs = now
             songsSinceRefresh = 0
             return loaded
         }
         if (songsSinceRefresh >= refreshEvery || (now - lastRefreshMs) > refreshTtlS * 1000) {
-            val refreshed = tasteSource.getProfile(useCache = false) // FORCE re-learn
+            val refreshed = tasteSource.getProfile(useCache = false)
             profile = refreshed
             lastRefreshMs = now
             songsSinceRefresh = 0
@@ -169,10 +160,10 @@ class RollingPlanner(
     }
 
     /**
-     * Pick the next [n] songs, optionally flowing out of [seed]. Mirrors Python
-     * `next_songs`: excludes the last [noRepeatWindow] played keys, relaxes
-     * (accepts the planner's picks) if too few are fresh, then records the chosen
-     * keys in history (and persists them when [persistFile] is set).
+     * Pick the next [n] songs, optionally flowing out of [seed]. Excludes the
+     * last [noRepeatWindow] played keys, relaxes (accepts the planner''s picks)
+     * if too few are fresh, then records the chosen keys / artists / genres /
+     * languages in history (and persists them when [persistFile] is set).
      */
     suspend fun nextSongs(n: Int, seed: Song? = null): List<Song> {
         val profile = ensureProfile()
@@ -184,18 +175,36 @@ class RollingPlanner(
             seed = seed,
             mood = mood,
             recentArtists = artistHistory.takeLast(artistWindow),
+            recentGenres = genreHistory.takeLast(cohesionWindow),
+            recentLanguages = languageHistory.takeLast(cohesionWindow),
         )
         val recentSet = recent.toSet()
         val fresh = picks.filter { key(it) !in recentSet }
-        // relax: accept the raw picks if the fresh set is starved (< n)
         val chosen = (if (fresh.size >= n) fresh else picks).take(n)
         for (s in chosen) {
             history.add(key(s))
             val artist = s.artist.trim().lowercase()
             if (artist.isNotEmpty()) artistHistory.add(artist)
+            // LANGUAGE is free (in-code); GENRE is a best-effort lookup so the
+            // run history is accurate. A null/unknown genre records a blank line
+            // (a run break) rather than nothing, keeping the histories aligned.
+            languageHistory.add(if (containsHebrew(s.title)) "he" else "int")
+            genreHistory.add(labelGenre(s).orEmpty())
         }
         saveHistory()
         songsSinceRefresh += chosen.size
         return chosen
+    }
+
+    /** Best-effort coarse genre of a played song via [genreSource]; null when no
+     *  source or any lookup problem (it must never break or stall selection). */
+    private suspend fun labelGenre(song: Song): String? {
+        val src = genreSource ?: return null
+        if (song.title.isBlank()) return null
+        return try {
+            src.genre(song.artist, song.title)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        } catch (e: Exception) {
+            null
+        }
     }
 }

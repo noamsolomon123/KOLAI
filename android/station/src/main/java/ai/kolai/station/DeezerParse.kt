@@ -104,3 +104,38 @@ fun parseDeezerTrackBpm(json: String): Double? = try {
 } catch (e: Exception) {
     null
 }
+
+/**
+ * GET /track/{id} -> {"id":...,"title":"...","album":{"id":302127,...},...} (a
+ * SINGLE object, not a {"data":[...]} envelope). Returns the nested album id, or
+ * null when it is missing/non-numeric or the body is malformed. The album id is
+ * the bridge from a track to its tagged genre: only the /album/{id} endpoint
+ * carries a usable genres list. Null-tolerant and never throws.
+ */
+fun parseDeezerAlbumIdFromTrack(json: String): Long? = try {
+    val root = Json.parseToJsonElement(json) as? JsonObject ?: return null
+    val album = root["album"] as? JsonObject ?: return null
+    (album["id"] as? JsonPrimitive)?.longOrNull
+} catch (e: Exception) {
+    null
+}
+
+/**
+ * GET /album/{id} -> {"id":...,"genres":{"data":[{"id":113,"name":"Dance",...},
+ * ...]},...} (a SINGLE object whose `genres` is itself a {"data":[...]}
+ * envelope). Returns the FIRST genre's non-blank `name` -- the album's primary
+ * genre, which the cohesion logic treats as the track's coarse genre -- or null
+ * when the album has no tagged genre (Deezer commonly returns an empty genres
+ * list) or the body is malformed. Null-tolerant and never throws.
+ */
+fun parseDeezerAlbumGenre(json: String): String? = try {
+    val root = Json.parseToJsonElement(json) as? JsonObject ?: return null
+    val genres = root["genres"] as? JsonObject ?: return null
+    val data = genres["data"] as? JsonArray ?: return null
+    data.asSequence()
+        .mapNotNull { it as? JsonObject }
+        .mapNotNull { (it["name"] as? JsonPrimitive)?.takeIf { p -> p.isString }?.content?.trim() }
+        .firstOrNull { it.isNotEmpty() }
+} catch (e: Exception) {
+    null
+}
