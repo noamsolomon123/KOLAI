@@ -34,6 +34,7 @@ import ai.kolai.app.wiring.LiveDjContext
 import ai.kolai.app.wiring.PoTokenRegistry
 import ai.kolai.app.wiring.WebViewPoTokenGenerator
 import ai.kolai.station.BlockMeta
+import ai.kolai.station.MoodSwitchWindow
 import ai.kolai.station.RollingPlanner
 import ai.kolai.station.StationEngine
 import kotlinx.coroutines.CoroutineScope
@@ -45,6 +46,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -116,6 +119,20 @@ class KolaiMediaService : MediaLibraryService() {
     private val retuneInFlight = AtomicBoolean(false)
     // Fast-mood-switch re-entrancy guard: a switch in flight collapses bursts.
     private val moodSwitchInFlight = AtomicBoolean(false)
+
+    // BUG 2 (MEDIUM) FIX -- SINGLE shared transition gate. The retune collector
+    // and the fast-mood-switch collector BOTH tear down feedJob
+    // (cancelAndJoin), mutate engine+player state, and relaunch startFeedLoop().
+    // Their in-flight flags are INDEPENDENT, so a near-simultaneous
+    // "new station" tap + mood-chip tap could interleave the two sequences:
+    // one collector's cancelAndJoin could target the OTHER collector's
+    // freshly-launched feed loop, orphaning a feed loop that then races the
+    // shared @Volatile nextToAdd + addMediaItem (duplicate/disordered playlist
+    // entries that never self-heal). This Mutex serializes the ENTIRE
+    // teardown+rebuild of BOTH collectors so they can never interleave; feedJob
+    // is only ever touched while this lock is held. (Each collector still keeps
+    // its own in-flight flag for burst-coalescing within its own type.)
+    private val transitionMutex = Mutex()
 
     // SELF-HEAL bookkeeping: timestamps of recent auto-restarts per loop
     // (bounded to MAX_LOOP_RESTARTS_PER_HOUR) and of recent player-error
@@ -438,6 +455,28 @@ class KolaiMediaService : MediaLibraryService() {
                         } else if (player.playbackState == Player.STATE_IDLE) {
                             // Defensive: never force play on a later block.
                             player.prepare()
+                        } else if (player.playbackState == Player.STATE_ENDED) {
+                            // BUG 1b SAFETY NET (drain recovery): the playlist had
+                            // already DRAINED to STATE_ENDED before this block was
+                            // appended (e.g. the playing block finished before a
+                            // re-rendered next block returned, or any future
+                            // playlist drain). ExoPlayer does NOT auto-resume into
+                            // items appended to an already-ENDED playlist, so it
+                            // would sit silent until a manual transport action.
+                            // Seek to the JUST-ADDED item and resume.
+                            //
+                            // COLD-START INVARIANT PRESERVED: we addMediaItem()
+                            // immediately above, so the player is provably
+                            // NON-EMPTY here -- this can never run on an empty
+                            // player. The added item is always the LAST one
+                            // (addMediaItem appends), so its POSITION is
+                            // mediaItemCount-1; we use that position, NOT the
+                            // block id, so leading-item pruning never desyncs it.
+                            val addedIndex = player.mediaItemCount - 1
+                            Log.w(TAG, "block $idx added into ENDED playlist -> seekTo($addedIndex,0)+play() (drain recovery)")
+                            player.seekTo(addedIndex, 0)
+                            player.prepare()
+                            player.play()
                         }
                     }
                     if (idx == first && coldStart) {
@@ -497,33 +536,41 @@ class KolaiMediaService : MediaLibraryService() {
                 }
                 try {
                     Log.i(TAG, "retune requested")
-                    // 1) stop feeding; join so no stale block lands mid-teardown.
-                    feedJob?.cancelAndJoin()
-                    // 2) player back to the cold-start state: paused, playlist
-                    //    cleared, stop() -> IDLE with an empty playlist. Must
-                    //    run ON the player thread, and we must WAIT for it
-                    //    (runOnPlayer is fire-and-forget), hence withContext.
-                    withContext(Dispatchers.Main) {
-                        player.pause()
-                        player.clearMediaItems()
-                        player.stop()
+                    // BUG 2 GATE: hold the SAME shared transition gate the
+                    // fast-mood-switch collector uses, around the ENTIRE
+                    // teardown+rebuild, so a retune and a mood switch can never
+                    // interleave (each could otherwise cancelAndJoin the OTHER's
+                    // freshly-launched feed loop). feedJob is only touched in here.
+                    // Existing retune behaviour is otherwise UNCHANGED.
+                    transitionMutex.withLock {
+                        // 1) stop feeding; join so no stale block lands mid-teardown.
+                        feedJob?.cancelAndJoin()
+                        // 2) player back to the cold-start state: paused, playlist
+                        //    cleared, stop() -> IDLE with an empty playlist. Must
+                        //    run ON the player thread, and we must WAIT for it
+                        //    (runOnPlayer is fire-and-forget), hence withContext.
+                        withContext(Dispatchers.Main) {
+                            player.pause()
+                            player.clearMediaItems()
+                            player.stop()
+                        }
+                        // 3) clear caches + UI state; show "tuning" right away.
+                        metaCache.clear()
+                        lastMetaSong = null
+                        KolaiState.reset()
+                        KolaiState.setTuning()
+                        withContext(Dispatchers.Main) { promoteToForeground("מתחבר לתחנה…") }
+                        // 4) fresh engine generation: discards in-flight renders,
+                        //    clears blocks + continuity, frontier = current = 0.
+                        stationEngine.reset()
+                        // 5) restart the feed. firstPlayableIndex() now returns
+                        //    the post-reset frontier (0, registry is empty), so
+                        //    the loop re-tunes from block 0 and its existing
+                        //    first-fed-block path prepare()+play()s when it lands.
+                        nextToAdd = 0
+                        lastAdvanced = -1
+                        startFeedLoop()
                     }
-                    // 3) clear caches + UI state; show "tuning" right away.
-                    metaCache.clear()
-                    lastMetaSong = null
-                    KolaiState.reset()
-                    KolaiState.setTuning()
-                    withContext(Dispatchers.Main) { promoteToForeground("מתחבר לתחנה…") }
-                    // 4) fresh engine generation: discards in-flight renders,
-                    //    clears blocks + continuity, frontier = current = 0.
-                    stationEngine.reset()
-                    // 5) restart the feed. firstPlayableIndex() now returns
-                    //    the post-reset frontier (0, registry is empty), so
-                    //    the loop re-tunes from block 0 and its existing
-                    //    first-fed-block path prepare()+play()s when it lands.
-                    nextToAdd = 0
-                    lastAdvanced = -1
-                    startFeedLoop()
                 } catch (e: Throwable) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.e(TAG, "retune failed", e)
@@ -576,46 +623,76 @@ class KolaiMediaService : MediaLibraryService() {
                     // ordering between collectors is not guaranteed).
                     rollingPlanner.setMood(mood)
 
-                    // The block currently being PLAYED keeps playing; everything
-                    // strictly after it is invalidated. If nothing is playing yet
-                    // (cold render in progress), there is nothing buffered to
-                    // drop - future blocks will already use the new mood.
-                    val curBlock = withContext(Dispatchers.Main) {
-                        player.currentMediaItem?.mediaId?.toIntOrNull()
-                    } ?: return@collect
+                    // BUG 2 GATE: hold the shared transition gate around the ENTIRE
+                    // teardown+rebuild so this can never interleave with a retune
+                    // (or another switch). feedJob is only touched inside here, and
+                    // curBlock is read INSIDE the gate too, so a retune that ran
+                    // just before us cannot make us act on a stale playing block.
+                    transitionMutex.withLock {
+                        // The block currently being PLAYED keeps playing; everything
+                        // strictly after it is invalidated. If nothing is playing yet
+                        // (cold render in progress, or a just-finished retune left the
+                        // playlist empty), there is nothing buffered to drop - future
+                        // blocks will already use the new mood. (withLock releases the
+                        // gate on this non-local return.)
+                        val curBlock = withContext(Dispatchers.Main) {
+                            player.currentMediaItem?.mediaId?.toIntOrNull()
+                        } ?: return@collect
 
-                    // 1) stop feeding so no stale (old-mood) block lands mid-swap.
-                    feedJob?.cancelAndJoin()
-                    // 2) remove player items AFTER the current one (keep the
-                    //    playing block intact). Offset-safe by mediaId.
-                    withContext(Dispatchers.Main) {
-                        var i = 0
-                        while (i < player.mediaItemCount) {
-                            val id = player.getMediaItemAt(i).mediaId.toIntOrNull()
-                            if (id != null && id > curBlock) {
-                                player.removeMediaItem(i)
-                                // do not advance i; items shifted down into slot i
-                            } else {
-                                i++
+                        // 1) stop feeding so no stale (old-mood) block lands mid-swap.
+                        feedJob?.cancelAndJoin()
+                        // BUG 1a (PRIMARY -- avoid the STATE_ENDED drain entirely):
+                        // do NOT strip the immediately-next ALREADY-RENDERED block.
+                        // Keep the playing block N AND N+1 (already rendered, old
+                        // mood) so playback continues seamlessly N -> N+1(old) ->
+                        // N+2(new) with ZERO drain/silence, and invalidate the
+                        // engine from N+2. If N+1 is not yet rendered (not in the
+                        // playlist), keep only N and fall back on the feed-loop
+                        // ENDED safety net (Bug 1b). keepThrough() is the pure,
+                        // unit-tested rule (MoodSwitchWindow): it inspects PLAYLIST
+                        // MEMBERSHIP by mediaId (offset-safe vs leading pruning),
+                        // not positions.
+                        val queuedIds = withContext(Dispatchers.Main) {
+                            (0 until player.mediaItemCount)
+                                .mapNotNull { player.getMediaItemAt(it).mediaId.toIntOrNull() }
+                        }
+                        val keepThrough = MoodSwitchWindow.keepThrough(curBlock, queuedIds)
+                        // 2) remove player items ABOVE keepThrough (keep the playing
+                        //    block, and N+1 if already rendered). Offset-safe by mediaId.
+                        withContext(Dispatchers.Main) {
+                            var i = 0
+                            while (i < player.mediaItemCount) {
+                                val id = player.getMediaItemAt(i).mediaId.toIntOrNull()
+                                if (id != null && id > keepThrough) {
+                                    player.removeMediaItem(i)
+                                    // do not advance i; items shifted down into slot i
+                                } else {
+                                    i++
+                                }
                             }
                         }
+                        // 3) drop stale (old-mood) metas ABOVE keepThrough.
+                        metaCache.keys.filter { it > keepThrough }.forEach { metaCache.remove(it) }
+                        // 4) engine: discard rendered/in-flight blocks > keepThrough
+                        //    and rewind the frontier so they re-render with the new
+                        //    mood. invalidateFrom additionally clamps to current+1, so
+                        //    the playing block is never invalidated.
+                        stationEngine.invalidateFrom(keepThrough + 1)
+                        // 5) restart the feed loop. The player still holds the playing
+                        //    block (coldStart=false path), so it re-feeds from
+                        //    keepThrough+1 WITHOUT re-running the first-fed
+                        //    prepare()+play() and without touching the cold-start invariant.
+                        startFeedLoop()
                     }
-                    // 3) drop stale (old-mood) metas beyond the playing block.
-                    metaCache.keys.filter { it > curBlock }.forEach { metaCache.remove(it) }
-                    // 4) engine: discard rendered/in-flight blocks > curBlock and
-                    //    rewind the frontier so they re-render with the new mood.
-                    stationEngine.invalidateFrom(curBlock + 1)
-                    // 5) restart the feed loop. The player still holds the playing
-                    //    block (coldStart=false path), so it re-feeds from
-                    //    curBlock+1 WITHOUT re-running the first-fed prepare()+play()
-                    //    and without touching the cold-start invariant.
-                    startFeedLoop()
                 } catch (e: Throwable) {
                     if (e is kotlinx.coroutines.CancellationException) throw e
                     Log.e(TAG, "fast mood switch failed", e)
                     // best-effort: ensure the feed is running again so playback
-                    // never stalls on a failed switch.
-                    if (feedJob?.isActive != true) startFeedLoop()
+                    // never stalls on a failed switch. Re-acquire the gate so this
+                    // recovery cannot race a concurrent retune teardown either.
+                    transitionMutex.withLock {
+                        if (feedJob?.isActive != true) startFeedLoop()
+                    }
                 } finally {
                     moodSwitchInFlight.set(false)
                 }

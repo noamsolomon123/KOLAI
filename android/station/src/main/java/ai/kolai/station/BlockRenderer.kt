@@ -205,10 +205,13 @@ class BlockRenderer(
     // PER-SONG SAFE-INTRO WINDOW (s), keyed by the loaded track's path (task 3,
     // 2026-06-13): the [VocalOnset.safeIntroWindowS] of each decoded song,
     // computed once in [loadTracks] (the only place the decoded PCM lives).
-    // [planFor]'s opener (block 0 + back-announce) and [render]'s mid-block
-    // intro talk-over both read it so the DJ never talks over a singer. Keyed
-    // by path because paths are unique within a setlist and LoadedTrack is a
-    // shared type we do not extend.
+    // ONLY [planFor]'s opener consults it (block-0 session opening + cross-block
+    // back-announce, both over tracks[0]'s intro) so the DJ never talks over a
+    // singer at a song's head. Mid-block breaks are placed over the OUTGOING
+    // song's outro (then the next song crossfades in afterward), never over an
+    // incoming song's intro, so they need no vocal-onset guard. Keyed by path
+    // because paths are unique within a setlist and LoadedTrack is a shared
+    // type we do not extend.
     // ConcurrentHashMap (not HashMap): [loadTracks] populates this from
     // parallel [Dispatchers.IO] coroutines (capped at [LOAD_CONCURRENCY]), so
     // concurrent put() must be safe - a plain HashMap can drop/lose an entry

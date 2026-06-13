@@ -1137,4 +1137,91 @@ class DjBrainTest {
         }
     }
 
+    // ---- GAP 1: mid-line dangling "עם של" + per-sentence scan ----------------
+
+    @Test
+    fun danglingName_true_for_midline_seq211_shape_with_clean_tail() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // seq-211-shaped: a broken "עם של" mid-line, then a CLEAN sentence that
+        // ends on a real word - pre-fix this returned false (END was clean).
+        val line = "בוא נשבור קצת שגרה עם של. שבת שלום, תגביר את הווליום ותהנה מהטירוף הזה."
+        assertTrue("mid-line 'עם של' must be flagged", brain.danglingName(line))
+        // a mid-line broken clause caught by the per-sentence scan even without
+        // the literal "עם של" adjacency (a bare trailing connector mid-line).
+        val midConnector = "תקשיב לשיר הזה של. ועכשיו ממשיכים הלאה בכיף."
+        assertTrue("mid-line bare connector must be flagged", brain.danglingName(midConnector))
+    }
+
+    @Test
+    fun danglingName_false_for_legit_named_lines_no_false_positive() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // legit "...עם <real title> של <real artist>." - עם is followed by a REAL
+        // name token, and של is preceded by a REAL token, so NOT flagged.
+        assertFalse(brain.danglingName("עכשיו עולה קריפ של רדיוהד, תהנה."))
+        assertFalse(brain.danglingName("נסגור את הסט עם ווה של אומה ת'רמן, ענק."))
+        // a normal clean multi-sentence line with no naming defect.
+        assertFalse(brain.danglingName("בוקר טוב לך. איזה כיף שהצטרפת אלינו עכשיו."))
+        // a clean naming line whose tail is a real word.
+        assertFalse(brain.danglingName("הנה השיר הבא, תהנה ממנו עד הסוף."))
+    }
+
+    // ---- GAP 2: writeRecapOpening gets the dangling-name guard ---------------
+
+    @Test
+    fun recapOpening_dangling_line_is_repaired_or_regenerated() = runTest {
+        // first recap reply dangles ("עם של"), second is complete -> guarded.
+        val client = FakeLlmClient(listOf("איזה שבוע עם של", "איזה שבוע, נפתח עם קריפ של רדיוהד"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(partOfDay = "בוקר", recapBrief = recapBrief)
+        val out = brain.writeRecapOpening(nxt = nxt, ctx = ctx, seconds = 20.0)
+        assertFalse("recap opening must not air a dangling line: $out", brain.danglingName(out))
+        assertEquals("dangling recap must trigger a regen", 2, client.prompts.size)
+        assertTrue("retry prompt carries the sharper instruction",
+            client.prompts[1].contains("כתוב משפט שלם שכולל את שם השיר המלא"))
+    }
+
+    @Test
+    fun recapOpening_clean_line_passes_through_without_regen() = runTest {
+        val client = FakeLlmClient(listOf("בוקר טוב, איזה שבוע מטורף עבר עליך."))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(partOfDay = "בוקר", recapBrief = recapBrief)
+        val out = brain.writeRecapOpening(nxt = nxt, ctx = ctx, seconds = 20.0)
+        assertEquals("בוקר טוב, איזה שבוע מטורף עבר עליך.", out)
+        assertEquals("clean recap must not trigger a retry", 1, client.prompts.size)
+    }
+
+    // ---- GAP 3: repairDangling drops standalone "&"; deDangleNaming guarantee -
+
+    @Test
+    fun repairDangling_strips_midline_standalone_ampersand() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        val repaired = brain.repairDangling("עכשיו עולה השיר & תהנה ממנו")
+        assertFalse("standalone & must be gone", brain.danglingName(repaired))
+        assertFalse("repaired line must not contain a standalone & token",
+            repaired.split(' ').any { it == "&" })
+        assertTrue("the real words must survive", repaired.contains("תהנה"))
+    }
+
+    @Test
+    fun deDangleNaming_never_returns_a_dangling_line_when_dangling_twice() = runTest {
+        // GAP 3b guarantee: both replies dangle (mid-line "עם של" + clean tail)
+        // -> the final per-sentence pass must yield a non-dangling line.
+        val twice = "בוא נשבור שגרה עם של. שבת שלום ותהנה מהטירוף."
+        val client = FakeLlmClient(listOf(twice, twice))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeIntro(prev, nxt, seconds = 8.0)
+        assertFalse("deDangleNaming guarantee violated: $out", brain.danglingName(out))
+        // the clean tail survives; the broken naming clause is dropped.
+        assertTrue("clean sentence must survive", out.contains("שבת שלום"))
+    }
+
+    @Test
+    fun deDangleNaming_clean_amp_free_line_is_unchanged() = runTest {
+        val client = FakeLlmClient(listOf("הנה קריפ של רדיוהד, תהנה."))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeIntro(prev, nxt, seconds = 8.0)
+        assertEquals("הנה קריפ של רדיוהד, תהנה.", out)
+        assertEquals("clean line must not trigger a retry", 1, client.prompts.size)
+    }
+
 }

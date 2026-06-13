@@ -435,7 +435,17 @@ class DjBrain(
      *   - ends on a standalone Hebrew connector word
      *     (עם / של / את / ה / ו / ב / ל / מ),
      *   - ends on (or is) the broken phrase "עם של" with nothing after it,
-     *   - ends on a bare "&" (a title that never substituted), or
+     *   - has an "עם של" adjacency ANYWHERE in the line (the token "עם"
+     *     IMMEDIATELY followed by the token "של" - a correctly-named line is
+     *     "עם <שם השיר> של <האמן>", so adjacent עם->של means the name is gone;
+     *     the legit "<title> של <artist>" pattern, where של is preceded by a
+     *     REAL name token rather than by עם, is NOT flagged - GAP 1 fix),
+     *   - has ANY mid-line sentence segment (split on .!?…) that is itself
+     *     end-dangling - catches a broken naming clause followed by a clean
+     *     sentence, e.g. "...עם של. שבת שלום ותהנה." (GAP 1 fix),
+     *   - ends on a bare "&" (a title that never substituted) or contains a
+     *     standalone "&" token anywhere (e.g. left by "X & Y" where Y never
+     *     filled), or
      *   - contains an empty "" quote pair (template that failed to fill).
      * Punctuation/quote chars are trimmed off the tail before the word check, so
      * "...עם של." and "...של!" are both caught.
@@ -447,17 +457,44 @@ class DjBrain(
         // a standalone "&" token (e.g. left by "X & Y" where Y never filled).
         val ampTokens = line.split(' ', '\t', '\n')
         if (ampTokens.any { it == "&" }) return true
-        // strip trailing punctuation / quotes / dashes / whitespace.
+        // GAP 1: "עם של" adjacency ANYWHERE - the token "עם" immediately
+        // followed by the token "של" means the song name between them is gone.
+        // We compare whole tokens (not substrings) so legit "<title> של <artist>"
+        // is never flagged: its של is preceded by a real title token, not by עם.
+        val wholeTokens = line.split(' ', '\t', '\n', '\r').filter { it.isNotEmpty() }
+        for (k in 0 until wholeTokens.size - 1) {
+            val a = wholeTokens[k].trim('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—')
+            val b = wholeTokens[k + 1].trim('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—')
+            if (a == "עם" && b == "של") return true
+        }
+        // whole-line end-dangling check.
+        if (isEndDangling(line)) return true
+        // GAP 1: per-sentence scan - flag if ANY segment is itself end-dangling,
+        // catching a mid-line broken naming clause that a clean tail would hide.
+        val segments = splitSentences(line)
+        if (segments.size > 1) {
+            for (seg in segments) if (isEndDangling(seg)) return true
+        }
+        return false
+    }
+
+    /**
+     * NEW (GAP 1 helper): true when [text] ENDS on a dangling connector token
+     * (עם / של / את / ה / ו / ב / ל / מ), on the broken "עם של" pair, or on a
+     * bare "&". Pure char/indexOf scan, no ICU regex. Trailing punctuation /
+     * quotes / dashes / whitespace are stripped first so "...עם של." and
+     * "...של!" are both caught.
+     */
+    private fun isEndDangling(text: String): Boolean {
         val tail = " \t\r\n.!?…,:;\"'`-–—&"
-        var end = line.length
-        while (end > 0 && tail.indexOf(line[end - 1]) >= 0) end -= 1
-        val trimmed = line.substring(0, end).trimEnd()
+        var end = text.length
+        while (end > 0 && tail.indexOf(text[end - 1]) >= 0) end -= 1
+        val trimmed = text.substring(0, end).trimEnd()
         if (trimmed.isEmpty()) {
             // nothing but punctuation - or a bare "&" was the whole tail.
-            return line.trimEnd().endsWith("&")
+            return text.trimEnd().endsWith("&")
         }
-        // split into whitespace tokens; inspect the last (and the pair before).
-        val tokens = trimmed.split(' ', '\t', '\n').filter { it.isNotEmpty() }
+        val tokens = trimmed.split(' ', '\t', '\n', '\r').filter { it.isNotEmpty() }
         if (tokens.isEmpty()) return false
         val last = tokens.last()
         if (last in DANGLING_CONNECTORS) return true
@@ -467,12 +504,39 @@ class DjBrain(
     }
 
     /**
+     * NEW (GAP 1 / GAP 3 helper): split [text] into sentence segments on the
+     * ender chars [.!?…], keeping the trailing ender with each segment. Pure
+     * char scan (no ICU regex). Blank segments are dropped.
+     */
+    private fun splitSentences(text: String): List<String> {
+        val enders = ".!?…"
+        val out = mutableListOf<String>()
+        var start = 0
+        for (i in text.indices) {
+            if (enders.indexOf(text[i]) >= 0) {
+                val seg = text.substring(start, i + 1).trim()
+                if (seg.isNotEmpty()) out.add(seg)
+                start = i + 1
+            }
+        }
+        if (start < text.length) {
+            val seg = text.substring(start).trim()
+            if (seg.isNotEmpty()) out.add(seg)
+        }
+        return out
+    }
+
+    /**
      * NEW (BUG 1): repair a finished line that [danglingName] flagged, WITHOUT a
      * further LLM call - used as the last-resort fallback so we never air a
      * dangling connector. Prefer cutting back to the last sentence boundary that
      * leaves a clean, non-dangling line; otherwise strip the trailing connector
-     * tokens (and a trailing "עם של") so the line ENDS cleanly. Never returns a
-     * line that still ends on a dangling connector or contains a trailing "עם של".
+     * tokens (and a trailing "עם של") so the line ENDS cleanly, and drop any
+     * standalone "&" token left ANYWHERE in the line (GAP 3a - e.g. an artist
+     * like "The Mamas & The Papas" whose halves never substituted). Never
+     * returns a line that still ends on a dangling connector or contains a
+     * trailing "עם של"; combined with [deDangleNaming]'s re-check the aired line
+     * is guaranteed non-dangling.
      */
     internal fun repairDangling(line: String): String {
         // 1) try cutting back to a sentence boundary that is itself clean.
@@ -497,6 +561,11 @@ class DjBrain(
                 break
             }
         }
+        // GAP 3a: drop any standalone "&" token left ANYWHERE in the line (a "&"
+        // with spaces around it, not part of a word) so it can never survive.
+        tokens = tokens.filter { tok ->
+            tok.trim('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—', '&', ' ').isNotEmpty()
+        }.toMutableList()
         val joined = tokens.joinToString(" ").trim().trimEnd(',', '-', '–', '—', ':', ';', '&', ' ')
         return joined.trim()
     }
@@ -514,10 +583,17 @@ class DjBrain(
      * NEW (BUG 1): defensive wrapper for the naming beats. [out] is the already
      * finished line; if it is dangling, regenerate ONCE with the sharper
      * [regenNamingLine] appended to [basePrompt], re-finish, and if that is still
-     * dangling fall back to [repairDangling] so the aired line ENDS cleanly and
-     * never carries "עם של". Non-dangling lines pass straight through unchanged,
-     * so the default (good) path is byte-identical to before. Any LLM failure on
-     * the retry falls back to repairing the original line - never throws.
+     * dangling fall back to [repairDangling]. Non-dangling lines pass straight
+     * through unchanged, so the default (good) path is byte-identical to before.
+     * Any LLM failure on the retry falls back to repairing the original line -
+     * never throws.
+     *
+     * GUARANTEE (GAP 3b, 2026-06-13): the returned line is NEVER one for which
+     * [danglingName] is true. [repairDangling] is re-checked; if it still
+     * dangles, a final per-sentence pass ([finalDeDangle]) drops every dangling
+     * sentence segment and keeps the clean ones, falling back to the longest
+     * clean prefix - so a twice-dangling input (incl. a mid-line "עם של" or a
+     * surviving standalone "&") still yields a clean, airable line.
      */
     private suspend fun deDangleNaming(out: String, basePrompt: String, budget: Int): String {
         if (!danglingName(out)) return out
@@ -528,7 +604,41 @@ class DjBrain(
         }
         if (retry.isNotBlank() && !danglingName(retry)) return retry
         val repaired = repairDangling(out)
-        return if (repaired.isNotBlank()) repaired else out
+        if (repaired.isNotBlank() && !danglingName(repaired)) return repaired
+        // GAP 3b: repair still dangles (mid-line "עם של", surviving "&", ...) -
+        // final safe per-sentence pass that GUARANTEES a non-dangling result.
+        return finalDeDangle(if (repaired.isNotBlank()) repaired else out)
+    }
+
+    /**
+     * NEW (GAP 3b): last-resort de-dangle that MUST return a non-dangling line.
+     * Keeps only the sentence segments that are themselves clean (not
+     * end-dangling and free of an "עם של" adjacency); if any survive, returns
+     * them joined. If none do, walks back token-by-token to the longest clean
+     * prefix. As a final guard, if even that dangles it strips trailing dangling
+     * tokens via [repairDangling] one more time, returning "" only if nothing
+     * clean remains (callers treat "" as "say nothing"). The invariant on exit:
+     * danglingName(result) == false.
+     */
+    private fun finalDeDangle(line: String): String {
+        // 1) keep only the clean sentence segments.
+        val segments = splitSentences(line)
+        val clean = segments.filter { !danglingName(it) }
+        if (clean.isNotEmpty()) {
+            val joined = clean.joinToString(" ").trim()
+            if (joined.isNotEmpty() && !danglingName(joined)) return joined
+        }
+        // 2) no clean full segment - walk back to the longest clean token prefix.
+        val tokens = line.split(' ', '\t', '\n', '\r').filter { it.isNotEmpty() }
+        var n = tokens.size
+        while (n > 0) {
+            val prefix = tokens.subList(0, n).joinToString(" ").trim()
+            if (prefix.isNotEmpty() && !danglingName(prefix)) return prefix
+            n -= 1
+        }
+        // 3) final guard - strip trailing dangling tokens once more.
+        val repaired = repairDangling(line)
+        return if (repaired.isNotBlank() && !danglingName(repaired)) repaired else ""
     }
 
     // ---- public API ------------------------------------------------------
@@ -840,8 +950,12 @@ class DjBrain(
     suspend fun writeRecapOpening(nxt: Song, ctx: DjContext, seconds: Double = 20.0): String {
         if (ctx.recapBrief.isNullOrEmpty()) return writeOpening(nxt, ctx, seconds)
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(recapOpeningPrompt(nxt, ctx, budget) + avoidLine())
-        val out = finish(text, budget)
+        // GAP 2: the recap opening is a LIVE naming path (its prompt ends naming
+        // the first song "<title> של <artist>"), so it gets the same
+        // dangling-name guard as its 4 opening/handover siblings - the plain
+        // finish() alone shared the truncation root cause.
+        val base = recapOpeningPrompt(nxt, ctx, budget) + avoidLine()
+        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
         remember(out)
         return out
     }
