@@ -79,3 +79,28 @@ fun parseDeezerTopTracks(json: String): List<Song> =
             durationS = duration?.takeIf { it > 0.0 },
         )
     }
+
+/**
+ * GET /search/track?q=... -> {"data":[{"id":3135556,"title":"...",...},...]}.
+ * Returns the first entry's track id (skipping entries without a usable id), or
+ * null on empty/malformed input. Used by the BPM source to resolve a song to
+ * the /track/{id} detail endpoint, which is the only Deezer endpoint that
+ * carries the `bpm` field. Identical in spirit to [parseDeezerArtistId].
+ */
+fun parseDeezerTrackId(json: String): Long? =
+    deezerData(json)?.firstNotNullOfOrNull { (it["id"] as? JsonPrimitive)?.longOrNull }
+
+/**
+ * GET /track/{id} -> {"id":...,"title":"...","bpm":123.4,...} (a SINGLE object,
+ * not a {"data":[...]} envelope). Returns the `bpm` when it is a positive
+ * number, else null: Deezer uses bpm == 0 (and frequently omits it) to mean
+ * "unknown tempo", which the caller treats as NEUTRAL. Null-tolerant and never
+ * throws on malformed input.
+ */
+fun parseDeezerTrackBpm(json: String): Double? = try {
+    val root = Json.parseToJsonElement(json) as? JsonObject ?: return null
+    val bpm = (root["bpm"] as? JsonPrimitive)?.doubleOrNull ?: return null
+    bpm.takeIf { it > 0.0 }
+} catch (e: Exception) {
+    null
+}

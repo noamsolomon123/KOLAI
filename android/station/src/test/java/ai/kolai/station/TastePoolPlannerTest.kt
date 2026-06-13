@@ -641,4 +641,202 @@ class TastePoolPlannerTest {
         // every other pick is a taste pick and IS marked
         assertTrue(songs.drop(1).all { it.tasteRank != null })
     }
+
+    // --- TEMPO AWARENESS: BpmSource bias + seed smoothing + ordering ----------
+
+    /** Canned BPMs keyed by title (case-insensitive); counts DISTINCT lookups.
+     *  Any title not in the map returns null (= unknown = neutral), exercising
+     *  the coverage-gap path. NEVER throws. */
+    private class FakeBpm(private val byTitle: Map<String, Double?>) : BpmSource {
+        var calls = 0
+        val titlesSeen = mutableSetOf<String>()
+        override suspend fun bpm(artist: String, title: String): Double? {
+            calls++
+            titlesSeen.add(title)
+            return byTitle[title]
+        }
+    }
+
+    /** All-unknown source: every lookup returns null. */
+    private class NullBpm : BpmSource {
+        var calls = 0
+        override suspend fun bpm(artist: String, title: String): Double? { calls++; return null }
+    }
+
+    @Test
+    fun null_bpm_source_is_byte_identical_to_no_bpm_for_every_seed() = runTest {
+        // A wired-but-all-unknown source must change nothing: no weight bias,
+        // no reorder -> the same picks the tempo-blind planner produces.
+        for (seed in 0 until 25) {
+            val base = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(mixedTaste, n = 6, mood = "party")
+            val withNullBpm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = NullBpm())
+                .plan(mixedTaste, n = 6, mood = "party")
+            assertEquals("rng seed $seed", base, withNullBpm)
+        }
+    }
+
+    @Test
+    fun bpm_constructor_default_is_byte_identical_to_today() = runTest {
+        // The new param defaults to null; an explicit-null planner equals the
+        // bare planner (regression guard that the default truly disables it).
+        for (seed in 0 until 10) {
+            val bare = TastePoolPlanner(rng = kotlin.random.Random(seed)).plan(mixedTaste, n = 6)
+            val explicitNull = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = null)
+                .plan(mixedTaste, n = 6)
+            assertEquals(bare, explicitNull)
+        }
+    }
+
+    /** 8 English tracks; half tagged in-window (130 BPM), half far-outside (55). */
+    private val tempoTaste = TasteProfile(
+        topTracks = listOf(
+            TasteTrack(title = "Fast A", artist = "FA", durationS = 100.0),
+            TasteTrack(title = "Slow A", artist = "SA", durationS = 100.0),
+            TasteTrack(title = "Fast B", artist = "FB", durationS = 100.0),
+            TasteTrack(title = "Slow B", artist = "SB", durationS = 100.0),
+            TasteTrack(title = "Fast C", artist = "FC", durationS = 100.0),
+            TasteTrack(title = "Slow C", artist = "SC", durationS = 100.0),
+            TasteTrack(title = "Fast D", artist = "FD", durationS = 100.0),
+            TasteTrack(title = "Slow D", artist = "SD", durationS = 100.0),
+        ),
+        topArtists = emptyList(),
+    )
+
+    private val tempoMap: Map<String, Double?> = mapOf(
+        "Fast A" to 130.0, "Fast B" to 130.0, "Fast C" to 130.0, "Fast D" to 130.0, // party window 118..150
+        "Slow A" to 55.0, "Slow B" to 55.0, "Slow C" to 55.0, "Slow D" to 55.0,     // far below 118-20
+    )
+
+    @Test
+    fun per_mood_window_biases_selection_toward_in_window_bpm() = runTest {
+        // mood=party (118..150): in-window "Fast" tracks must open far more
+        // often WITH the BPM source than the tempo-blind planner does.
+        var biasedFast = 0
+        var plainFast = 0
+        for (seed in 0 until 200) {
+            val withBpm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = FakeBpm(tempoMap))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            if (withBpm.title.startsWith("Fast")) biasedFast++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            if (plain.title.startsWith("Fast")) plainFast++
+        }
+        // x3 in-window vs x0.4 far-outside is a ~7.5x odds tilt PER track; the
+        // biased opener should land in-window far more than the unbiased ~50%.
+        assertTrue("biasedFast=$biasedFast", biasedFast >= 140)
+        assertTrue("biasedFast=$biasedFast plainFast=$plainFast", biasedFast > plainFast + 30)
+    }
+
+    @Test
+    fun mix_mood_applies_no_window_bias() = runTest {
+        // "mix" has no BPM window: even WITH a source, picks must match the
+        // tempo-blind planner (no per-mood weight change; only ordering could
+        // differ, and n=1 cannot reorder).
+        for (seed in 0 until 20) {
+            val withBpm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = FakeBpm(tempoMap))
+                .plan(tempoTaste, n = 1, mood = "mix").single()
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "mix").single()
+            assertEquals("rng seed $seed", plain.title, withBpm.title)
+        }
+    }
+
+    /** A 60-BPM seed; tempoTaste has Fast=130 and Slow=55 candidates. */
+    @Test
+    fun seed_bpm_smoothing_reduces_first_pick_dBPM() = runTest {
+        // mood=mix (no window bias) so ONLY seed smoothing acts. A 55-BPM seed
+        // should pull the first pick toward the 55-BPM "Slow" tracks, lowering
+        // the mean |dBPM| vs the unbiased planner.
+        val seedSong = Song(title = "Seed", artist = "Z")
+        val seedBpm = 55.0
+        val bpmFor = tempoMap + ("Seed" to seedBpm)
+        var biasedSlow = 0
+        var plainSlow = 0
+        for (seed in 0 until 200) {
+            val withBpm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = FakeBpm(bpmFor))
+                .plan(tempoTaste, n = 1, mood = "mix", seed = seedSong).single()
+            if (withBpm.title.startsWith("Slow")) biasedSlow++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "mix", seed = seedSong).single()
+            if (plain.title.startsWith("Slow")) plainSlow++
+        }
+        // 55-BPM seed: Slow (|d|=0 -> x3) beats Fast (|d|=75 -> x1) per track.
+        assertTrue("biasedSlow=$biasedSlow", biasedSlow >= 140)
+        assertTrue("biasedSlow=$biasedSlow plainSlow=$plainSlow", biasedSlow > plainSlow + 30)
+    }
+
+    @Test
+    fun unknown_bpm_candidates_are_neutral_under_a_window() = runTest {
+        // mood=party, but the source knows NOTHING about these titles -> every
+        // candidate is unknown = neutral, so picks match the tempo-blind planner.
+        val emptyBpm = FakeBpm(emptyMap())
+        for (seed in 0 until 20) {
+            val withBpm = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = emptyBpm)
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            assertEquals("rng seed $seed", plain.title, withBpm.title)
+        }
+    }
+
+    @Test
+    fun candidate_bpm_lookups_are_bounded_to_the_cap() = runTest {
+        // 70-track pool, no seed: candidate lookups must not exceed bpmLookupCap.
+        val big = TasteProfile(
+            topTracks = (0 until 70).map { i ->
+                TasteTrack(title = "Song$i Unique", artist = "Artist$i", durationS = 100.0)
+            },
+            topArtists = emptyList(),
+        )
+        val fake = FakeBpm(emptyMap())
+        TastePoolPlanner(rng = kotlin.random.Random(1), bpm = fake, bpmLookupCap = 30)
+            .plan(big, n = 2, mood = "party")
+        assertTrue("calls=${fake.calls}", fake.calls <= 30)
+        assertEquals("distinct titles looked up", fake.titlesSeen.size, fake.calls) // no dup queries
+    }
+
+    @Test
+    fun ordering_pass_places_the_pick_closer_to_the_seed_first() = runTest {
+        // n=2, both picks + seed have known BPM: the FINAL order must put the
+        // pick whose tempo is closer to the seed first (smaller seed->first jump).
+        // tempoTaste = Fast(130)/Slow(55); a 125-BPM seed is nearest the Fast set.
+        val seedSong = Song(title = "Seed", artist = "Z")
+        val bpmFor = tempoMap + ("Seed" to 125.0)
+        for (seed in 0 until 40) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = FakeBpm(bpmFor))
+                .plan(tempoTaste, n = 2, mood = "mix", seed = seedSong)
+            assertEquals(2, songs.size)
+            val b0 = tempoMap.getValue(songs[0].title)!!
+            val b1 = tempoMap.getValue(songs[1].title)!!
+            assertTrue(
+                "first pick not closest to seed (rng $seed): ${songs.map { it.title }}",
+                kotlin.math.abs(b0 - 125.0) <= kotlin.math.abs(b1 - 125.0),
+            )
+        }
+    }
+
+    @Test
+    fun ordering_parks_unknown_bpm_song_at_the_boundary() = runTest {
+        // One pick known (Fast=130), one unknown: the known one must lead and
+        // the unknown is parked last (so a missing value cannot fabricate a jump).
+        // Force the two specific picks by excluding all but two tracks.
+        val knownOnly = TasteProfile(
+            topTracks = listOf(
+                TasteTrack(title = "Known Hit", artist = "K", durationS = 100.0),
+                TasteTrack(title = "Mystery Track", artist = "M", durationS = 100.0),
+            ),
+            topArtists = emptyList(),
+        )
+        val seedSong = Song(title = "Seed", artist = "Z")
+        val bpmFor = mapOf<String, Double?>("Known Hit" to 130.0, "Seed" to 128.0) // Mystery unknown
+        // With only 2 tracks and n=2, both are always chosen; we check ORDER.
+        for (seed in 0 until 20) {
+            val songs = TastePoolPlanner(rng = kotlin.random.Random(seed), bpm = FakeBpm(bpmFor))
+                .plan(knownOnly, n = 2, mood = "mix", seed = seedSong)
+            assertEquals(2, songs.size)
+            assertEquals("known-BPM song must lead (rng $seed)", "Known Hit", songs[0].title)
+            assertEquals("unknown-BPM song parked last (rng $seed)", "Mystery Track", songs[1].title)
+        }
+    }
 }

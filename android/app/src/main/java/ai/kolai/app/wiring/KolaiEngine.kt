@@ -127,12 +127,19 @@ class KolaiEngine private constructor(
             // --- brains -----------------------------------------------------
             val brain = DjBrain(client = llm, persona = PERSONA)
             val discovery = DeezerDiscovery(http)
+            // TEMPO AWARENESS (2026-06-13): a Deezer /track BPM source feeds the
+            // planner's per-mood BPM window bias + seed/order smoothing (see
+            // docs/studies/findings-bpm-v3.md). LONG-LIVED so its BPM cache
+            // survives across plan() calls. Best-effort: unknown BPM (the
+            // ~57-70% catalog gap) is neutral and never blocks a pick.
+            val bpmSource = DeezerBpmSource(http)
             // MoodCurator is LONG-LIVED on purpose: it keeps an in-memory
             // verdict cache, so one instance for the engine's lifetime means
             // repeated mood checks for the same songs cost zero LLM calls.
             val planner: SetlistSource = TastePoolPlanner(
                 discovery = discovery,
                 curator = MoodCurator(llm),
+                bpm = bpmSource,
             )
 
             // PER-MOOD VOICE resolver: an override wins, else the Moods

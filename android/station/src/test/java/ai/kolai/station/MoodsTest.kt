@@ -1,6 +1,8 @@
 package ai.kolai.station
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -152,5 +154,54 @@ class MoodsTest {
         assertEquals("mix", Moods.spec(null).key)
         assertEquals("mix", Moods.spec("no_such_mood").key)
         assertEquals("mix", Moods.spec("").key)
+    }
+
+    // --- per-mood BPM windows (tempo-distinct moods) -------------------------
+
+    @Test
+    fun mix_has_no_bpm_window_the_others_do() {
+        // "mix" is intentionally tempo-agnostic: no window at all.
+        val mix = Moods.ALL.getValue("mix")
+        assertNull(mix.bpmLo)
+        assertNull(mix.bpmHi)
+        assertFalse("mix must NOT carry a BPM window", mix.hasBpmWindow)
+        // every other mood is numerically tempo-distinct (the study's P2 fix).
+        for (key in listOf("party", "late_night", "focus", "morning")) {
+            assertTrue("$key must carry a BPM window", Moods.ALL.getValue(key).hasBpmWindow)
+        }
+    }
+
+    @Test
+    fun bpm_windows_are_well_formed_and_ordered() {
+        for (spec in Moods.ALL.values) {
+            if (!spec.hasBpmWindow) continue
+            val lo = spec.bpmLo!!
+            val hi = spec.bpmHi!!
+            assertTrue("${spec.key} bpmLo must be positive", lo > 0.0)
+            assertTrue("${spec.key} bpmLo < bpmHi", lo < hi)
+        }
+    }
+
+    @Test
+    fun bpm_windows_match_the_chosen_per_mood_values() {
+        fun win(key: String, lo: Double, hi: Double) {
+            val s = Moods.ALL.getValue(key)
+            assertEquals("$key bpmLo", lo, s.bpmLo!!, 0.0)
+            assertEquals("$key bpmHi", hi, s.bpmHi!!, 0.0)
+        }
+        win("party", 118.0, 150.0)
+        win("late_night", 60.0, 95.0)
+        win("focus", 70.0, 110.0)
+        win("morning", 90.0, 120.0)
+    }
+
+    @Test
+    fun moods_are_tempo_distinct_party_is_faster_than_late_night() {
+        // The whole point of the windows: party's band sits clearly ABOVE
+        // late_night's (the study found them tempo-indistinct before).
+        val party = Moods.ALL.getValue("party")
+        val lateNight = Moods.ALL.getValue("late_night")
+        assertTrue("party floor must clear late_night ceiling",
+            party.bpmLo!! > lateNight.bpmHi!!)
     }
 }

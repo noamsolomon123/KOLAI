@@ -39,7 +39,27 @@ data class MoodSpec(
     val ttsStyle: String,
     val djLine: String,
     val curationHint: String,
-)
+    /**
+     * Optional TARGET TEMPO WINDOW (beats-per-minute) for the mood, the
+     * numeric counterpart of the prose [curationHint] on the rhythm axis. The
+     * BPM study (docs/studies/findings-bpm-v3.md) found moods were
+     * tempo-INDISTINCT (every mood spanned ~70-185 BPM; mean BPMs sat in a
+     * ~13 BPM band) because [curationHint] is unenforced LLM prose with no
+     * numeric gate. [bpmLo]/[bpmHi] give [TastePoolPlanner] a SOFT window: a
+     * candidate whose (known) BPM falls inside is favored, far-outside is
+     * gently demoted, unknown BPM stays neutral. NEVER a hard filter -- a
+     * coverage gap or an out-of-window favorite still plays.
+     *
+     * Both null (the default, and "mix") = NO tempo constraint = the widest,
+     * tempo-agnostic behavior. Stored as a closed [bpmLo]..[bpmHi] inclusive
+     * band; both must be set together for the window to apply.
+     */
+    val bpmLo: Double? = null,
+    val bpmHi: Double? = null,
+) {
+    /** True when this mood carries a usable target tempo window. */
+    val hasBpmWindow: Boolean get() = bpmLo != null && bpmHi != null
+}
 
 object Moods {
     const val DEFAULT = "mix"
@@ -57,6 +77,8 @@ object Moods {
             djLine = "",
             curationHint = "a flowing mix across energies with a natural arc - the " +
                 "listener's favorites and closely related songs",
+            // No tempo window on purpose: "mix" flows across all energies, so
+            // bpmLo/bpmHi stay null (= no BPM bias, the widest band).
         ),
         MoodSpec(
             key = "party",
@@ -70,6 +92,8 @@ object Moods {
             curationHint = "high-energy, upbeat, danceable party bangers - energetic pop, " +
                 "dance, EDM, hip-hop bangers (think 'The Middle' energy); keep " +
                 "the energy high and the tempo up",
+            // Fast, danceable floor: the upper end reaches double-time pop/EDM.
+            bpmLo = 118.0, bpmHi = 150.0,
         ),
         MoodSpec(
             key = "late_night",
@@ -83,6 +107,8 @@ object Moods {
             curationHint = "low-energy, slow, smooth, intimate late-night songs - mellow " +
                 "R&B, downtempo, soft ballads, chill electronic, dreamy vibes; " +
                 "avoid loud high-tempo bangers",
+            // Slowest mood: downtempo ballads / chill electronica.
+            bpmLo = 60.0, bpmHi = 95.0,
         ),
         MoodSpec(
             key = "focus",
@@ -95,6 +121,8 @@ object Moods {
             curationHint = "steady, mellow, non-distracting songs for focus - chill, " +
                 "instrumental-leaning, lo-fi, smooth grooves, minimal vocals; " +
                 "consistent calm energy, nothing jarring",
+            // Steady mid-low groove: nothing jarring, nothing sleepy.
+            bpmLo = 70.0, bpmHi = 110.0,
         ),
         MoodSpec(
             key = "morning",
@@ -108,6 +136,8 @@ object Moods {
             curationHint = "bright, warm, uplifting mid-energy morning songs - feel-good " +
                 "pop, sunny vibes, easy upbeat tracks; a positive start to the " +
                 "day",
+            // Rising-but-easy mid energy: brighter than focus, calmer than party.
+            bpmLo = 90.0, bpmHi = 120.0,
         ),
     ).associateBy { it.key }
 
