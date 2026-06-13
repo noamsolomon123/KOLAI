@@ -1,0 +1,17 @@
+{
+  "totalSongs": 120,
+  "totalItems": 120,
+  "targetSongs": 120,
+  "perMood": {"focus": 23, "late_night": 25, "mix": 25, "party": 23, "morning": 24},
+  "perBeat": {"song": 37, "handover": 16, "cue": 16, "good_thing": 16, "banter": 16, "weather": 1, "trivia": 16, "recap": 1, "open": 1},
+  "discoveryCount": 26,
+  "discoveryRate": 0.2167,
+  "geminiFailures": 0,
+  "quotaExhausted": false,
+  "deezerHits": 115,
+  "deezerMisses": 5,
+  "deezerBpmKnown": 0,
+  "deezerBpmCoverage": 0.0000,
+  "emptyPicks": 0,
+  "wallClockMs": 529966
+}
