@@ -316,7 +316,21 @@ class KolaiMediaService : MediaLibraryService() {
             // context fields null (DjBrain falls back gracefully).
             liveCtx?.refreshNow()
 
-            val taste = SeededTasteSource(this)
+            // GROW-THE-POOL: wrap the real ~20-track taste in a decorator that
+            // expands it to ~60-80 tracks via Deezer (free/keyless) so the
+            // RollingPlanner no-repeat window (50) becomes satisfiable and play
+            // stops hammering the same favourites. The expansion runs ONCE in
+            // the background on serviceScope (off the cold-start path) and is
+            // cached to disk; getProfile() serves the base 20 instantly until
+            // the expanded pool is ready, then the planner's periodic
+            // getProfile(useCache=false) refresh picks up the swap. Reuses the
+            // engine's HttpClient (created inside KolaiEngine.build above).
+            val taste = ExpandedTasteSource(
+                base = SeededTasteSource(this),
+                http = engine.httpClient,
+                cacheDir = cacheRoot,
+                scope = serviceScope,
+            )
             rollingPlanner = RollingPlanner(
                 tasteSource = taste,
                 setlistPlanner = engine.planner,
