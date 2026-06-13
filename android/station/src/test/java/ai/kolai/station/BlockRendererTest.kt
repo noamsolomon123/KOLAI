@@ -1682,4 +1682,119 @@ class BlockRendererTest {
         assertFalse(boundary.contains("יום הזיכרון"))
         assertTrue("somber tone must survive", boundary.contains("יום לאומי כבד ורציני"))
     }
+
+    // ---- decode concurrency bound (OOM fix, 2026-06-13) ----------------------
+    //
+    // The proven OOM aggravator was up to LOAD_CONCURRENCY (=3) full-song DECODES
+    // each holding a giant raw FloatArray at once. The fix keeps the network
+    // FETCH parallel (capped at LOAD_CONCURRENCY) but SERIALIZES the heap-heavy
+    // decode (default decodeConcurrency = 1) so at most ONE big song buffer is
+    // alive at a time. These timed fakes gauge BOTH gauges simultaneously:
+    // fetches must run in parallel (>= 2 concurrent) while decodes must never
+    // exceed 1. The DJ-gen overlap is re-asserted to be preserved.
+
+    /** A fetcher + decode (loadFn) pair sharing two live-count gauges, so one
+     *  test can prove fetch parallelism AND decode serialization together. */
+    private class DecodeGauge {
+        val fetchActive = AtomicInteger(0)
+        val fetchMax = AtomicInteger(0)
+        val decodeActive = AtomicInteger(0)
+        val decodeMax = AtomicInteger(0)
+
+        val fetcher = object : AudioFetcher {
+            override fun fetch(song: Song): String {
+                val now = fetchActive.incrementAndGet()
+                fetchMax.updateAndGet { maxOf(it, now) }
+                Thread.sleep(40)
+                fetchActive.decrementAndGet()
+                return "/fake/${song.title}.m4a"
+            }
+        }
+        // the DECODE leg (BlockRenderer's loadFn). The voice WAV path is decoded
+        // OUTSIDE the song-decode gate (tiny TTS clips, not an OOM risk), so it
+        // must NOT trip the song-decode gauge - return it fast and ungauged.
+        val load: LoadFn = { path ->
+            if (path.startsWith("/voice/")) {
+                FloatArray(Dsp.SR * 2) { i ->
+                    0.3f + 0.2f * kotlin.math.sin(2.0 * Math.PI * 440.0 * i / Dsp.SR).toFloat()
+                }
+            } else {
+                val now = decodeActive.incrementAndGet()
+                decodeMax.updateAndGet { maxOf(it, now) }
+                Thread.sleep(40)
+                decodeActive.decrementAndGet()
+                FloatArray(Dsp.SR * 10) { 0.3f }
+            }
+        }
+    }
+
+    @Test
+    fun loadTracks_serializes_decode_while_fetch_stays_parallel() = runTest {
+        val g = DecodeGauge()
+        val r = newRenderer(fetcher = g.fetcher, load = g.load)
+        r.loadTracks(songs(6))
+        assertTrue(
+            "fetches must run in parallel (fetchMax=${g.fetchMax.get()})",
+            g.fetchMax.get() >= 2,
+        )
+        assertEquals(
+            "song decodes must be serialized to 1 concurrent (decodeMax=${g.decodeMax.get()})",
+            1, g.decodeMax.get(),
+        )
+    }
+
+    @Test
+    fun render_serializes_decode_while_fetch_stays_parallel() = runTest {
+        // The render() path launches its own per-song load deferreds; the
+        // per-renderer decode gate must bound them exactly like loadTracks.
+        val g = DecodeGauge()
+        val r = newRenderer(fetcher = g.fetcher, load = g.load, talkChance = 0.0, write = false)
+        r.render(songs(6), index = 0, prevTrack = null)
+        assertTrue(
+            "fetches must run in parallel under render (fetchMax=${g.fetchMax.get()})",
+            g.fetchMax.get() >= 2,
+        )
+        assertEquals(
+            "song decodes must be serialized to 1 concurrent under render (decodeMax=${g.decodeMax.get()})",
+            1, g.decodeMax.get(),
+        )
+    }
+
+    @Test
+    fun render_overlap_preserved_with_serialized_decode() = runTest {
+        // The cold-start DJ-gen overlap must survive the decode serialization:
+        // S0 fetches fast, S1..S3 fetch slow; decode is instant (fakeLoad); the
+        // slow TTS runs concurrently with the still-loading songs. Sequential
+        // lower bound (load 150 + 4*tts 120 = 630 ms) must NOT be hit.
+        val r = newRenderer(
+            fetcher = FastFirstSlowRestFetcher(slowMs = 150),
+            voice = SlowVoice(ttsMs = 120, djSamples = djSamples),
+            talkChance = 0.0, maxSilence = 1, write = false,
+        )
+        val t0 = System.currentTimeMillis()
+        val result = r.render(songs(4), index = 0, prevTrack = null)
+        val elapsed = System.currentTimeMillis() - t0
+        assertTrue("opening + breaks expected", result.meta.talk.size >= 2)
+        assertTrue(
+            "DJ TTS must still overlap loading with serialized decode (elapsed=${elapsed}ms)",
+            elapsed < 450,
+        )
+    }
+
+    @Test
+    fun render_releases_per_song_pcm_yet_meta_and_lastTrack_intact() = runTest {
+        // The memory-hygiene release (nulling each song's pcm slot after it is
+        // mixed) must NOT change the rendered result: monotonic segments, valid
+        // talk meta, the correct lastTrack, and a non-empty audio timeline.
+        val r = newRenderer(talkChance = 0.0, maxSilence = 1, write = false)
+        val result = r.render(songs(5), index = 0, prevTrack = null)
+        assertEquals(5, result.meta.segments.size)
+        val starts = result.meta.segments.map { it.startS }
+        for (k in 1 until starts.size) assertTrue("segments monotonic", starts[k] > starts[k - 1])
+        for (tk in result.meta.talk) assertTrue("talk start <= end", tk.startS <= tk.endS)
+        assertEquals("S4", result.lastTrack.song.title)
+        assertTrue("timeline must be assembled", result.audio.isNotEmpty())
+        // lastTrack still carries its real audio (it is the next block's prev).
+        assertTrue("lastTrack keeps real audio", result.lastTrack.audio.isNotEmpty())
+    }
 }

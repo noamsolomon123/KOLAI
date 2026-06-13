@@ -124,6 +124,15 @@ class BlockRenderer(
     // dispatcher for the parallel song loads (feature 14b); injectable so tests
     // can pin it, defaults to IO because fetch/decode are blocking I/O.
     private val loadDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    // DECODE CONCURRENCY (OOM fix, 2026-06-13): how many full-song DECODES may
+    // hold a big raw FloatArray at once. Default 1 SERIALIZES the memory-heavy
+    // decode step while leaving the network FETCH (and the DJ-gen) fully
+    // parallel (capped at [LOAD_CONCURRENCY]), so peak heap is ~1 decoded song +
+    // the growing mix timeline instead of up to LOAD_CONCURRENCY (=3) giant
+    // FloatArrays alive simultaneously - the proven OOM aggravator. Injectable
+    // so a future device with more RAM (or a test) can raise it; <1 is coerced
+    // to 1. Keep at 1 unless heap headroom is measured.
+    private val decodeConcurrency: Int = 1,
     // PER-MOOD VOICE resolver (2026-06-13): mood key -> the prebuilt Gemini
     // voice name for the main host. Default = the Moods spec voice; the :app
     // wiring overrides it with DevConfig.moodVoices so a per-mood voice picked
@@ -218,6 +227,15 @@ class BlockRenderer(
     // under a colliding put, which would make a missing key read back as the
     // POSITIVE_INFINITY default and wrongly arm the opener (data race).
     private val safeIntroByPath = ConcurrentHashMap<String, Double>()
+
+    // DECODE GATE (OOM fix, 2026-06-13): a single shared semaphore that bounds
+    // how many full-song DECODES run at once across BOTH loadTracks and render.
+    // Per-renderer (not per-call) so even overlapping/recursive loads can never
+    // exceed [decodeConcurrency] concurrent giant FloatArrays. coerceAtLeast(1)
+    // so a misconfigured 0 never deadlocks. The network FETCH stays parallel
+    // under the separate [LOAD_CONCURRENCY] gate; only the heap-heavy decode +
+    // analyze (which also decodes) are serialized here.
+    private val decodeGate = Semaphore(decodeConcurrency.coerceAtLeast(1))
 
     /** The decoded song's safe instrumental window at its start (s); +inf when
      *  unknown so callers treat "no info" as not-a-constraint (the introEndS
@@ -389,21 +407,36 @@ class BlockRenderer(
     private suspend fun loadOne(gate: Semaphore, song: Song): LoadedTrack? =
         gate.withPermit {
             try {
+                // FETCH (network) under the LOAD_CONCURRENCY [gate] only: this is
+                // the I/O-overlap win and stays parallel. The big-heap DECODE is
+                // serialized separately below so we never hold LOAD_CONCURRENCY
+                // giant FloatArrays at once (the OOM aggravator).
                 val path = fetcher.fetch(song)
-                val audio = Dsp.microFadeEdges(
-                    Dsp.trimTrailingSilence(
-                        Dsp.normalizeLoudness(loadFn(path), targetRms = songTargetRms, maxGain = LOUDNESS_MAX_GAIN),
-                        sr = Dsp.SR,
+                // DECODE + ANALYZE under [decodeGate] (default 1 permit): only
+                // here do the heap-heavy raw FloatArrays exist. loadFn decodes
+                // the song; analyzeFn ALSO decodes the same file - both are kept
+                // inside the one permit so a single song's decode is fully done
+                // (and its big buffers released) before the next song's decode
+                // starts. The conditioned `audio` we RETAIN per track is far
+                // smaller pressure than several concurrent raw decodes; releasing
+                // the analyze decode's transient PCM is left to GC (analyzeFn does
+                // not retain it).
+                decodeGate.withPermit {
+                    val audio = Dsp.microFadeEdges(
+                        Dsp.trimTrailingSilence(
+                            Dsp.normalizeLoudness(loadFn(path), targetRms = songTargetRms, maxGain = LOUDNESS_MAX_GAIN),
+                            sr = Dsp.SR,
+                        )
                     )
-                )
-                // VOCAL-ONSET (task 3, 2026-06-13): measure the safe
-                // instrumental window at this song''s start on the
-                // CONDITIONED PCM (the audio the listener hears), so the
-                // opener / intro talk-over never lands over a singer.
-                // Computed here because loadTracks is the only place the
-                // decoded PCM exists. SAFETY-biased inside VocalOnset.
-                safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
-                LoadedTrack(song, analyzeFn(path), audio, path)
+                    // VOCAL-ONSET (task 3, 2026-06-13): measure the safe
+                    // instrumental window at this song''s start on the
+                    // CONDITIONED PCM (the audio the listener hears), so the
+                    // opener / intro talk-over never lands over a singer.
+                    // Computed here because loadTracks is the only place the
+                    // decoded PCM exists. SAFETY-biased inside VocalOnset.
+                    safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
+                    LoadedTrack(song, analyzeFn(path), audio, path)
+                }
             } catch (e: CancellationException) {
                 throw e // cooperative cancellation must propagate
             } catch (e: Exception) {
@@ -802,11 +835,17 @@ class BlockRenderer(
      *  - never keep less than [OUTRO_MIN_KEEP_FRAC] of the song.
      * Talk-over boundaries never call this: the duck look-back needs the tail.
      */
-    private fun outroCutSamples(track: LoadedTrack): Int {
-        val audio = track.audio
+    private fun outroCutSamples(track: LoadedTrack): Int =
+        outroCutSamples(track.audio, track.analysis)
+
+    /** As [outroCutSamples] but over an explicit [audio] buffer + [analysis], so
+     *  the assembly loop can pass the per-song PCM it holds locally (and then
+     *  release it) instead of forcing every track's audio to stay reachable via
+     *  the LoadedTrack list (OOM memory-hygiene, 2026-06-13). */
+    private fun outroCutSamples(audio: FloatArray, analysis: ai.kolai.core.TrackAnalysis): Int {
         if (audio.isEmpty()) return 0
         val durS = audio.size.toDouble() / Dsp.SR
-        val hint = track.analysis.outroStartS
+        val hint = analysis.outroStartS
         if (!hint.isFinite() || hint <= 0.0 || hint >= durS - OUTRO_MIN_TAIL_S) return 0
         val refined = refineOutroStart(audio, Dsp.SR, hint)
         var cutAtS = refined + OUTRO_GRACE_S
@@ -912,8 +951,12 @@ class BlockRenderer(
         }
 
         // 3. await everything: the full loaded track list (skip-on-failure) and
-        // the speculative DJ leg.
-        val tracks = loadDeferreds.awaitAll().filterNotNull()
+        // the speculative DJ leg. `var` because, after the memory-hygiene step
+        // below extracts the per-song PCM into a local array, we REBIND this to
+        // an audio-stripped metadata view so the original full-audio LoadedTrack
+        // objects are no longer reachable through it (the OOM fix relies on the
+        // local pcm[] being the sole strong holder of the big buffers).
+        var tracks = loadDeferreds.awaitAll().filterNotNull()
         if (tracks.isEmpty()) {
             djDeferred.cancel()
             throw IllegalArgumentException("No playable tracks in block")
@@ -934,8 +977,32 @@ class BlockRenderer(
         val events = djPlan.events
         val dj = djPlan.dj
 
-        // 4. assemble audio + collect timings (needs BOTH decoded songs + DJ PCM)
-        var timeline = tracks[0].audio
+        // MEMORY HYGIENE (OOM fix, 2026-06-13): hold each song's decoded PCM in a
+        // LOCAL nullable array that the assembly loop reads from and RELEASES per
+        // song as soon as it is mixed into the [timeline] (the crossfade output
+        // already contains the song's samples, so the source buffer is dead
+        // weight afterward). We also strip the audio from the LoadedTrack list so
+        // [pcm] is the SOLE strong holder of the big buffers during assembly:
+        // peak heap is then ~1-2 song buffers + the timeline, NOT all N songs'
+        // raw PCM retained until render() returns. The LAST track keeps its real
+        // audio (it is returned as BlockResult.lastTrack); every track keeps its
+        // song/analysis/path metadata, so the cadence/meta math is unchanged.
+        val pcm = Array<FloatArray?>(tracks.size) { tracks[it].audio }
+        val lastTrack = tracks.last()
+        // Rebind [tracks] to an audio-stripped metadata view. The assembly loop
+        // reads only .song/.analysis/.path from it; the big PCM lives in [pcm]
+        // (freed per song) and in [lastTrack] (returned). After this line the
+        // original full-audio LoadedTracks for songs 0..n-2 are referenced ONLY
+        // by [pcm], so nulling a pcm slot truly releases that song's buffer.
+        tracks = tracks.map { LoadedTrack(it.song, it.analysis, EMPTY_PCM, it.path) }
+
+        // 4. assemble audio + collect timings (needs BOTH decoded songs + DJ PCM).
+        // NOTE: song 0's PCM (pcm[0]) is NOT released here - it is still needed as
+        // the OUTGOING song's outro-cut source at boundary 1. Each song's pcm slot
+        // is released at the END of the iteration in which it is the outgoing song
+        // (pcm[i - 1] = null below), so the outgoing buffer lives exactly as long
+        // as it is read.
+        var timeline = pcm[0]!!
         val songEvents = ArrayList<SongEvent>()
         val talk = ArrayList<TalkEntry>()
 
@@ -993,7 +1060,7 @@ class BlockRenderer(
             // used region at its refined outro (+ grace). Talk-over boundaries
             // skip the cut - the duck look-back math below needs the tail.
             if (talkEvent == null) {
-                val cut = outroCutSamples(tracks[i - 1])
+                val cut = outroCutSamples(pcm[i - 1]!!, tracks[i - 1].analysis)
                 if (cut in 1 until timeline.size) {
                     timeline = timeline.copyOfRange(0, timeline.size - cut)
                 }
@@ -1037,12 +1104,20 @@ class BlockRenderer(
             // so the duckStart math above (which reserves segueS + 0.3 s after
             // the DJ) stays untouched.
             val overlap = if (talkEvent != null) segueS else snappedMusicOverlap(tracks[i - 1])
+            val incomingPcm = pcm[i]!!
             val incoming = if (talkEvent != null) {
-                track.audio
+                incomingPcm
             } else {
-                alignEntryToBeat(track.audio, track.analysis.beatTimes, overlap)
+                alignEntryToBeat(incomingPcm, track.analysis.beatTimes, overlap)
             }
             timeline = Dsp.equalPowerCrossfade(timeline, incoming, overlapS = overlap)
+            // RELEASE the OUTGOING song's PCM: it is fully baked into `timeline`
+            // now and the next iteration only needs pcm[i] (this iteration's
+            // incoming). The incoming song's own buffer is freed on the NEXT
+            // iteration (when it becomes the outgoing one); the final song stays
+            // referenced via the captured `lastTrack`. Peak heap during assembly
+            // is thus ~timeline + 1 song, not all N songs' PCM.
+            pcm[i - 1] = null
             songEvents.add(
                 SongEvent(title = song.title, artist = song.artist, startS = boundary)
             )
@@ -1062,7 +1137,7 @@ class BlockRenderer(
         val segments = buildSegments(songEvents, totalS)
         val meta = BlockMeta(index = index, durationS = totalS, segments = segments, talk = talk)
 
-        BlockResult(audio = timeline, meta = meta, path = path, lastTrack = tracks.last())
+        BlockResult(audio = timeline, meta = meta, path = path, lastTrack = lastTrack)
     }
 
     /** One talk event's synthesized DJ artifact: the on-air [text] (from the
@@ -1129,6 +1204,11 @@ class BlockRenderer(
         }
 
     companion object {
+        /** Shared empty PCM for the audio-stripped LoadedTrack metadata view
+         *  (OOM memory-hygiene): a single zero-length array, never read for
+         *  samples (the assembly reads the real PCM from the local pcm[] array).*/
+        private val EMPTY_PCM: FloatArray = FloatArray(0)
+
         /** Equal-power overlap (s) between the session ident and song 0. */
         const val IDENT_OVERLAP_S: Float = 0.4f
 
