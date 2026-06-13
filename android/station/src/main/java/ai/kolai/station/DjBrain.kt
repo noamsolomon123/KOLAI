@@ -102,6 +102,11 @@ class DjBrain(
             "כל דבר פחות מזה הוא מילוי, ומילוי גרוע משתיקה, אז SKIP."
 
     internal companion object {
+        /** Standalone Hebrew connector words that must never end a naming
+         *  line (BUG 1, dangling song name). Single-letter prefixes (ה/ו/ב/ל/מ)
+         *  normally attach to the next word, so a lone trailing one is broken. */
+        val DANGLING_CONNECTORS = setOf("עם", "של", "את", "ה", "ו", "ב", "ל", "מ")
+
         const val MEMORY_SIZE = 8
         const val AVOID_COUNT = 3
         const val AVOID_TRUNC = 60
@@ -132,10 +137,49 @@ class DjBrain(
          *  prompt asks for ~15; this is 15 plus a little slack. */
         const val BANTER_TURN_MAX_WORDS = 18
 
-        /** The second voice (B) in banter: ONE fixed trait, always the same. */
+        /** The second voice (B) in banter: ONE fixed trait, always the same.
+         *  Kept for backward-compat (the no-index writeBanter delegates to
+         *  SIDEKICK_PERSONAS[0], which is byte-identical to this string). */
         const val SIDEKICK_PERSONA =
             "שדרן משנה יבש ולקוני, ספקן חביב - עונה קצר, בלי התלהבות מופרזת, " +
                 "אבל בעומק רואים שהוא נהנה."
+
+        /**
+         * NEW (2026-06-13, voice variety): a rotation of distinct sidekick
+         * personas for B in the banter, so the second voice doesn't always feel
+         * like the same person. Index 0 is byte-identical to [SIDEKICK_PERSONA]
+         * so the legacy single-arg [writeBanter] is unchanged. The renderer
+         * rotates with [sidekickPersonaCount]; an out-of-range index is wrapped
+         * (modulo), never throws. APPEND-only - the existing persona text is
+         * verbatim.
+         */
+        val SIDEKICK_PERSONAS = listOf(
+            // 0: הציני היבש (== SIDEKICK_PERSONA, verbatim)
+            SIDEKICK_PERSONA,
+            // 1: הנלהב־מדי
+            "שדרן משנה נלהב־מדי, מתפעל מכל דבר וקופץ קדימה - אנרגיה גבוהה, " +
+                "מגזים קצת בהתלהבות, חם ומדבק, אבל לא מציף את A.",
+            // 2: היודע־כל
+            "שדרן משנה יודע־כל חביב, תמיד עם פינת טריוויה או עובדה קטנה - " +
+                "בטוח בעצמו ומשועשע, בלי להיות יהיר, ובסוף מוסר בכיף ל-A.",
+        )
+
+        /** Count of sidekick personas, exposed so the renderer can rotate. */
+        val sidekickPersonaCount: Int get() = SIDEKICK_PERSONAS.size
+
+        /** Trivia: keep at most this many turns (short bit, never a lecture). */
+        const val TRIVIA_MAX_TURNS = 4
+
+        /** Trivia: the quizmaster framing for host A. */
+        const val QUIZMASTER_FRAMING =
+            "פינת טריוויה קצרה וכיפית: A הוא הקוויזמאסטר ושואל שאלת טריוויה " +
+                "אחת קלילה ומשעשעת על האמן של השיר הבא בלבד - לא על תאריכים " +
+                "מעורפלים ולא על פרטים אזוטריים, מותר שתהיה שעשועית או שאלת דעה. " +
+                "B מגיב ומנחש, ו-A נותן את התשובה או חומק בחיוך עם " +
+                "\"נגלה אחרי השיר\", ואז מוסר אל המוזיקה."
+
+        /** Two-truths-and-a-lie: keep at most this many turns. */
+        const val TWO_TRUTHS_MAX_TURNS = 4
     }
 
     /** Lenient runtime-only JSON reader for the banter array (no @Serializable). */
@@ -155,7 +199,7 @@ class DjBrain(
     private fun oneListenerLine(): String =
         "אתה מדבר אל מאזין אחד בלבד, בגוף שני (את/אתה) - כמו חבר שיושב לידו " +
             "ברכב או במטבח. לעולם אל תפנה לקהל: אסור להגיד \"מאזינים\", " +
-            "\"המאזינים\", \"כל מי שמאזין\", \"אתם\", \"לכולם\" או \"חברים\". " +
+            "\"המאזינים\", \"כל מי שמאזין\", \"אתם\", \"לכולם\", \"כולם\", \"אנשים\" או \"חברים\" כפנייה אל קהל. " +
             "\"אנחנו\" מותר רק כשמדובר ברגע משותף באמת."
 
     /**
@@ -177,6 +221,19 @@ class DjBrain(
             "אל תחזור על אותה פתיחה פעמיים - תפתיע, תהיה מגוון ואנושי."
 
     /**
+     * NEW (2026-06-13, BUG 3 - hallucination risk in trivia / good-thing):
+     * forbid asserting invented specific facts. Years, numbers, "first band",
+     * "most ... of the sixties" and the like read as confident truth but are
+     * unverifiable - so ban them and steer toward the FEELING / style / a light
+     * opinion instead. Trivia may still pose a playful opinion/taste question;
+     * it just may not state an invented fact as certain.
+     */
+    private fun noInventedFactsLine(): String =
+        "אל תמציא עובדות, שנים, מספרים, או 'הראשון/הכי/הגדול ביותר' - אל תציג " +
+            "פרט שאינך בטוח בו כעובדה ודאית. אם אינך בטוח, דבר על התחושה או " +
+            "הסגנון של השיר/האמן, או הצב שאלת דעה קלילה, במקום לטעון עובדה."
+
+    /**
      * Real DJs announce / back-announce the tracks. Tell the model to weave the
      * outgoing and incoming song + artist names into the line naturally, with
      * wordplay where it fits - but to vary it, not name them formulaically every
@@ -187,7 +244,10 @@ class DjBrain(
             "הכרז על השיר שעולה ו/או 'סגור' את השיר שהרגע התנגן (back-announce), " +
             "רצוי עם קריצה או משחק מילים על שם השיר/האמן. אבל אל תעשה את זה " +
             "בכל פעם באותה צורה ולא תמיד - תהיה מגוון, לפעמים רק מזכיר שם אחד, " +
-            "לפעמים את שניהם, ולפעמים סתם זורם - שזה יישמע אנושי ולא רובוטי."
+            "לפעמים את שניהם, ולפעמים סתם זורם - שזה יישמע אנושי ולא רובוטי. " +
+            "כשאתה כן מזכיר שם, כתוב את שם השיר המלא ו/או שם האמן המלא במפורש - " +
+            "לעולם אל תשאיר מילת חיבור תלויה בסוף (כמו 'עם', 'של', 'את') בלי " +
+            "השם אחריה, ואל תכתוב 'עם של' בלי שם."
 
     private fun formatLine(budget: Int): String =
         "דבר בעברית מדוברת בלבד (סלנג ישראלי בסדר גמור), עד $budget מילים. " +
@@ -361,6 +421,116 @@ class DjBrain(
         return line
     }
 
+
+
+    // ---- dangling-name guard (BUG 1: dangling song name, 2026-06-13) -------
+
+    /**
+     * NEW (2026-06-13, BUG 1 root cause was word-budget truncation in [finish]:
+     * a naming clause that sits at the END of a single punctuation-free sentence
+     * gets hard-cut to the budget, chopping the song/artist name and leaving a
+     * dangling connector like "עם של" or a bare trailing של/עם/את). A pure,
+     * regex-free trailing-token scan (no ICU regex - we only use indexOf / char
+     * scanning per the platform constraint). Returns true when [line]:
+     *   - ends on a standalone Hebrew connector word
+     *     (עם / של / את / ה / ו / ב / ל / מ),
+     *   - ends on (or is) the broken phrase "עם של" with nothing after it,
+     *   - ends on a bare "&" (a title that never substituted), or
+     *   - contains an empty "" quote pair (template that failed to fill).
+     * Punctuation/quote chars are trimmed off the tail before the word check, so
+     * "...עם של." and "...של!" are both caught.
+     */
+    internal fun danglingName(line: String?): Boolean {
+        if (line == null) return false
+        // empty-quote pair: a title slot that never got filled.
+        if (line.contains("\"\"") || line.contains("''")) return true
+        // a standalone "&" token (e.g. left by "X & Y" where Y never filled).
+        val ampTokens = line.split(' ', '\t', '\n')
+        if (ampTokens.any { it == "&" }) return true
+        // strip trailing punctuation / quotes / dashes / whitespace.
+        val tail = " \t\r\n.!?…,:;\"'`-–—&"
+        var end = line.length
+        while (end > 0 && tail.indexOf(line[end - 1]) >= 0) end -= 1
+        val trimmed = line.substring(0, end).trimEnd()
+        if (trimmed.isEmpty()) {
+            // nothing but punctuation - or a bare "&" was the whole tail.
+            return line.trimEnd().endsWith("&")
+        }
+        // split into whitespace tokens; inspect the last (and the pair before).
+        val tokens = trimmed.split(' ', '\t', '\n').filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return false
+        val last = tokens.last()
+        if (last in DANGLING_CONNECTORS) return true
+        // "עם של" pair left at the very end (name never followed).
+        if (tokens.size >= 2 && tokens[tokens.size - 2] == "עם" && last == "של") return true
+        return false
+    }
+
+    /**
+     * NEW (BUG 1): repair a finished line that [danglingName] flagged, WITHOUT a
+     * further LLM call - used as the last-resort fallback so we never air a
+     * dangling connector. Prefer cutting back to the last sentence boundary that
+     * leaves a clean, non-dangling line; otherwise strip the trailing connector
+     * tokens (and a trailing "עם של") so the line ENDS cleanly. Never returns a
+     * line that still ends on a dangling connector or contains a trailing "עם של".
+     */
+    internal fun repairDangling(line: String): String {
+        // 1) try cutting back to a sentence boundary that is itself clean.
+        val enders = ".!?…"
+        var i = line.length - 1
+        while (i >= 0) {
+            if (enders.indexOf(line[i]) >= 0) {
+                val candidate = line.substring(0, i + 1).trim()
+                if (candidate.isNotEmpty() && !danglingName(candidate)) return candidate
+            }
+            i -= 1
+        }
+        // 2) no clean sentence boundary - strip trailing dangling tokens.
+        var tokens = line.split(' ', '\t', '\n').filter { it.isNotEmpty() }.toMutableList()
+        while (tokens.isNotEmpty()) {
+            var t = tokens.last()
+            // strip trailing punctuation/quote/& off this token for the test.
+            t = t.trimEnd('.', '!', '?', '…', ',', ':', ';', '"', '\'', '`', '-', '–', '—', '&', ' ')
+            if (t.isEmpty() || t in DANGLING_CONNECTORS) {
+                tokens.removeAt(tokens.size - 1)
+            } else {
+                break
+            }
+        }
+        val joined = tokens.joinToString(" ").trim().trimEnd(',', '-', '–', '—', ':', ';', '&', ' ')
+        return joined.trim()
+    }
+
+    /**
+     * NEW (BUG 1): a sharper regeneration instruction appended on the ONE retry
+     * when a naming-beat result came back dangling. Demands a complete sentence
+     * with the full song + artist name and no trailing connector.
+     */
+    private fun regenNamingLine(): String =
+        "\nכתוב משפט שלם שכולל את שם השיר המלא ואת שם האמן, אל תשאיר מילת חיבור " +
+            "תלויה בסוף (כמו 'עם', 'של', 'את') ואל תכתוב 'עם של' בלי שם."
+
+    /**
+     * NEW (BUG 1): defensive wrapper for the naming beats. [out] is the already
+     * finished line; if it is dangling, regenerate ONCE with the sharper
+     * [regenNamingLine] appended to [basePrompt], re-finish, and if that is still
+     * dangling fall back to [repairDangling] so the aired line ENDS cleanly and
+     * never carries "עם של". Non-dangling lines pass straight through unchanged,
+     * so the default (good) path is byte-identical to before. Any LLM failure on
+     * the retry falls back to repairing the original line - never throws.
+     */
+    private suspend fun deDangleNaming(out: String, basePrompt: String, budget: Int): String {
+        if (!danglingName(out)) return out
+        val retry = try {
+            finish(client.complete(basePrompt + regenNamingLine()), budget)
+        } catch (e: Exception) {
+            ""
+        }
+        if (retry.isNotBlank() && !danglingName(retry)) return retry
+        val repaired = repairDangling(out)
+        return if (repaired.isNotBlank()) repaired else out
+    }
+
     // ---- public API ------------------------------------------------------
 
     /**
@@ -371,8 +541,8 @@ class DjBrain(
      */
     suspend fun writeIntro(prev: Song?, nxt: Song, seconds: Double, ctx: DjContext? = null, allowTasteWink: Boolean = false): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(prompt(prev, nxt, budget, ctx = ctx, allowTasteWink = allowTasteWink) + flavorLine(ctx) + avoidLine())
-        val out = finish(text, budget)
+        val base = prompt(prev, nxt, budget, ctx = ctx, allowTasteWink = allowTasteWink) + flavorLine(ctx) + avoidLine()
+        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
         remember(out)
         return out
     }
@@ -383,8 +553,8 @@ class DjBrain(
      */
     suspend fun writeOpening(nxt: Song, ctx: DjContext, seconds: Double): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(openingPrompt(nxt, ctx, budget) + avoidLine())
-        val out = finish(text, budget)
+        val base = openingPrompt(nxt, ctx, budget) + avoidLine()
+        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
         remember(out)
         return out
     }
@@ -405,6 +575,7 @@ class DjBrain(
         allowSkip: Boolean = false,
     ): String? {
         val budget = wordsForSeconds(seconds)
+        var isNaming = false
         val p = when {
             beat == "weather" && !ctx.weather.isNullOrEmpty() ->
                 weatherPrompt(nxt, ctx, budget, allowSkip) + backAnnounceLine(prev)
@@ -412,13 +583,18 @@ class DjBrain(
                 newsPrompt(nxt, ctx.generalHeadline, budget, allowSkip, ctx) + backAnnounceLine(prev)
             beat == "topic" && topic != null && !ctx.topicHeadlines[topic].isNullOrEmpty() ->
                 topicPrompt(nxt, topic, ctx.topicHeadlines.getValue(topic), budget, allowSkip, ctx) + backAnnounceLine(prev)
-            else ->
-                // song beat / fallback -> witty handoff (honors allowSkip too)
+            else -> {
+                // song beat / fallback -> witty handoff (honors allowSkip too).
+                // This is the naming beat, so it gets the dangling-name guard.
+                isNaming = true
                 prompt(prev, nxt, budget, allowSkip, ctx)
+            }
         }
-        val raw = client.complete(p + flavorLine(ctx) + avoidLine())
+        val base = p + flavorLine(ctx) + avoidLine()
+        val raw = client.complete(base)
         if (allowSkip && isSkip(raw)) return null
-        val out = finish(raw, budget)
+        var out = finish(raw, budget)
+        if (isNaming) out = deDangleNaming(out, base, budget)
         remember(out)
         return out
     }
@@ -453,8 +629,8 @@ class DjBrain(
      */
     suspend fun writeHandover(ctx: DjContext, nxt: Song, seconds: Double = 8.0): String {
         val budget = wordsForSeconds(seconds)
-        val text = client.complete(handoverPrompt(ctx, nxt, budget) + avoidLine())
-        val out = finish(text, budget)
+        val base = handoverPrompt(ctx, nxt, budget) + avoidLine()
+        val out = deDangleNaming(finish(client.complete(base), budget), base, budget)
         remember(out)
         return out
     }
@@ -482,6 +658,7 @@ class DjBrain(
             sourceLine + "\n" +
             "חובה לפתוח בדיוק במילים: \"$GOOD_THING_OPENER\" ומיד אחריהן התוכן עצמו.\n" +
             "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            noInventedFactsLine() + "\n" +
             oneListenerLine() + "\n" +
             skipLine() + "\n" +
             "והרף כאן גבוה במיוחד: אם אין באמת משהו טוב או מעניין - SKIP.\n" +
@@ -509,14 +686,14 @@ class DjBrain(
 
     // ---- two-voice banter (feature 11) -------------------------------------
 
-    private fun banterPrompt(prev: Song?, nxt: Song, ctx: DjContext, budget: Int): String {
+    private fun banterPrompt(prev: Song?, nxt: Song, ctx: DjContext, budget: Int, sidekick: String = SIDEKICK_PERSONA): String {
         val prevLine = if (prev != null) {
             "השיר שהרגע התנגן: \"${prev.title}\" של ${prev.artist}.\n"
         } else {
             ""
         }
         return personaLine() + " אתה המגיש הראשי (A).\n" +
-            "לידך באולפן B: $SIDEKICK_PERSONA\n" +
+            "לידך באולפן B: $sidekick\n" +
             prevLine +
             "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
             "כתבו קטע באנטר קצרצר בין A ל-B: 2-3 חילופי דברים לכל היותר, על " +
@@ -569,7 +746,20 @@ class DjBrain(
      * trimmed from the end until A speaks last (A hands to the music).
      * Fewer than 2 surviving turns is not banter -> emptyList().
      */
-    private fun parseBanterTurns(raw: String): List<Pair<String, String>> {
+    private fun parseBanterTurns(raw: String): List<Pair<String, String>> =
+        parseTurns(raw, BANTER_MAX_TURNS)
+
+    /**
+     * Shared two-voice JSON-array parser, used by banter, trivia and
+     * two-truths-and-a-lie. A JSON array of {"s":"A"|"B","t":text} objects;
+     * anything malformed -> emptyList() (skip, never throw). Overlong
+     * (> [BANTER_TURN_MAX_WORDS] words) or empty turns are dropped together
+     * with everything after them - turns are dropped whole, words are never
+     * cut. The list is then capped at [maxTurns] and trimmed from the end
+     * until A speaks last (A hands to the music). Fewer than 2 surviving
+     * turns is not a bit -> emptyList().
+     */
+    private fun parseTurns(raw: String, maxTurns: Int): List<Pair<String, String>> {
         val arr = firstJsonArray(raw) ?: return emptyList()
         val turns = mutableListOf<Pair<String, String>>()
         for (el in arr) {
@@ -584,7 +774,7 @@ class DjBrain(
             if (spoken.split(' ').count { it.isNotBlank() } > BANTER_TURN_MAX_WORDS) break
             turns.add(s to spoken)
         }
-        var kept: List<Pair<String, String>> = turns.take(BANTER_MAX_TURNS)
+        var kept: List<Pair<String, String>> = turns.take(maxTurns)
         while (kept.isNotEmpty() && kept.last().first != "A") kept = kept.dropLast(1)
         if (kept.size < 2) return emptyList()
         return kept
@@ -598,11 +788,22 @@ class DjBrain(
      * trims). NEVER fires on somber days: returns emptyList() immediately,
      * without an LLM call. Never throws.
      */
-    suspend fun writeBanter(prev: Song?, nxt: Song, ctx: DjContext, seconds: Double = 14.0): List<Pair<String, String>> {
+    suspend fun writeBanter(prev: Song?, nxt: Song, ctx: DjContext, seconds: Double = 14.0): List<Pair<String, String>> =
+        writeBanter(prev, nxt, ctx, seconds, sidekickIndex = 0)
+
+    /**
+     * NEW (2026-06-13, voice variety): banter with a chosen sidekick persona.
+     * [sidekickIndex] selects from [SIDEKICK_PERSONAS] (wrapped modulo, so the
+     * renderer can rotate freely); index 0 is byte-identical to the legacy
+     * single-arg overload. Same 2-3 turn cap, somber-empties (no LLM call),
+     * strict JSON parsing and ring-remember as before.
+     */
+    suspend fun writeBanter(prev: Song?, nxt: Song, ctx: DjContext, seconds: Double, sidekickIndex: Int): List<Pair<String, String>> {
         if (ctx.somber) return emptyList()
         val budget = wordsForSeconds(seconds)
+        val sidekick = SIDEKICK_PERSONAS[Math.floorMod(sidekickIndex, SIDEKICK_PERSONAS.size)]
         val raw = try {
-            client.complete(banterPrompt(prev, nxt, ctx, budget) + avoidLine())
+            client.complete(banterPrompt(prev, nxt, ctx, budget, sidekick) + avoidLine())
         } catch (e: Exception) {
             return emptyList()
         }
@@ -643,5 +844,121 @@ class DjBrain(
         val out = finish(text, budget)
         remember(out)
         return out
+    }
+
+    // ---- trivia game (2026-06-13, fun segment) -----------------------------
+
+    private fun triviaPrompt(nxt: Song, ctx: DjContext, budget: Int): String =
+        personaLine() + " אתה המגיש הראשי (A).\n" +
+            "לידך באולפן B, שדרן משנה שמשתתף במשחק.\n" +
+            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            QUIZMASTER_FRAMING + "\n" +
+            noInventedFactsLine() + "\n" +
+            "שמור על זה קצר וכיפי - 2 עד 4 חילופי דברים בלבד, לא הרצאה. " +
+            "כל רפליקה עד 15 מילים, סך הכל עד $budget מילים, עברית מדוברת בלבד. " +
+            "A פותח בשאלה ו-A תמיד סוגר במסירה אל המוזיקה.\n" +
+            oneListenerLine() + "\n" +
+            "החזר אך ורק מערך JSON תקני, בלי שום טקסט אחר, בפורמט: " +
+            "[{\"s\":\"A\",\"t\":\"...\"},{\"s\":\"B\",\"t\":\"...\"}]. " +
+            "אם אין שאלה באמת כיפית להגיד - החזר מערך ריק [].\n" +
+            moodLine(ctx) + calendarLine(ctx)
+
+    /**
+     * NEW (2026-06-13): a short two-host trivia bit before the next song. A is
+     * the quizmaster ([QUIZMASTER_FRAMING]) and poses one light, fun question
+     * restricted to the NEXT song's artist (to minimize hallucination); B
+     * reacts/guesses; A answers or teases "נגלה אחרי השיר" and hands to music.
+     * 2-4 turns. Returns speaker-tagged turns; emptyList() means "skip" (model
+     * skipped, invalid/over-cap/empty JSON, or too little survived the trims).
+     * NEVER fires on somber days: returns emptyList() immediately, no LLM call.
+     * Never throws.
+     */
+    suspend fun writeTrivia(nxt: Song, ctx: DjContext, seconds: Double = 18.0): List<Pair<String, String>> {
+        if (ctx.somber) return emptyList()
+        val budget = wordsForSeconds(seconds)
+        val raw = try {
+            client.complete(triviaPrompt(nxt, ctx, budget) + avoidLine())
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (isSkip(raw)) return emptyList()
+        val turns = parseTurns(raw, TRIVIA_MAX_TURNS)
+        if (turns.isNotEmpty()) remember(turns.joinToString(" / ") { it.second })
+        return turns
+    }
+
+    // ---- micro-segment: listening cue (2026-06-13, fun segment) ------------
+
+    private fun listeningCuePrompt(nxt: Song, ctx: DjContext, budget: Int): String =
+        personaLine() + "\n" +
+            "השיר שעולה עכשיו: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "כתוב שורה חמה אחת שמכוונת את האוזן של המאזין לרגע מגניב אחד בשיר " +
+            "שעומד להתנגן - הדרופ, מעבר יפה, הרמוניה, סולו, רגע שקט - " +
+            "\"שים לב לרגע ב...\". טבעי לגמרי, בלי קלישאות.\n" +
+            oneListenerLine() + "\n" +
+            skipLine() + "\n" +
+            "והרף כאן גבוה: אם אין באמת רגע אמיתי ומעניין להצביע עליו - SKIP.\n" +
+            formatLine(budget) + moodLine(ctx) + calendarLine(ctx)
+
+    /**
+     * NEW (2026-06-13): one warm single-voice line pointing the listener's ear
+     * at a genuinely cool moment in the song about to play. Fully natural,
+     * SKIP-gated (returns "" when there's nothing real to say, including on
+     * somber days). Output remembered in the ring.
+     */
+    suspend fun writeListeningCue(nxt: Song, ctx: DjContext, seconds: Double = 10.0): String {
+        if (ctx.somber) return ""
+        val budget = wordsForSeconds(seconds)
+        val raw = try {
+            client.complete(listeningCuePrompt(nxt, ctx, budget) + avoidLine())
+        } catch (e: Exception) {
+            return ""
+        }
+        if (isSkip(raw)) return ""
+        val out = finish(raw, budget)
+        if (out.isBlank()) return ""
+        remember(out)
+        return out
+    }
+
+    // ---- micro-segment: two truths and a lie (2026-06-13, fun segment) -----
+
+    private fun twoTruthsLiePrompt(nxt: Song, ctx: DjContext, budget: Int): String =
+        personaLine() + " אתה המגיש הראשי (A).\n" +
+            "לידך באולפן B, שדרן משנה שמנחש.\n" +
+            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "פינת \"שתי אמיתות ושקר\" קצרצרה ומשעשעת על ${nxt.artist} - האמן " +
+            "של השיר הבא בלבד: A זורק שלוש אמירות שאחת מהן שקר, B מנחש איזו, " +
+            "ו-A חושף ומוסר אל המוזיקה. הגבל הכל לאמן הזה, ונסח את ה'עובדות' " +
+            "ברוח קלילה ומשוערת - כך שגם ניחוש שגוי נשאר מקסים, בלי להציג " +
+            "המצאה כעובדה ודאית.\n" +
+            "2 עד 4 חילופי דברים, כל רפליקה עד 15 מילים, סך הכל עד $budget " +
+            "מילים, עברית מדוברת בלבד. A פותח ו-A תמיד סוגר אל המוזיקה.\n" +
+            oneListenerLine() + "\n" +
+            "החזר אך ורק מערך JSON תקני, בלי שום טקסט אחר, בפורמט: " +
+            "[{\"s\":\"A\",\"t\":\"...\"},{\"s\":\"B\",\"t\":\"...\"}]. " +
+            "אם אין משהו באמת כיפי להגיד - החזר מערך ריק [].\n" +
+            moodLine(ctx) + calendarLine(ctx)
+
+    /**
+     * NEW (2026-06-13): a short two-host "two truths and a lie" bit, restricted
+     * to the NEXT song's artist and phrased speculatively so a wrong guess is
+     * still charming (no invented fact presented as certain). A poses, B
+     * guesses, A reveals and hands to music. 2-4 turns. Returns speaker-tagged
+     * turns; emptyList() means "skip". NEVER fires on somber days (no LLM
+     * call). Never throws.
+     */
+    suspend fun writeTwoTruthsLie(nxt: Song, ctx: DjContext, seconds: Double = 16.0): List<Pair<String, String>> {
+        if (ctx.somber) return emptyList()
+        val budget = wordsForSeconds(seconds)
+        val raw = try {
+            client.complete(twoTruthsLiePrompt(nxt, ctx, budget) + avoidLine())
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        if (isSkip(raw)) return emptyList()
+        val turns = parseTurns(raw, TWO_TRUTHS_MAX_TURNS)
+        if (turns.isNotEmpty()) remember(turns.joinToString(" / ") { it.second })
+        return turns
     }
 }

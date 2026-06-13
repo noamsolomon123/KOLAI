@@ -26,15 +26,20 @@ class VoiceRenderer(
      * [voiceOverride] forwards to the synth for per-call voice selection.
      * [style] forwards to the synth as a per-call TTS style override.
      *
-     * Cache-key note: when [style] is null/blank the key stays the legacy
-     * `sha1(text)` so WAVs cached before styles existed remain valid; when a
-     * style is given the key is `sha1(style + " " + text)` so the same text
-     * voiced in different moods produces different cache files instead of
-     * reusing a WAV synthesized for another mood.
+     * Cache-key note: when BOTH [voiceOverride] and [style] are null/blank the
+     * key stays the legacy `sha1(text)` so WAVs cached before voices/styles
+     * existed remain valid; otherwise the key is
+     * `sha1("v:" + voiceOverride + "|s:" + style + "|" + text)` so the same text
+     * voiced in a different voice OR mood produces a distinct cache file instead
+     * of reusing a WAV synthesized for another voice/mood.
      */
     suspend fun render(text: String, voiceOverride: String? = null, style: String? = null): DJSlot {
         outDir.mkdirs()
-        val cacheKey = if (style.isNullOrBlank()) text else "$style $text"
+        val cacheKey = if (voiceOverride.isNullOrBlank() && style.isNullOrBlank()) {
+            text
+        } else {
+            "v:${voiceOverride ?: ""}|s:${style ?: ""}|$text"
+        }
         val outFile = File(outDir, "dj_${sha1Hex(cacheKey).substring(0, 16)}.wav")
 
         if (!outFile.exists()) {
@@ -50,27 +55,29 @@ class VoiceRenderer(
      * Synthesize (or reuse the cached WAV for) a two-host banter dialogue via
      * one multi-speaker TTS call and return its [DJSlot].
      *
-     * [turns] are (speakerLabel "A"/"B", Hebrew text) pairs; speaker A uses the
-     * synth's constructor voice and speaker B uses [voiceB]. [style] forwards
-     * to the synth as the per-call TTS style override.
+     * [turns] are (speakerLabel "A"/"B", Hebrew text) pairs; speaker A uses
+     * [voiceA] (defaulting to the synth's constructor voice) and speaker B uses
+     * [voiceB]. [style] forwards to the synth as the per-call TTS style override.
      *
-     * Cache-key: `sha1("dlg|" + voiceB + "|" + style + "|" + joined turns)` —
-     * the "dlg|" prefix keeps dialogue WAVs disjoint from single-voice ones,
-     * and voiceB/style/turns each contribute so a different co-host voice,
-     * mood, or script never reuses another dialogue's WAV.
+     * Cache-key: `sha1("dlg|" + voiceA + "|" + voiceB + "|" + style + "|" +
+     * joined turns)` — the "dlg|" prefix keeps dialogue WAVs disjoint from
+     * single-voice ones, and voiceA/voiceB/style/turns each contribute so a
+     * different host voice, co-host voice, mood, or script never reuses another
+     * dialogue's WAV.
      */
     suspend fun renderDialogue(
         turns: List<Pair<String, String>>,
         voiceB: String,
         style: String? = null,
+        voiceA: String? = null,
     ): DJSlot {
         outDir.mkdirs()
         val script = dialogueScript(turns)
-        val cacheKey = "dlg|$voiceB|$style|$script"
+        val cacheKey = "dlg|${voiceA ?: ""}|$voiceB|$style|$script"
         val outFile = File(outDir, "dj_${sha1Hex(cacheKey).substring(0, 16)}.wav")
 
         if (!outFile.exists()) {
-            val bytes = synth.synthDialogue(turns, voiceB = voiceB, styleOverride = style)
+            val bytes = synth.synthDialogue(turns, voiceA = voiceA, voiceB = voiceB, styleOverride = style)
             outFile.writeBytes(bytes)
         }
 

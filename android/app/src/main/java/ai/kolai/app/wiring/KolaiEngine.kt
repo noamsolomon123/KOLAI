@@ -4,6 +4,7 @@ import ai.kolai.station.BlockRenderer
 import ai.kolai.station.DjBrain
 import ai.kolai.station.DjContext
 import ai.kolai.station.MoodCurator
+import ai.kolai.station.Moods
 import ai.kolai.station.SetlistSource
 import ai.kolai.station.TastePoolPlanner
 import ai.kolai.voice.GeminiTextClient
@@ -75,6 +76,15 @@ class KolaiEngine private constructor(
             cacheDir: File,
             blocksDir: File,
             ctxFactory: (HttpClient) -> (() -> DjContext) = { { DjContext() } },
+            // PER-MOOD VOICE overrides (2026-06-13): mood key -> prebuilt voice
+            // name (DevConfig.moodVoices). An override WINS over the Moods
+            // default; a missing key falls back to Moods.spec(mood).voiceName.
+            // Empty (the default) keeps the stock per-mood voices. Backward
+            // compatible: existing callers omit it.
+            moodVoices: Map<String, String> = emptyMap(),
+            // Sidekick co-host voices rotated alongside the banter persona
+            // (2026-06-13). Empty -> the single ttsVoiceB is always used.
+            sidekickVoices: List<String> = emptyList(),
         ): KolaiEngine {
             require(geminiKeys.isNotEmpty()) { "KolaiEngine needs at least one Gemini key" }
             cacheDir.mkdirs()
@@ -125,6 +135,14 @@ class KolaiEngine private constructor(
                 curator = MoodCurator(llm),
             )
 
+            // PER-MOOD VOICE resolver: an override wins, else the Moods
+            // default. Resolves for the EFFECTIVE mood (mix included) so the DJ
+            // always has a real voice even in the default/daytime case.
+            val moodVoiceResolver: (String?) -> String = { mood ->
+                val key = mood ?: Moods.DEFAULT
+                moodVoices[key] ?: Moods.spec(key).voiceName
+            }
+
             val blockRenderer = BlockRenderer(
                 fetcher = fetcher,
                 brain = brain,
@@ -140,6 +158,8 @@ class KolaiEngine private constructor(
                 loadFn = loadFn,
                 encoder = encoder,
                 write = true,
+                moodVoice = moodVoiceResolver,
+                sidekickVoices = sidekickVoices,
             )
 
             return KolaiEngine(

@@ -96,6 +96,21 @@ object KolaiMood {
     private val _retune = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val retune: SharedFlow<Unit> = _retune.asSharedFlow()
 
+    // FAST MOOD SWITCH (2026-06-13): emitted whenever the user MANUALLY changes
+    // the mood (a chip tap via [set] / [setAndPersist]). The payload is the new
+    // EFFECTIVE manual mood. The service collector drops the buffered-but-
+    // unplayed blocks beyond the playing one and lets the engine re-render them
+    // with the new mood, so a manual switch is heard within ~one block instead
+    // of after the whole pre-rendered buffer drains. extraBufferCapacity=1 +
+    // CONFLATED semantics: bursts collapse to the latest pending mood. This is
+    // distinct from [retune] (a full fresh-station reset); a mood change keeps
+    // history/taste and the currently-playing block.
+    private val _manualMoodChanges = MutableSharedFlow<String>(
+        replay = 0, extraBufferCapacity = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val manualMoodChanges: SharedFlow<String> = _manualMoodChanges.asSharedFlow()
+
     /**
      * Set the active MANUAL mood (auto turns off, in memory only). Unknown
      * keys (not in [Moods.ALL]) are ignored.
@@ -104,6 +119,7 @@ object KolaiMood {
         if (mood !in Moods.ALL) return
         _mood.value = mood
         _auto.value = false
+        _manualMoodChanges.tryEmit(mood)
     }
 
     /**
@@ -116,6 +132,8 @@ object KolaiMood {
         _auto.value = false
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit().putString(KEY_MOOD, mood).putBoolean(KEY_AUTO, false).apply()
+        // FAST MOOD SWITCH: signal the service to re-render the unplayed buffer.
+        _manualMoodChanges.tryEmit(mood)
     }
 
     /** "אוטו" chip tap (or its inverse): toggle the broadcast clock + persist. */

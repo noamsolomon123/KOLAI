@@ -6,8 +6,11 @@ import org.junit.Test
 
 /**
  * Table-integrity tests for [Moods], the Kotlin port of
- * backend/radioai/moods.py. The cadence numbers and the English ttsStyle /
- * curationHint strings must match the Python VERBATIM.
+ * backend/radioai/moods.py. The cadence numbers and the [curationHint] strings
+ * still match the Python VERBATIM. The [ttsStyle] strings were deliberately
+ * rewritten Android-side (calmer + distinct per mood), so these tests assert
+ * the NEW intent (calm / non-hyped / steers away from over-excitement) rather
+ * than verbatim Python text.
  */
 class MoodsTest {
 
@@ -42,34 +45,62 @@ class MoodsTest {
     }
 
     @Test
-    fun ttsStyles_match_python_verbatim() {
-        assertEquals(
-            "Read this like a charismatic, warm, professional Israeli FM radio host. " +
-                "Energetic but smooth, natural broadcast pacing - a real radio personality. " +
-                "Speak only the Hebrew:",
-            Moods.ALL.getValue("mix").ttsStyle,
-        )
-        assertEquals(
-            "Read this like a high-energy, hyped, exciting party radio host. " +
-                "Fast, punchy, fun, full of energy. Speak only the Hebrew:",
-            Moods.ALL.getValue("party").ttsStyle,
-        )
-        assertEquals(
-            "Read this like a soft, warm, intimate late-night radio host. " +
-                "Slow, smooth, relaxed, calming, low and gentle - unhurried. " +
-                "Speak only the Hebrew:",
-            Moods.ALL.getValue("late_night").ttsStyle,
-        )
-        assertEquals(
-            "Read this calmly, briefly and low-key, unobtrusive and even. " +
-                "Speak only the Hebrew:",
-            Moods.ALL.getValue("focus").ttsStyle,
-        )
-        assertEquals(
-            "Read this like a warm, friendly, bright morning radio host. " +
-                "Cheerful and welcoming, medium pace. Speak only the Hebrew:",
-            Moods.ALL.getValue("morning").ttsStyle,
-        )
+    fun voiceNames_are_the_expected_distinct_defaults() {
+        assertEquals("Algieba", Moods.ALL.getValue("mix").voiceName)
+        assertEquals("Puck", Moods.ALL.getValue("party").voiceName)
+        assertEquals("Enceladus", Moods.ALL.getValue("late_night").voiceName)
+        assertEquals("Charon", Moods.ALL.getValue("focus").voiceName)
+        assertEquals("Aoede", Moods.ALL.getValue("morning").voiceName)
+    }
+
+    @Test
+    fun every_mood_has_a_nonblank_and_distinct_voiceName() {
+        val voices = Moods.ALL.values.map { it.voiceName }
+        for (spec in Moods.ALL.values) {
+            assertTrue("${spec.key} voiceName must be non-blank", spec.voiceName.isNotBlank())
+        }
+        // distinct across all five moods - the whole point is an audible
+        // per-mood voice difference, so no two moods may share a voice.
+        assertEquals("voiceNames must be distinct across moods", voices.size, voices.toSet().size)
+    }
+
+    @Test
+    fun ttsStyles_are_calm_and_distinct_and_speak_only_hebrew() {
+        val styles = Moods.ALL.mapValues { it.value.ttsStyle }
+
+        // all five end with the directive close + are distinct strings
+        for ((key, style) in styles) {
+            assertTrue("$key ttsStyle must close with the Hebrew-only directive",
+                style.contains("Speak only the Hebrew, naturally:"))
+        }
+        assertEquals("ttsStyles must be distinct per mood",
+            styles.size, styles.values.toSet().size)
+
+        // mix: must steer AWAY from hype/over-excitement (the user complaint).
+        val mix = styles.getValue("mix").lowercase()
+        assertTrue("mix must explicitly avoid hyping", mix.contains("do not hype"))
+        assertTrue("mix must avoid over-excitement", mix.contains("over-excited"))
+        assertTrue("mix must read as relaxed/medium-low", mix.contains("relaxed") || mix.contains("medium-low"))
+        // and must NOT carry the old over-the-top default wording.
+        assertTrue("mix must drop the old 'energetic' default", !mix.contains("energetic"))
+
+        // party stays energetic but controlled (not screaming).
+        val party = styles.getValue("party").lowercase()
+        assertTrue("party stays upbeat", party.contains("upbeat") || party.contains("lively"))
+        assertTrue("party must stay controlled, not screaming", party.contains("controlled") || party.contains("smooth"))
+
+        // late_night is soft/slow/intimate.
+        val lateNight = styles.getValue("late_night").lowercase()
+        assertTrue("late_night must be soft/slow", lateNight.contains("soft") && lateNight.contains("slow"))
+
+        // focus is minimal / unobtrusive.
+        val focus = styles.getValue("focus").lowercase()
+        assertTrue("focus must be minimal/unobtrusive", focus.contains("minimal") || focus.contains("unobtrusive"))
+
+        // morning is warm/friendly but explicitly NOT manic.
+        val morning = styles.getValue("morning").lowercase()
+        assertTrue("morning must be warm/friendly", morning.contains("warm") && morning.contains("friendly"))
+        assertTrue("morning must not be manic", morning.contains("not manic") || morning.contains("over-excited"))
     }
 
     @Test

@@ -114,6 +114,8 @@ class KolaiMediaService : MediaLibraryService() {
 
     // "New station" re-entrancy guard: a retune in flight ignores new requests.
     private val retuneInFlight = AtomicBoolean(false)
+    // Fast-mood-switch re-entrancy guard: a switch in flight collapses bursts.
+    private val moodSwitchInFlight = AtomicBoolean(false)
 
     // SELF-HEAL bookkeeping: timestamps of recent auto-restarts per loop
     // (bounded to MAX_LOOP_RESTARTS_PER_HOUR) and of recent player-error
@@ -271,6 +273,9 @@ class KolaiMediaService : MediaLibraryService() {
                 ttsVoiceB = cfg.ttsVoiceB,
                 cacheDir = cacheRoot,
                 blocksDir = blocksDir,
+                // PER-MOOD VOICE overrides from kolai_dev.properties: an
+                // override wins over the Moods default; empty keeps stock.
+                moodVoices = cfg.moodVoices,
                 ctxFactory = { http ->
                     val live = LiveDjContext(
                         http = http,
@@ -325,6 +330,7 @@ class KolaiMediaService : MediaLibraryService() {
             // build (a failed build leaves nothing for them to drive).
             startMoodCollector()
             startRetuneCollector()
+            startMoodSwitchCollector()
             Log.i(TAG, "engine built; blocksDir=${blocksDir.absolutePath}")
         } catch (e: Throwable) {
             Log.e(TAG, "engine build FAILED", e)
@@ -524,6 +530,94 @@ class KolaiMediaService : MediaLibraryService() {
                     KolaiState.setError("retune failed: ${e.message}")
                 } finally {
                     retuneInFlight.set(false)
+                }
+            }
+        }
+    }
+
+    /**
+     * FAST MOOD SWITCH (2026-06-13): when the user MANUALLY changes the mood
+     * (a chip tap -> [KolaiMood.manualMoodChanges]), the pre-rendered buffer
+     * still holds OLD-mood blocks, so without this the change would only be
+     * heard after the whole buffer drains (up to BUFFER_AHEAD blocks). This
+     * collector drops the buffered-but-UNPLAYED blocks beyond the currently
+     * playing one and lets the engine re-render them with the new mood.
+     *
+     * It is DELIBERATELY LIGHTER than the retune ([startRetuneCollector]):
+     *  - history / taste are NOT reset (this is not a new station);
+     *  - the CURRENTLY-PLAYING block keeps playing (no stop(), no pause);
+     *  - only player items AFTER the current one are removed, and the engine is
+     *    asked to invalidate blocks > current ([StationEngine.invalidateFrom]),
+     *    which discards their files + any in-flight render and rewinds the
+     *    frontier so the feed loop re-requests them under the new mood (the
+     *    per-block moodProvider reads the now-current effectiveMood).
+     *
+     * RESIDUAL LATENCY: the new mood is heard starting at the NEXT block
+     * boundary (the playing block finishes in its old mood), and the first
+     * re-rendered block must cold-render (~one block). The crossfade INTO that
+     * first re-rendered block is lost (prevTrack continuity cannot be rebuilt
+     * cheaply - same as a warm restart); this is an inaudible one-time seam, not
+     * a regression. Auto-mode clock transitions still flow only through
+     * [startMoodCollector] (no buffer drop) - only an explicit chip tap pays
+     * the re-render cost.
+     */
+    private fun startMoodSwitchCollector() {
+        serviceScope.launch {
+            KolaiMood.manualMoodChanges.collect { mood ->
+                if (!::stationEngine.isInitialized) return@collect
+                if (!moodSwitchInFlight.compareAndSet(false, true)) {
+                    Log.i(TAG, "mood switch already in flight; coalescing")
+                    return@collect
+                }
+                try {
+                    Log.i(TAG, "fast mood switch -> $mood")
+                    // Make sure the planner is already on the new mood before we
+                    // re-render (the effectiveMood collector also does this, but
+                    // ordering between collectors is not guaranteed).
+                    rollingPlanner.setMood(mood)
+
+                    // The block currently being PLAYED keeps playing; everything
+                    // strictly after it is invalidated. If nothing is playing yet
+                    // (cold render in progress), there is nothing buffered to
+                    // drop - future blocks will already use the new mood.
+                    val curBlock = withContext(Dispatchers.Main) {
+                        player.currentMediaItem?.mediaId?.toIntOrNull()
+                    } ?: return@collect
+
+                    // 1) stop feeding so no stale (old-mood) block lands mid-swap.
+                    feedJob?.cancelAndJoin()
+                    // 2) remove player items AFTER the current one (keep the
+                    //    playing block intact). Offset-safe by mediaId.
+                    withContext(Dispatchers.Main) {
+                        var i = 0
+                        while (i < player.mediaItemCount) {
+                            val id = player.getMediaItemAt(i).mediaId.toIntOrNull()
+                            if (id != null && id > curBlock) {
+                                player.removeMediaItem(i)
+                                // do not advance i; items shifted down into slot i
+                            } else {
+                                i++
+                            }
+                        }
+                    }
+                    // 3) drop stale (old-mood) metas beyond the playing block.
+                    metaCache.keys.filter { it > curBlock }.forEach { metaCache.remove(it) }
+                    // 4) engine: discard rendered/in-flight blocks > curBlock and
+                    //    rewind the frontier so they re-render with the new mood.
+                    stationEngine.invalidateFrom(curBlock + 1)
+                    // 5) restart the feed loop. The player still holds the playing
+                    //    block (coldStart=false path), so it re-feeds from
+                    //    curBlock+1 WITHOUT re-running the first-fed prepare()+play()
+                    //    and without touching the cold-start invariant.
+                    startFeedLoop()
+                } catch (e: Throwable) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    Log.e(TAG, "fast mood switch failed", e)
+                    // best-effort: ensure the feed is running again so playback
+                    // never stalls on a failed switch.
+                    if (feedJob?.isActive != true) startFeedLoop()
+                } finally {
+                    moodSwitchInFlight.set(false)
                 }
             }
         }

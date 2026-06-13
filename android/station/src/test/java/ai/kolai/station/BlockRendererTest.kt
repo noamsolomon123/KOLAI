@@ -78,17 +78,32 @@ class BlockRendererTest {
     private class FakeVoice(private val djSamples: Int) : VoiceRenderer {
         val styles = mutableListOf<String?>()
         val texts = mutableListOf<String>()
-        val dialogues = mutableListOf<Triple<List<Pair<String, String>>, String, String?>>()
-        override fun render(text: String, style: String?): DJSlot {
+        val voices = mutableListOf<String?>()
+        // (turns, voiceB, style, voiceA)
+        val dialogues = mutableListOf<DialogueCall>()
+        override fun render(text: String, style: String?, voiceName: String?): DJSlot {
             styles.add(style)
             texts.add(text)
+            voices.add(voiceName)
             return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
         }
-        override fun renderDialogue(turns: List<Pair<String, String>>, voiceB: String, style: String?): DJSlot {
-            dialogues.add(Triple(turns, voiceB, style))
+        override fun renderDialogue(
+            turns: List<Pair<String, String>>,
+            voiceB: String,
+            style: String?,
+            voiceA: String?,
+        ): DJSlot {
+            dialogues.add(DialogueCall(turns, voiceB, style, voiceA))
             return DJSlot(text = joinDialogue(turns), audioPath = "/voice/dj.wav", durationS = djSamples.toDouble() / Dsp.SR)
         }
     }
+
+    private data class DialogueCall(
+        val turns: List<Pair<String, String>>,
+        val voiceB: String,
+        val style: String?,
+        val voiceA: String?,
+    )
 
     /** Random whose nextDouble() is ~0.5000000075 - deterministically BELOW the
      *  default talk chances (0.5 < 0.9) and ABOVE the focus ones (>= 0.2), so
@@ -187,6 +202,14 @@ class BlockRendererTest {
         ident: (() -> FloatArray)? = null,
         analyze: AnalyzeFn = ::fakeAnalyze,
         load: LoadFn = ::fakeLoad,
+        // PER-MOOD VOICE resolver (defaults to the Moods spec voice, as in prod).
+        moodVoice: (String?) -> String = { Moods.spec(it).voiceName },
+        sidekickVoices: List<String> = emptyList(),
+        // VOCAL-ONSET seam. DEFAULT returns a generously-safe window so the
+        // synthetic (DC/constant) song fixtures keep their opener exactly as
+        // before; the vocal-onset tests inject a small window to assert the
+        // talk-over guard fires.
+        safeIntroFn: (FloatArray, Int) -> Double = { _, _ -> 60.0 },
     ): BlockRenderer = BlockRenderer(
         fetcher = fetcher,
         brain = DjBrain(client, persona = "דני"),
@@ -207,6 +230,9 @@ class BlockRendererTest {
         loadFn = load,
         encoder = encoder,
         write = write,
+        moodVoice = moodVoice,
+        sidekickVoices = sidekickVoices,
+        safeIntroFn = safeIntroFn,
     )
 
     private suspend fun loadTracks(r: BlockRenderer, songs: List<Song>): List<LoadedTrack> =
@@ -545,6 +571,8 @@ class BlockRendererTest {
             analyzeFn = ::fakeAnalyze,
             loadFn = ::fakeLoad,
             write = false,
+            // safe intro so the opener fires (this test is about ident length).
+            safeIntroFn = { _, _ -> 60.0 },
         )
         val withDefault = r.render(songs(2), index = 0, prevTrack = null)
         val without = newRenderer(talkChance = 0.0, ident = null)
@@ -609,12 +637,19 @@ class BlockRendererTest {
     }
 
     @Test
-    fun render_passes_null_style_when_mood_null() = runTest {
+    fun render_null_mood_resolves_mix_voice_and_calm_style() = runTest {
+        // INTENTIONAL CHANGE (2026-06-13, task 2): the old behavior left a null
+        // mood (the default/daytime "mix" case, LiveDjContext maps mix -> null)
+        // with NO style and NO voice - the "mix applies no style/voice" bug. A
+        // null mood now resolves voice + delivery from the EFFECTIVE mood
+        // ("mix"), so the DJ always has a real calm voice + calm style.
         val voice = FakeVoice(djSamples)
         val r = newRenderer(voice = voice, talkChance = 0.0, ctx = DjContext())
         r.render(songs(3), index = 0, prevTrack = null)
         assertTrue(voice.styles.isNotEmpty())
-        voice.styles.forEach { assertNull("style must be null without a mood", it) }
+        val mix = Moods.spec("mix")
+        voice.styles.forEach { assertEquals("null mood must get mix calm style", mix.ttsStyle, it) }
+        voice.voices.forEach { assertEquals("null mood must get mix voice", mix.voiceName, it) }
     }
 
     // ---- audio quality: loudness normalization, limiter, segues, fades ------
@@ -1112,18 +1147,20 @@ class BlockRendererTest {
     @Test
     fun seam_renderDialogue_default_body_is_single_voice() {
         // The seam DEFAULT must keep every existing single-voice adapter
-        // working: it flattens the turns and delegates to render(text, style).
-        val rendered = mutableListOf<Pair<String, String?>>()
+        // working: it flattens the turns and delegates to render(text, style,
+        // voiceName=voiceA) so the main host voice still carries through.
+        val rendered = mutableListOf<Triple<String, String?, String?>>()
         val v = object : VoiceRenderer {
-            override fun render(text: String, style: String?): DJSlot {
-                rendered.add(text to style)
+            override fun render(text: String, style: String?, voiceName: String?): DJSlot {
+                rendered.add(Triple(text, style, voiceName))
                 return DJSlot(text = text, audioPath = "/voice/dj.wav", durationS = 1.0)
             }
         }
-        val slot = v.renderDialogue(listOf("A" to "שלום", "B" to "אהלן"), voiceB = "Kore", style = "calm")
+        val slot = v.renderDialogue(listOf("A" to "שלום", "B" to "אהלן"), voiceB = "Kore", style = "calm", voiceA = "HostV")
         assertEquals(1, rendered.size)
         assertEquals(joinDialogue(listOf("A" to "שלום", "B" to "אהלן")), rendered.first().first)
         assertEquals("calm", rendered.first().second)
+        assertEquals("HostV", rendered.first().third)
         assertEquals(rendered.first().first, slot.text)
     }
 
@@ -1150,6 +1187,373 @@ class BlockRendererTest {
         now = 91L * 60_000L
         r.planFor(loadTracks(r, songs(2)), prevTrack = null)
         assertTrue(client.prompts.last().contains("ערב שבת"))
+    }
+
+
+    // ---- per-mood voice (task 1, 2026-06-13) --------------------------------
+
+    @Test
+    fun render_passes_mood_voice_to_render_when_mood_set() = runTest {
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(voice = voice, talkChance = 0.0, ctx = DjContext(mood = "party"))
+        r.render(songs(3), index = 0, prevTrack = null)
+        assertTrue(voice.voices.isNotEmpty())
+        val expected = Moods.spec("party").voiceName
+        voice.voices.forEach { assertEquals("party host voice expected", expected, it) }
+    }
+
+    @Test
+    fun render_mix_resolves_algieba_voice_and_calm_style_not_null() = runTest {
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(voice = voice, talkChance = 0.0, ctx = DjContext())
+        r.render(songs(3), index = 0, prevTrack = null)
+        val mix = Moods.spec("mix")
+        assertEquals("Algieba", mix.voiceName)
+        assertTrue(voice.voices.isNotEmpty())
+        voice.voices.forEach { assertEquals(mix.voiceName, it) }
+        voice.styles.forEach {
+            assertNotNull("mix must get a calm style, not null", it)
+            assertEquals(mix.ttsStyle, it)
+        }
+    }
+
+    @Test
+    fun render_moodVoice_override_wins_over_moods_default() = runTest {
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(
+            voice = voice, talkChance = 0.0, ctx = DjContext(mood = "party"),
+            moodVoice = { mood -> if (mood == "party") "Custom" else Moods.spec(mood).voiceName },
+        )
+        r.render(songs(3), index = 0, prevTrack = null)
+        voice.voices.forEach { assertEquals("Custom", it) }
+    }
+
+    @Test
+    fun render_dialogue_carries_mood_voice_as_voiceA() = runTest {
+        // mood "party" sets maxSilence=3; with talkChance 0 only the forced
+        // boundary (3) talks and banterEvery 1 makes it a banter. block 0 has
+        // no prevTrack so good-thing cannot pre-empt it -> deterministic banter.
+        val client = RoutedLlmClient(routes = listOf("באנטר" to banterJson))
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(
+            client = client, voice = voice, voiceB = "Kore",
+            talkChance = 0.0, banterEvery = 1,
+            ctx = DjContext(mood = "party"),
+        )
+        r.render(songs(4), index = 0, prevTrack = null)
+        assertEquals(1, voice.dialogues.size)
+        assertEquals(Moods.spec("party").voiceName, voice.dialogues.first().voiceA)
+        assertEquals("Kore", voice.dialogues.first().voiceB)
+    }
+
+    // ---- vocal-onset talk-over guard (task 3, 2026-06-13) -------------------
+
+    @Test
+    fun plan_block0_skips_opener_when_safe_intro_window_too_short() = runTest {
+        val r = newRenderer(talkChance = 0.0, safeIntroFn = { _, _ -> 0.0 })
+        val tracks = loadTracks(r, songs(3))
+        val events = r.planFor(tracks, prevTrack = null)
+        assertTrue("opener must be suppressed", events.none { it.kind == "open" })
+        assertEquals("song", events.first().kind)
+    }
+
+    @Test
+    fun render_no_opening_talk_when_safe_intro_window_too_short() = runTest {
+        val r = newRenderer(talkChance = 0.0, safeIntroFn = { _, _ -> 0.0 })
+        val result = r.render(songs(3), index = 0, prevTrack = null)
+        assertTrue("no talk over the opening", result.meta.talk.none { it.beat == "song" && it.startS < 1.0 })
+    }
+
+    @Test
+    fun plan_laterBlock_skips_back_announce_when_safe_intro_too_short() = runTest {
+        val prevSong = Song(title = "PREV", artist = "PA")
+        val prevTrack = LoadedTrack(prevSong, fakeAnalyze("/fake/PREV.m4a"), fakeLoad("/fake/PREV.m4a"), "/fake/PREV.m4a")
+        val unsafe = newRenderer(talkChance = 0.0, safeIntroFn = { _, _ -> 0.0 })
+        val eUnsafe = unsafe.planFor(loadTracks(unsafe, songs(5)), prevTrack = prevTrack)
+        assertTrue("unsafe suppresses opener", eUnsafe.none { it.kind == "open" })
+        val safe = newRenderer(talkChance = 0.0, safeIntroFn = { _, _ -> 30.0 })
+        val eSafe = safe.planFor(loadTracks(safe, songs(5)), prevTrack = prevTrack)
+        assertEquals("open", eSafe.first().kind)
+    }
+
+    @Test
+    fun plan_opening_budget_clamped_by_vocal_onset_below_introEnd() = runTest {
+        val client = FakeLlmClient()
+        val r = newRenderer(
+            client = client, talkChance = 0.0,
+            analyze = analyzeWith(introEndS = 8.0),
+            safeIntroFn = { _, _ -> 6.0 },
+        )
+        r.planFor(loadTracks(r, songs(2)), prevTrack = null)
+        assertTrue("clamp to vocal onset", client.prompts.first().contains("עד 12 מילים"))
+    }
+
+    // ---- fun segments: trivia (task 4, 2026-06-13) --------------------------
+
+    private val triviaJson =
+        """[{"s":"A","t":"מי כתב"},{"s":"B","t":"לא יודע"},{"s":"A","t":"נגלה אחרי השיר"}]"""
+
+    @Test
+    fun plan_trivia_fires_once_per_window_and_replaces_break() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "פינת טריוו" to triviaJson))
+        var now = 0L
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 4, nowMs = { now })
+        val t0 = loadTracks(r, songs(7))
+        val e0 = r.planFor(t0, prevTrack = null)
+        assertTrue(e0.none { it.beat == "trivia" })
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertEquals(listOf(4), e1.filter { it.beat == "trivia" }.map { it.i })
+        assertEquals(listOf(4), e1.filter { it.kind == "break" }.map { it.i })
+        val t2 = loadTracks(r, songs(7))
+        val e2 = r.planFor(t2, prevTrack = t1.last())
+        assertTrue(e2.none { it.beat == "trivia" })
+        assertTrue(e2.any { it.i == 4 && it.kind == "break" })
+    }
+
+    @Test
+    fun plan_trivia_skip_does_not_consume_latch() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "פינת טריוו" to "[]"))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 4)
+        val t0 = loadTracks(r, songs(7))
+        r.planFor(t0, prevTrack = null)
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertTrue(e1.none { it.beat == "trivia" })
+        assertTrue(e1.any { it.i == 4 && it.kind == "break" })
+        // block 0 cannot attempt trivia (no prevTrack); blocks 1 AND 2 both
+        // attempt it because the [] skip did NOT consume the latch.
+        val t2 = loadTracks(r, songs(7))
+        val e2 = r.planFor(t2, prevTrack = t1.last())
+        assertTrue(e2.none { it.beat == "trivia" })
+        assertEquals(2, client.prompts.count { it.contains("פינת טריוו") })
+    }
+
+    @Test
+    fun render_trivia_uses_renderDialogue_when_voiceB_set() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "פינת טריוו" to triviaJson))
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(client = client, voice = voice, voiceB = "Kore", talkChance = 0.0, maxSilence = 1, nowMs = { 0L })
+        val prevSong = Song(title = "PREV", artist = "PA")
+        val prevTrack = LoadedTrack(prevSong, fakeAnalyze("/fake/PREV.m4a"), fakeLoad("/fake/PREV.m4a"), "/fake/PREV.m4a")
+        val result = r.render(songs(2), index = 1, prevTrack = prevTrack)
+        assertEquals(1, voice.dialogues.size)
+        assertEquals("Kore", voice.dialogues.first().voiceB)
+        assertTrue(result.meta.talk.any { it.beat == "trivia" })
+    }
+
+    // ---- fun segments: listening cue (task 4) -------------------------------
+
+    @Test
+    fun plan_listening_cue_replaces_song_intro_once_per_window() = runTest {
+        // maxSilence 1 -> every boundary forced; on a fresh renderer beatK
+        // starts 0 so boundary 1 of block 0 is a "song" beat. block 0 has no
+        // prevTrack so the cue is ineligible (it needs a previous song); the
+        // SECOND block (prevTrack set) is where the song-beat cue lands.
+        val cueText = "שים לב לדרופ"
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "שים לב לרגע" to cueText))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 1, banterEvery = 1000, minuteOfHour = { 15 }, nowMs = { 0L })
+        val prevSong = Song(title = "PREV", artist = "PA")
+        val prevTrack = LoadedTrack(prevSong, fakeAnalyze("/fake/PREV.m4a"), fakeLoad("/fake/PREV.m4a"), "/fake/PREV.m4a")
+        val e1 = r.planFor(loadTracks(r, songs(2)), prevTrack = prevTrack)
+        val cues = e1.filter { it.beat == "cue" }
+        assertEquals(listOf(1), cues.map { it.i })
+        assertEquals(cueText, cues.first().text)
+        assertEquals(listOf(1), e1.filter { it.kind == "break" }.map { it.i })
+    }
+
+    @Test
+    fun plan_listening_cue_skip_falls_back_to_normal_intro() = runTest {
+        // cue routed to SKIP -> the song-beat boundary keeps the NORMAL song
+        // intro (beat "song"), the cue replaced nothing.
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "שים לב לרגע" to "SKIP"))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 1, banterEvery = 1000, minuteOfHour = { 15 })
+        val prevSong = Song(title = "PREV", artist = "PA")
+        val prevTrack = LoadedTrack(prevSong, fakeAnalyze("/fake/PREV.m4a"), fakeLoad("/fake/PREV.m4a"), "/fake/PREV.m4a")
+        val e1 = r.planFor(loadTracks(r, songs(2)), prevTrack = prevTrack)
+        val b = e1.filter { it.kind == "break" }
+        assertEquals(listOf(1), b.map { it.i })
+        assertEquals("song", b.first().beat)
+        assertTrue(b.none { it.beat == "cue" })
+    }
+
+    // ---- fun segments: banter persona/voice rotation (task 4) ---------------
+
+    @Test
+    fun plan_banter_rotates_sidekick_persona_across_consecutive_banters() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson))
+        val r = newRenderer(client = client, talkChance = 0.0, maxSilence = 1, banterEvery = 1)
+        var prev: LoadedTrack? = null
+        repeat(3) {
+            val t = loadTracks(r, songs(2))
+            r.planFor(t, prevTrack = prev)
+            prev = t.last()
+        }
+        val bp = client.prompts.filter { it.contains("קטע באנטר") }
+        assertTrue("expected >=3 banter prompts", bp.size >= 3)
+        assertTrue("persona 0 used", bp.any { it.contains(DjBrain.SIDEKICK_PERSONAS[0]) })
+        assertTrue("persona 1 used", bp.any { it.contains(DjBrain.SIDEKICK_PERSONAS[1]) })
+        assertTrue("persona 2 used", bp.any { it.contains(DjBrain.SIDEKICK_PERSONAS[2]) })
+    }
+
+    @Test
+    fun render_banter_rotates_sidekick_voiceB_when_sidekickVoices_set() = runTest {
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson))
+        val voice = FakeVoice(djSamples)
+        val r = newRenderer(client = client, voice = voice, voiceB = "Kore", talkChance = 0.0, maxSilence = 1, banterEvery = 1, sidekickVoices = listOf("VA", "VB", "VC"))
+        var prev: LoadedTrack? = null
+        repeat(3) {
+            val t = loadTracks(r, songs(2))
+            r.render(songs(2), index = it, prevTrack = prev)
+            prev = t.last()
+        }
+        assertEquals(listOf("VA", "VB", "VC"), voice.dialogues.map { it.voiceB })
+    }
+
+    // ---- mood-driven banter/trivia/handover (study finding 8 VERIFICATION) ---
+    //
+    // The 2026-06-13 generation study (docs/studies/findings-djtext.md item 8)
+    // reported banter/trivia/handover firing ONLY in "mix" and never in
+    // party/focus/late_night/morning. That was a HARNESS ARTIFACT: the study's
+    // CorpusGenerator drives beats off its own `<rareTarget` sample counters
+    // (handoverSamples / banterSamples / triviaSamples), processes "mix" FIRST
+    // for 50 songs, and fills those counters to the cap (16) entirely during the
+    // mix phase before party/focus/etc. are ever reached - the counters are
+    // neither per-mood nor reset. The REAL renderer (planFor) has NO mix-only
+    // gate: banter is driven purely by the EFFECTIVE mood's banterChance
+    // (party 0.4 > morning 0.25 > mix 0.2 > late_night 0.1 > focus 0.05) and the
+    // sparse-talk eligibility law; trivia/handover ride the same `eligible`
+    // boundary in any mood. These tests prove that directly.
+
+    /** Random whose nextDouble() is ~0.01 - BELOW every mood's banterChance and
+     *  talkChance, so a non-forced eligible boundary both qualifies and elects
+     *  banter deterministically (no seed bookkeeping). */
+    private class LowRandom : Random() {
+        override fun nextBits(bitCount: Int): Int = 0
+        override fun nextDouble(): Double = 0.01
+    }
+
+    @Test
+    fun plan_banter_fires_in_party_mood_via_banterChance() = runTest {
+        // party: talkChance 0.7, banterChance 0.4. LowRandom (~0.01) clears both
+        // the eligibility flip (0.01 < 0.7) and the banter flip (0.01 < 0.4) at
+        // the FIRST non-forced eligible boundary (since-talk >= 2). This is the
+        // NON-forced path - banter is driven purely by the mood's banterChance,
+        // not by `mix`, and not by the forced/banterEvery rotation.
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson))
+        val r = newRenderer(
+            client = client, maxSilence = 100, rng = LowRandom(),
+            ctx = DjContext(mood = "party"),
+        )
+        val events = r.planFor(loadTracks(r, songs(6)), prevTrack = null)
+        assertTrue(
+            "party must banter on a non-forced boundary per its banterChance",
+            events.any { it.beat == "banter" },
+        )
+    }
+
+    @Test
+    fun plan_banter_fires_in_late_night_mood_via_banterChance() = runTest {
+        // late_night: talkChance 0.3, banterChance 0.1. LowRandom (~0.01) still
+        // clears both (0.01 < 0.3 and 0.01 < 0.1) - banter is reachable in a
+        // non-mix, low-chance mood, just rarer in practice.
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson))
+        val r = newRenderer(
+            client = client, maxSilence = 100, rng = LowRandom(),
+            ctx = DjContext(mood = "late_night"),
+        )
+        val events = r.planFor(loadTracks(r, songs(6)), prevTrack = null)
+        assertTrue(
+            "late_night must be able to banter per its banterChance",
+            events.any { it.beat == "banter" },
+        )
+    }
+
+    @Test
+    fun plan_focus_mood_does_not_banter_on_nonforced_boundaries() = runTest {
+        // focus: banterChance 0.05. MidRandom (~0.5) NEVER clears the banter flip
+        // (0.5 > 0.05), so banter never fires on a non-forced boundary - the LOW
+        // chance is respected (rarely/never), exactly as the mood intends. We set
+        // banterEvery huge so the forced rotation never elects one either,
+        // proving the chance alone governs the non-forced path.
+        val client = RoutedLlmClient(routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson))
+        val r = newRenderer(
+            client = client, maxSilence = 100, rng = MidRandom(), banterEvery = 100_000,
+            ctx = DjContext(mood = "focus"),
+        )
+        val events = r.planFor(loadTracks(r, songs(8)), prevTrack = null)
+        assertTrue(
+            "focus must not banter on non-forced boundaries given its tiny banterChance",
+            events.none { it.beat == "banter" },
+        )
+    }
+
+    @Test
+    fun plan_party_banters_where_focus_does_not_at_the_same_threshold() = runTest {
+        // SAME rng and SAME boundary structure, only the mood differs. A value in
+        // (focus 0.05, party 0.4): party banters, focus does not - proving party
+        // banters MORE than focus, governed by banterChance, not by `mix`.
+        class BetweenRandom : Random() {
+            override fun nextBits(bitCount: Int): Int = 0
+            override fun nextDouble(): Double = 0.2
+        }
+        val routes = listOf("משהו טוב לדרך" to "SKIP", "קטע באנטר" to banterJson)
+
+        val party = newRenderer(
+            client = RoutedLlmClient(routes), maxSilence = 100, rng = BetweenRandom(),
+            banterEvery = 100_000, ctx = DjContext(mood = "party"),
+        )
+        val partyEvents = party.planFor(loadTracks(party, songs(6)), prevTrack = null)
+        assertTrue("party banters at chance 0.4 > 0.2", partyEvents.any { it.beat == "banter" })
+
+        val focus = newRenderer(
+            client = RoutedLlmClient(routes), maxSilence = 100, rng = BetweenRandom(),
+            banterEvery = 100_000, ctx = DjContext(mood = "focus"),
+        )
+        val focusEvents = focus.planFor(loadTracks(focus, songs(6)), prevTrack = null)
+        assertTrue("focus does NOT banter at chance 0.05 < 0.2", focusEvents.none { it.beat == "banter" })
+    }
+
+    @Test
+    fun plan_trivia_fires_in_party_mood_not_just_mix() = runTest {
+        // trivia rides an `eligible` boundary in ANY non-somber mood (no mix
+        // gate). party here; block 1 has a forced boundary, latch open.
+        val client = RoutedLlmClient(
+            routes = listOf("משהו טוב לדרך" to "SKIP", "פינת טריוו" to triviaJson, "קטע באנטר" to "[]"),
+        )
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4, nowMs = { 0L },
+            ctx = DjContext(mood = "party"),
+        )
+        val t0 = loadTracks(r, songs(7))
+        r.planFor(t0, prevTrack = null)
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertTrue(
+            "trivia must be reachable in party mood (no mix-only gate)",
+            e1.any { it.beat == "trivia" },
+        )
+    }
+
+    @Test
+    fun plan_handover_fires_in_late_night_mood_not_just_mix() = runTest {
+        // handover replaces the first eligible boundary after a partOfDay change,
+        // in ANY mood. Drive late_night across a day-part transition.
+        val client = FakeLlmClient()
+        var part = "ערב"
+        val r = newRenderer(
+            client = client, talkChance = 0.0, maxSilence = 4,
+            ctxProvider = { DjContext(partOfDay = part, mood = "late_night") },
+        )
+        val t0 = loadTracks(r, songs(7))
+        r.planFor(t0, prevTrack = null)
+        part = "לילה"
+        val t1 = loadTracks(r, songs(7))
+        val e1 = r.planFor(t1, prevTrack = t0.last())
+        assertEquals(
+            "late_night handover must fire on the transition boundary",
+            listOf("handover"), e1.filter { it.kind == "break" }.map { it.beat },
+        )
     }
 
     @Test

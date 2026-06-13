@@ -39,23 +39,39 @@ interface VoiceRenderer {
      * [style] is an optional English TTS delivery prefix (a mood's
      * [MoodSpec.ttsStyle]); null keeps the implementation's default delivery
      * (and its caching behavior). Overrides must NOT redeclare the default.
+     *
+     * [voiceName] (2026-06-13, per-mood voice integration) is an optional
+     * prebuilt Gemini voice name (a mood's [MoodSpec.voiceName], possibly
+     * overridden per-mood in app config); null keeps the renderer's
+     * constructor voice. [BlockRenderer] resolves the EFFECTIVE mood's voice
+     * (mix included) and passes it here so the main-host voice tracks the
+     * mood. Defaulted so existing fakes/adapters keep compiling; the cache key
+     * already folds in the voice in the :voice renderer.
      */
-    fun render(text: String, style: String? = null): DJSlot
+    fun render(text: String, style: String? = null, voiceName: String? = null): DJSlot
 
     /**
      * Render a two-host DIALOGUE: speaker-tagged [turns] (e.g.
      * `[("A", line), ("B", line), ...]`, see DjBrain.writeBanter) where the
-     * second host speaks with [voiceB].
+     * second host speaks with [voiceB] and the MAIN host (speaker A) with
+     * [voiceA] (2026-06-13; null = the renderer's constructor voice). The
+     * renderer passes the block's mood voice as [voiceA] so the lead host
+     * tracks the mood while the sidekick keeps [voiceB].
      *
      * DEFAULT body (wave 3): single-voice fallback - the turns are flattened
-     * via [joinDialogue] and spoken through [render], so every existing
-     * fake/adapter keeps compiling and keeps the MVP single-voice banter
-     * behavior. The :app adapter overrides this (wave 4) with true
-     * multi-speaker Gemini TTS; [BlockRenderer] only calls it when a voiceB
-     * is configured. Overrides must NOT redeclare the [style] default.
+     * via [joinDialogue] and spoken through [render] (carrying the mood
+     * [voiceName] = [voiceA]), so every existing fake/adapter keeps compiling
+     * and keeps the MVP single-voice banter behavior. The :app adapter
+     * overrides this with true multi-speaker Gemini TTS; [BlockRenderer] only
+     * calls it when a voiceB is configured. Overrides must NOT redeclare the
+     * defaults.
      */
-    fun renderDialogue(turns: List<Pair<String, String>>, voiceB: String, style: String? = null): DJSlot =
-        render(joinDialogue(turns), style)
+    fun renderDialogue(
+        turns: List<Pair<String, String>>,
+        voiceB: String,
+        style: String? = null,
+        voiceA: String? = null,
+    ): DJSlot = render(joinDialogue(turns), style, voiceA)
 }
 
 /**

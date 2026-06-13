@@ -215,6 +215,89 @@ class VoiceRendererTest {
     }
 
     @Test
+    fun render_same_text_different_voices_uses_different_cache_files() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "אותו טקסט בדיוק"
+
+        val v1 = renderer.render(text, voiceOverride = "Algieba")
+        val v2 = renderer.render(text, voiceOverride = "Puck")
+        val plain = renderer.render(text)
+
+        // a WAV voiced in one voice is never reused for another voice (or the default)
+        assertTrue("Algieba vs Puck", v1.audioPath != v2.audioPath)
+        assertTrue("Algieba vs plain", v1.audioPath != plain.audioPath)
+        assertTrue("Puck vs plain", v2.audioPath != plain.audioPath)
+        assertEquals("each voice synthesized once", 3, calls[0])
+
+        // repeating a voiced render is a cache hit (no extra synth)
+        val v1Again = renderer.render(text, voiceOverride = "Algieba")
+        assertEquals(v1.audioPath, v1Again.audioPath)
+        assertEquals("repeat voiced render is a cache hit", 3, calls[0])
+    }
+
+    @Test
+    fun render_voice_and_style_each_change_cache_file() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "אותו טקסט בדיוק"
+
+        val voiceOnly = renderer.render(text, voiceOverride = "Puck")
+        val styleOnly = renderer.render(text, style = "Late night")
+        val both = renderer.render(text, voiceOverride = "Puck", style = "Late night")
+
+        val paths = listOf(voiceOnly, styleOnly, both).map { it.audioPath }
+        assertEquals("voice, style, and both produce distinct files", 3, paths.toSet().size)
+        assertEquals("each combination synthesized once", 3, calls[0])
+    }
+
+    @Test
+    fun render_null_voice_and_null_style_hits_exact_legacy_filename() = runTest {
+        val calls = intArrayOf(0)
+        val renderer = VoiceRenderer(fakeSynth(calls), tmp.root)
+        val text = "שלום עולם"
+
+        // both voiceOverride and style null/blank -> legacy key is sha1(text) alone
+        val slot = renderer.render(text, voiceOverride = null, style = null)
+
+        val sha1 = java.security.MessageDigest.getInstance("SHA-1")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val expectedName = "dj_${sha1.substring(0, 16)}.wav"
+        assertEquals(expectedName, java.io.File(slot.audioPath).name)
+
+        // blank voiceOverride is treated like null too (still legacy file)
+        val blankVoice = renderer.render(text, voiceOverride = "  ", style = null)
+        assertEquals(slot.audioPath, blankVoice.audioPath)
+        assertEquals("blank voice hits the legacy cache", 1, calls[0])
+    }
+
+    @Test
+    fun renderDialogue_different_voiceA_uses_different_cache_file() = runTest {
+        val calls = intArrayOf(0)
+        val bodies = mutableListOf<String>()
+        val renderer = VoiceRenderer(fakeSynth(calls, bodies), tmp.root)
+        val turns = listOf("A" to "hi", "B" to "yo")
+
+        val defaultA = renderer.renderDialogue(turns, voiceB = "Iapetus")
+        val customA = renderer.renderDialogue(turns, voiceB = "Iapetus", voiceA = "Puck")
+        val otherA = renderer.renderDialogue(turns, voiceB = "Iapetus", voiceA = "Charon")
+
+        val paths = listOf(defaultA, customA, otherA).map { it.audioPath }
+        assertEquals("varying voiceA produces distinct files", 3, paths.toSet().size)
+        assertEquals("each voiceA synthesized once", 3, calls[0])
+
+        // the custom host voice reached the synth (speaker A == voiceA)
+        assertTrue("custom voiceA forwarded to synth", bodies.any { it.contains("Puck") })
+        assertTrue("custom voiceA forwarded to synth", bodies.any { it.contains("Charon") })
+
+        // repeating with the same voiceA is a cache hit
+        val customAgain = renderer.renderDialogue(turns, voiceB = "Iapetus", voiceA = "Puck")
+        assertEquals(customA.audioPath, customAgain.audioPath)
+        assertEquals("repeat voiceA render is a cache hit", 3, calls[0])
+    }
+
+    @Test
     fun wavDurationSeconds_parses_known_pcm() {
         val wav = pcmToWav(knownPcm, 24000)
         assertEquals(1.0, wavDurationSeconds(wav), 1e-9)

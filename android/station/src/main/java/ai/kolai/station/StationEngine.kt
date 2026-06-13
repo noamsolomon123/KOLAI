@@ -353,6 +353,68 @@ class StationEngine(
     }
 
     /**
+     * FAST MOOD SWITCH (2026-06-13): partially invalidate the rendered buffer
+     * so the un-played blocks at/after [fromIndex] are re-rendered (with the
+     * new mood) WITHOUT a full [reset]. Unlike [reset] this keeps [current] and
+     * the already-PLAYING block intact - it only discards blocks the listener
+     * has not reached yet, so a manual mood change is heard within roughly one
+     * block instead of after the whole pre-rendered buffer drains.
+     *
+     *  - Bumps [generation] so any in-flight render of an invalidated index is
+     *    discarded on commit (same staleness guard as [reset]).
+     *  - Drops registry entries + block/meta files for indices >= [fromIndex].
+     *  - Rewinds [frontier] to [fromIndex] (only if it was further ahead) so the
+     *    run loop re-renders from there.
+     *  - PCM crossfade continuity into [fromIndex] cannot be rebuilt cheaply, so
+     *    [prevLastTrack] is cleared (the re-rendered block opens like a warm
+     *    restart - the renderer already tolerates a null prevTrack). The planner
+     *    seed [prevLastSong] is rebuilt from the retained block_(fromIndex-1)
+     *    meta's last segment when available, so no-repeat history is preserved.
+     *  - [fromIndex] <= [current] is clamped to current+1: the playing block is
+     *    NEVER invalidated (that would interrupt playback). Wakes the loop.
+     */
+    suspend fun invalidateFrom(fromIndex: Int) {
+        val toDelete: List<Int>
+        stateMutex.withLock {
+            val from = fromIndex.coerceAtLeast(current + 1)
+            if (from >= frontier) {
+                // nothing rendered ahead yet: only ensure future renders pick up
+                // the new state (generation bump) so an in-flight render of
+                // >= from is discarded; no files to drop.
+                generation += 1
+                wakeChannel.trySend(Unit)
+                return
+            }
+            generation += 1
+            toDelete = blocks.keys.filter { it >= from }.toList()
+            for (k in toDelete) blocks.remove(k)
+            // rebuild the planner seed from the last RETAINED block before
+            // `from` (its last segment), so no-repeat history survives.
+            val prevMeta = blocks[from - 1]?.first
+            val lastSeg = prevMeta?.segments?.lastOrNull()
+            prevLastSong = lastSeg?.let { Song(title = it.title, artist = it.artist) }
+            prevLastTrack = null // PCM continuity cannot be rebuilt cheaply
+            frontier = from
+            saveStateLocked()
+        }
+        for (i in toDelete) {
+            try {
+                val f = File("$blocksDir/block_$i.m4a")
+                if (f.exists()) f.delete()
+            } catch (e: Exception) {
+                // tolerate IO errors
+            }
+            try {
+                val mf = File("$blocksDir/block_$i.meta.json")
+                if (mf.exists()) mf.delete()
+            } catch (e: Exception) {
+                // tolerate IO errors
+            }
+        }
+        wakeChannel.trySend(Unit)
+    }
+
+    /**
      * Python `_delete_block_files`: remove every block_*.m4a in blocksDir --
      * plus (Android persistence) every block_*.meta.json and state.json (and
      * their .tmp leftovers). Anything else in the dir is left alone.

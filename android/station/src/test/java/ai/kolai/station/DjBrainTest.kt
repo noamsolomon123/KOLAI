@@ -768,4 +768,373 @@ class DjBrainTest {
             }
         }
     }
+
+    // ---- trivia game (2026-06-13) -------------------------------------------
+
+    /** Stable marker of the quizmaster framing (QUIZMASTER_FRAMING). */
+    private val quizMarker = "הקוויזמאסטר"
+
+    @Test
+    fun trivia_parses_clean_json_into_speaker_tagged_turns() = runTest {
+        val reply = """[{"s":"A","t":"מאיפה רדיוהד במקור?"},{"s":"B","t":"לא יודע, נשמע בריטי."},{"s":"A","t":"בול. נגלה אחרי השיר."}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTrivia(nxt, ctx = DjContext())
+        assertEquals(3, turns.size)
+        assertEquals(listOf("A", "B", "A"), turns.map { it.first })
+        assertEquals("מאיפה רדיוהד במקור?", turns[0].second)
+    }
+
+    @Test
+    fun trivia_garbage_returns_empty_list_and_never_throws() = runTest {
+        val client = FakeLlmClient(listOf("סתם טקסט שאינו מערך בכלל"))
+        val brain = DjBrain(client, persona = "דני")
+        assertTrue(brain.writeTrivia(nxt, ctx = DjContext()).isEmpty())
+    }
+
+    @Test
+    fun trivia_empty_array_returns_empty_list() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        assertTrue(brain.writeTrivia(nxt, ctx = DjContext()).isEmpty())
+    }
+
+    @Test
+    fun trivia_never_fires_when_somber_no_llm_call() = runTest {
+        val client = FakeLlmClient(listOf("לא אמור להיקרא"))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTrivia(nxt, ctx = DjContext(somber = true))
+        assertTrue(turns.isEmpty())
+        assertTrue("somber trivia must not call the LLM", client.prompts.isEmpty())
+    }
+
+    @Test
+    fun trivia_prompt_carries_quizmaster_framing_artist_and_json_format() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTrivia(nxt, ctx = DjContext())
+        val p = client.prompts.first()
+        assertTrue("quizmaster framing missing", p.contains(quizMarker))
+        assertTrue("artist restriction missing", p.contains("על האמן של השיר הבא בלבד"))
+        assertTrue("artist name missing", p.contains("Radiohead"))
+        assertTrue("tease line missing", p.contains("נגלה אחרי השיר"))
+        assertTrue("JSON format instruction missing", p.contains("\"s\":\"A\""))
+        assertTrue(p.contains(oneListenerMarker))
+    }
+
+    @Test
+    fun trivia_is_remembered_in_the_ring() = runTest {
+        val reply = """[{"s":"A","t":"שאלה כיפית?"},{"s":"B","t":"אולי."},{"s":"A","t":"נגלה אחרי השיר."}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTrivia(nxt, ctx = DjContext())
+        val mem = brain.recentLinesSnapshot()
+        assertEquals(1, mem.size)
+        assertTrue(mem.first().contains("שאלה כיפית?"))
+    }
+
+    @Test
+    fun trivia_five_turns_truncated_and_ends_with_A() = runTest {
+        val reply = """[{"s":"A","t":"אחת."},{"s":"B","t":"שתיים."},{"s":"A","t":"שלוש."},{"s":"B","t":"ארבע."},{"s":"A","t":"חמש."}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTrivia(nxt, ctx = DjContext())
+        assertEquals(3, turns.size)
+        assertTrue("must not exceed cap", turns.size <= DjBrain.TRIVIA_MAX_TURNS)
+        assertEquals("A", turns.last().first)
+    }
+
+    // ---- banter persona rotation (2026-06-13) -------------------------------
+
+    @Test
+    fun sidekick_persona_count_is_exposed_and_index_zero_is_legacy() = runTest {
+        assertEquals(3, DjBrain.sidekickPersonaCount)
+        assertEquals(DjBrain.SIDEKICK_PERSONA, DjBrain.SIDEKICK_PERSONAS[0])
+    }
+
+    @Test
+    fun legacy_writeBanter_uses_persona_index_zero() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBanter(prev, nxt, ctx = DjContext())
+        assertTrue(client.prompts.first().contains(DjBrain.SIDEKICK_PERSONAS[0]))
+    }
+
+    @Test
+    fun banter_persona_rotation_injects_distinct_persona_text_per_index() = runTest {
+        // one client, three calls with indices 0/1/2; each prompt must carry
+        // its own persona and not the others'.
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 0)
+        brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 1)
+        brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 2)
+        assertEquals(3, client.prompts.size)
+        for (i in 0..2) {
+            assertTrue("prompt #$i missing its own persona", client.prompts[i].contains(DjBrain.SIDEKICK_PERSONAS[i]))
+        }
+        // the three personas are genuinely different text
+        assertEquals(3, DjBrain.SIDEKICK_PERSONAS.toSet().size)
+    }
+
+    @Test
+    fun banter_persona_index_wraps_modulo_and_never_throws() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        // index 3 wraps to 0, index -1 wraps to last
+        brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 3)
+        brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = -1)
+        assertTrue(client.prompts[0].contains(DjBrain.SIDEKICK_PERSONAS[0]))
+        assertTrue(client.prompts[1].contains(DjBrain.SIDEKICK_PERSONAS[2]))
+    }
+
+    @Test
+    fun banter_rotation_still_parses_and_remembers() = runTest {
+        val reply = """[{"s":"A","t":"שיר טוב."},{"s":"B","t":"וואו, מהמם!"},{"s":"A","t":"יאללה מוזיקה."}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext(), seconds = 14.0, sidekickIndex = 1)
+        assertEquals(3, turns.size)
+        assertEquals("A", turns.last().first)
+        assertEquals(1, brain.recentLinesSnapshot().size)
+    }
+
+    @Test
+    fun banter_rotation_empty_when_somber_no_llm_call() = runTest {
+        val client = FakeLlmClient(listOf("לא אמור להיקרא"))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeBanter(prev, nxt, ctx = DjContext(somber = true), seconds = 14.0, sidekickIndex = 2)
+        assertTrue(turns.isEmpty())
+        assertTrue(client.prompts.isEmpty())
+    }
+
+    // ---- micro-segment: listening cue (2026-06-13) --------------------------
+
+    @Test
+    fun listeningCue_returns_finished_line() = runTest {
+        val client = FakeLlmClient(listOf("שים לב לדרופ בדקה השנייה - מצמרר."))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeListeningCue(nxt, ctx = DjContext())
+        assertTrue(out.contains("שים לב"))
+        assertEquals(listOf(out), brain.recentLinesSnapshot())
+    }
+
+    @Test
+    fun listeningCue_skip_returns_empty_and_not_remembered() = runTest {
+        val client = FakeLlmClient(listOf("SKIP"))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeListeningCue(nxt, ctx = DjContext())
+        assertEquals("", out)
+        assertTrue(brain.recentLinesSnapshot().isEmpty())
+    }
+
+    @Test
+    fun listeningCue_empty_when_somber_no_llm_call() = runTest {
+        val client = FakeLlmClient(listOf("לא אמור להיקרא"))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeListeningCue(nxt, ctx = DjContext(somber = true))
+        assertEquals("", out)
+        assertTrue("somber cue must not call the LLM", client.prompts.isEmpty())
+    }
+
+    @Test
+    fun listeningCue_prompt_has_artist_and_skip_gate() = runTest {
+        val client = FakeLlmClient(listOf("SKIP"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeListeningCue(nxt, ctx = DjContext())
+        val p = client.prompts.first()
+        assertTrue("song title missing", p.contains("Creep"))
+        assertTrue("cue framing missing", p.contains("שים לב לרגע ב"))
+        assertTrue("skip line missing", p.contains("החזר בדיוק את המילה SKIP"))
+        assertTrue(p.contains(oneListenerMarker))
+    }
+
+    // ---- micro-segment: two truths and a lie (2026-06-13) -------------------
+
+    @Test
+    fun twoTruthsLie_parses_clean_json() = runTest {
+        val reply = """[{"s":"A","t":"שלוש על רדיוהד, אחת שקר."},{"s":"B","t":"השנייה שקר?"},{"s":"A","t":"נראה לי כן. מוזיקה!"}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTwoTruthsLie(nxt, ctx = DjContext())
+        assertEquals(3, turns.size)
+        assertEquals("A", turns.last().first)
+    }
+
+    @Test
+    fun twoTruthsLie_garbage_returns_empty_list() = runTest {
+        val client = FakeLlmClient(listOf("בכלל לא מערך"))
+        val brain = DjBrain(client, persona = "דני")
+        assertTrue(brain.writeTwoTruthsLie(nxt, ctx = DjContext()).isEmpty())
+    }
+
+    @Test
+    fun twoTruthsLie_empty_when_somber_no_llm_call() = runTest {
+        val client = FakeLlmClient(listOf("לא אמור להיקרא"))
+        val brain = DjBrain(client, persona = "דני")
+        val turns = brain.writeTwoTruthsLie(nxt, ctx = DjContext(somber = true))
+        assertTrue(turns.isEmpty())
+        assertTrue(client.prompts.isEmpty())
+    }
+
+    @Test
+    fun twoTruthsLie_prompt_restricts_to_artist_and_phrases_speculatively() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTwoTruthsLie(nxt, ctx = DjContext())
+        val p = client.prompts.first()
+        assertTrue("two-truths framing missing", p.contains("שתי אמיתות ושקר"))
+        assertTrue("artist name missing", p.contains("Radiohead"))
+        assertTrue("speculative phrasing missing", p.contains("משוערת"))
+        assertTrue("JSON format missing", p.contains("\"s\":\"A\""))
+        assertTrue(p.contains(oneListenerMarker))
+    }
+
+    @Test
+    fun twoTruthsLie_is_remembered_in_the_ring() = runTest {
+        val reply = """[{"s":"A","t":"שתיים נכונות, אחת שקר."},{"s":"B","t":"הראשונה שקר."},{"s":"A","t":"נראה אחרי השיר. מוזיקה!"}]"""
+        val client = FakeLlmClient(listOf(reply))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTwoTruthsLie(nxt, ctx = DjContext())
+        assertEquals(1, brain.recentLinesSnapshot().size)
+    }
+
+    // ---- byte-identity lock: new fun segments off => old prompts unchanged --
+
+    @Test
+    fun new_fun_segment_fragments_absent_from_legacy_prompts() = runTest {
+        val client = FakeLlmClient(listOf("שלום"))
+        val brain = DjBrain(client, persona = "דני")
+        val ctx = DjContext(timeStr = "08:00", partOfDay = "בוקר", weather = "שמשי")
+        brain.writeBreak(prev, nxt, beat = "song", ctx = ctx, seconds = 8.0)
+        brain.writeBreak(prev, nxt, beat = "weather", ctx = ctx, seconds = 8.0)
+        brain.writeOpening(nxt = nxt, ctx = ctx, seconds = 10.0)
+        val funMarkers = listOf(
+            "הקוויזמאסטר", "שים לב לרגע ב", "שתי אמיתות ושקר",
+            DjBrain.SIDEKICK_PERSONAS[1], DjBrain.SIDEKICK_PERSONAS[2],
+        )
+        client.prompts.forEachIndexed { idx, p ->
+            funMarkers.forEach { m ->
+                assertFalse("prompt #$idx unexpectedly contains fun fragment: $m", p.contains(m))
+            }
+        }
+    }
+
+    // ---- BUG 1: dangling song-name guard (2026-06-13) -----------------------
+
+    @Test
+    fun danglingName_true_for_trailing_connectors_and_amp() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        // ends on the broken "עם של" phrase
+        assertTrue(brain.danglingName("תירגע רגע עם של"))
+        // bare trailing connectors (with and without trailing punctuation)
+        assertTrue(brain.danglingName("קח אוויר עם של."))
+        assertTrue(brain.danglingName("בוא תוריד רגל מהגז עם."))
+        assertTrue(brain.danglingName("תעלה קצת את הווליום של"))
+        assertTrue(brain.danglingName("נראה אם יצליח לענות לך עם?"))
+        assertTrue(brain.danglingName("בוא נלמד שפה חדשה עם של"))
+        // bare trailing ampersand / standalone amp token
+        assertTrue(brain.danglingName("בוא נחלומי חלום קטן עם ה- &"))
+        assertTrue(brain.danglingName("השיר הבא הוא X & לכבוד ערב שבת"))
+        // empty quote pair
+        assertTrue(brain.danglingName("השיר הבא, \"\", מזכיר ששפה זה כלי"))
+    }
+
+    @Test
+    fun danglingName_false_for_complete_lines() = runTest {
+        val brain = DjBrain(FakeLlmClient(listOf("שלום")), persona = "דני")
+        assertFalse(brain.danglingName("תירגע רגע עם ניקלבק."))
+        assertFalse(brain.danglingName("הנה קריפ של רדיוהד, תהנה."))
+        assertFalse(brain.danglingName("בוא תקשיב לאישהשלי של צוקוש"))
+        assertFalse(brain.danglingName("ערב טוב, איזה כיף שבאת"))
+        assertFalse(brain.danglingName(""))
+        assertFalse(brain.danglingName(null))
+        // a word that merely STARTS with a connector letter is fine
+        assertFalse(brain.danglingName("בוא נשמע את עומר אדם"))
+    }
+
+    @Test
+    fun naming_beat_regenerates_once_when_first_result_is_dangling() = runTest {
+        // first reply dangles, second is complete -> method returns the complete one.
+        val client = FakeLlmClient(listOf("תירגע רגע עם של", "תירגע רגע עם ניקלבק"))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeHandover(ctx = DjContext(partOfDay = "בוקר"), nxt = nxt, seconds = 8.0)
+        assertFalse("must not air a dangling line: $out", brain.danglingName(out))
+        assertTrue("expected the regenerated complete line", out.contains("ניקלבק"))
+        // the retry prompt carried the sharper instruction
+        assertEquals(2, client.prompts.size)
+        assertTrue(client.prompts[1].contains("כתוב משפט שלם שכולל את שם השיר המלא"))
+    }
+
+    @Test
+    fun naming_beat_falls_back_clean_when_dangling_twice() = runTest {
+        // both replies dangle -> result ends cleanly, never "עם של".
+        val client = FakeLlmClient(listOf("תירגע רגע עם של", "קח אוויר עם של"))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertNotNull(out)
+        assertFalse("must not end dangling: $out", brain.danglingName(out))
+        assertFalse("must never air 'עם של'", out!!.trimEnd('.', '!', '?', ' ').endsWith("עם של"))
+        assertFalse("must not end on bare של", out.trimEnd('.', '!', '?', ' ').endsWith(" של"))
+    }
+
+    @Test
+    fun naming_beat_passes_clean_line_through_without_regen() = runTest {
+        val client = FakeLlmClient(listOf("הנה קריפ של רדיוהד, תהנה."))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeIntro(prev, nxt, seconds = 8.0)
+        assertEquals("הנה קריפ של רדיוהד, תהנה.", out)
+        assertEquals("clean line must not trigger a retry", 1, client.prompts.size)
+    }
+
+    @Test
+    fun truncation_at_budget_never_leaves_dangling_connector() = runTest {
+        // A long naming line whose name sits at the end and has NO sentence-end
+        // punctuation: finish() hard-cuts at the budget and (pre-fix) would leave
+        // a dangling "של". The guard must repair it. seconds 8.0 -> budget 20.
+        // Build: 19 filler words then "עם של ניקלבק" so the budget cut lands on של.
+        val filler = (1..19).joinToString(" ") { "מילה" }
+        val dangling = "$filler עם של ניקלבק"
+        // first call returns the long line (finish cuts the name off -> dangling);
+        // the regen returns the same kind of thing -> forces the repair fallback.
+        val client = FakeLlmClient(listOf(dangling, dangling))
+        val brain = DjBrain(client, persona = "דני")
+        val out = brain.writeBreak(prev, nxt, beat = "song", ctx = DjContext(), seconds = 8.0)
+        assertNotNull(out)
+        assertFalse("budget-truncated naming line must not dangle: $out", brain.danglingName(out))
+    }
+
+    // ---- BUG 2: strengthened plural-address ban -----------------------------
+
+    @Test
+    fun plural_address_ban_present_in_trivia_banter_handover_prompts() = runTest {
+        val client = FakeLlmClient(listOf("[]"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTrivia(nxt, ctx = DjContext())
+        brain.writeBanter(prev, nxt, ctx = DjContext())
+        brain.writeHandover(ctx = DjContext(partOfDay = "ערב"), nxt = nxt)
+        assertEquals(3, client.prompts.size)
+        client.prompts.forEachIndexed { idx, p ->
+            assertTrue("prompt #$idx missing one-listener doctrine", p.contains(oneListenerMarker))
+            assertTrue("prompt #$idx must forbid כולם as address", p.contains("\"כולם\""))
+            assertTrue("prompt #$idx must forbid אנשים as address", p.contains("\"אנשים\""))
+        }
+    }
+
+    // ---- BUG 3: forbid invented facts in trivia / good_thing ----------------
+
+    @Test
+    fun hallucination_forbid_present_in_trivia_and_goodThing_prompts() = runTest {
+        val client = FakeLlmClient(listOf("[]", "SKIP"))
+        val brain = DjBrain(client, persona = "דני")
+        brain.writeTrivia(nxt, ctx = DjContext())
+        brain.writeGoodThing(ctx = DjContext(), nxt = nxt)
+        assertEquals(2, client.prompts.size)
+        client.prompts.forEach { p ->
+            assertTrue("must forbid inventing facts/years/numbers", p.contains("אל תמציא עובדות, שנים, מספרים"))
+            assertTrue("must forbid superlatives", p.contains("הראשון/הכי"))
+            assertTrue("must steer to feeling/style", p.contains("הסגנון"))
+        }
+    }
+
 }

@@ -20,9 +20,25 @@ data class DevConfig(
     val ttsVoice: String,
     /** Second-host TTS voice for two-host banter (`gemini.tts.voice.b`). */
     val ttsVoiceB: String,
+    /**
+     * OPTIONAL per-mood voice overrides, keyed by mood key
+     * (mix / party / late_night / focus / morning), read from the optional
+     * `gemini.tts.voice.<mood>` properties. Empty when none are set; a missing
+     * key means "use the Moods.spec(mood).voiceName default". Lets us re-tune a
+     * mood's voice on-device by editing kolai_dev.properties WITHOUT
+     * recompiling Moods.kt.
+     *
+     * INTEGRATION WAVE: apply these over MoodSpec.voiceName (override wins when
+     * present), and thread the resolved voiceName into VoiceRenderer.render at
+     * the BlockRenderer call sites.
+     */
+    val moodVoices: Map<String, String>,
 ) {
     companion object {
         private const val ASSET = "kolai_dev.properties"
+
+        /** Mood keys that accept a `gemini.tts.voice.<mood>` override. */
+        private val MOOD_KEYS = listOf("mix", "party", "late_night", "focus", "morning")
 
         /**
          * Load + validate the dev config from assets. Throws a clear error if the
@@ -44,6 +60,15 @@ data class DevConfig(
                 "kolai_dev.properties has no gemini.key.* values"
             }
 
+            // OPTIONAL per-mood voice overrides: only moods with a non-blank
+            // gemini.tts.voice.<mood> property land in the map; everything else
+            // falls back to the Moods default downstream.
+            val moodVoices = MOOD_KEYS.mapNotNull { mood ->
+                props.getProperty("gemini.tts.voice.$mood")?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?.let { mood to it }
+            }.toMap()
+
             return DevConfig(
                 geminiKeys = keys,
                 llmModel = props.getProperty("gemini.llm.model")?.trim()
@@ -56,6 +81,7 @@ data class DevConfig(
                 // working and banter just uses the stock co-host voice.
                 ttsVoiceB = props.getProperty("gemini.tts.voice.b")?.trim()
                     ?.takeIf { it.isNotEmpty() } ?: "Iapetus",
+                moodVoices = moodVoices,
             )
         }
     }

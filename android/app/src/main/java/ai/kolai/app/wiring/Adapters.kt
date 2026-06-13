@@ -54,26 +54,36 @@ class GeminiLlmClient(
 class VoiceRendererAdapter(
     private val inner: VoiceVoiceRenderer,
 ) : StationVoiceRenderer {
-    override fun render(text: String, style: String?): DJSlot =
-        runBlocking { inner.render(text, style = style) }
+    /**
+     * [voiceName] (2026-06-13, per-mood voice) forwards as the :voice
+     * renderer's [voiceOverride] - the EFFECTIVE mood's main-host voice
+     * resolved in [BlockRenderer] - so the host voice tracks the mood. Null
+     * keeps the synth's constructor voice. The :voice cache key already folds
+     * in the voice + style, so distinct moods never reuse a WAV.
+     */
+    override fun render(text: String, style: String?, voiceName: String?): DJSlot =
+        runBlocking { inner.render(text, voiceOverride = voiceName, style = style) }
 
     /**
      * TWO-HOST DIALOGUE (wave 4): bridge the :station dialogue seam to the
      * :voice multi-speaker renderer (one Gemini multi-speaker TTS call), same
-     * runBlocking bridge as [render]. On ANY failure (network, TTS refusal,
-     * parse error, ...) fall back to the seam's DEFAULT single-voice behavior:
-     * the turns flattened via [joinDialogue] and spoken through [render] - so
-     * a broken dialogue call degrades to the pre-wave-3 substitute break
-     * instead of killing the block render.
+     * runBlocking bridge as [render]. [voiceA] (the block's mood voice) is the
+     * lead host; [voiceB] is the sidekick. On ANY failure (network, TTS
+     * refusal, parse error, ...) fall back to the seam's DEFAULT single-voice
+     * behavior: the turns flattened via [joinDialogue] and spoken through
+     * [render] CARRYING the mood [voiceA] - so a broken dialogue call degrades
+     * to the pre-wave-3 substitute break (in the right voice) instead of
+     * killing the block render.
      */
     override fun renderDialogue(
         turns: List<Pair<String, String>>,
         voiceB: String,
         style: String?,
+        voiceA: String?,
     ): DJSlot = try {
-        runBlocking { inner.renderDialogue(turns, voiceB = voiceB, style = style) }
+        runBlocking { inner.renderDialogue(turns, voiceB = voiceB, style = style, voiceA = voiceA) }
     } catch (e: Throwable) {
-        render(joinDialogue(turns), style)
+        render(joinDialogue(turns), style, voiceA)
     }
 }
 

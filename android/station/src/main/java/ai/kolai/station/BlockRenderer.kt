@@ -1,10 +1,12 @@
 package ai.kolai.station
 
+import ai.kolai.analyze.VocalOnset
 import ai.kolai.analyze.refineOutroStart
 import ai.kolai.core.Song
 import ai.kolai.mix.Dsp
 import ai.kolai.mix.StationIdent
 import ai.kolai.mix.voiceBroadcastChain
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -122,6 +124,23 @@ class BlockRenderer(
     // dispatcher for the parallel song loads (feature 14b); injectable so tests
     // can pin it, defaults to IO because fetch/decode are blocking I/O.
     private val loadDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    // PER-MOOD VOICE resolver (2026-06-13): mood key -> the prebuilt Gemini
+    // voice name for the main host. Default = the Moods spec voice; the :app
+    // wiring overrides it with DevConfig.moodVoices so a per-mood voice picked
+    // in kolai_dev.properties wins over the Moods default. Resolved for the
+    // EFFECTIVE mood (mix included) so the host ALWAYS has a real voice.
+    private val moodVoice: (String?) -> String = { Moods.spec(it).voiceName },
+    // SIDEKICK voices (2026-06-13): rotated alongside the banter sidekick
+    // PERSONA so successive two-host bits use a distinct co-host voice. Index
+    // wraps modulo the list; empty -> always the single constructor [voiceB].
+    private val sidekickVoices: List<String> = emptyList(),
+    // VOCAL-ONSET seam (task 3, 2026-06-13): (conditioned mono PCM, sr) -> the
+    // safe instrumental window (s) at the song's start. Defaults to the real
+    // :analyze VocalOnset; injectable so tests pin a known window (e.g. ~0 to
+    // assert the opener is suppressed) without crafting bespoke PCM.
+    private val safeIntroFn: (FloatArray, Int) -> Double = { audio, sr ->
+        VocalOnset.safeIntroWindowS(audio, sr)
+    },
 ) {
     // CROSS-BLOCK cadence state. Start "since talk" high so block 0 opens with a
     // DJ intro and the first real boundary is eligible to talk. Python uses
@@ -138,6 +157,15 @@ class BlockRenderer(
     // null / unknown -> default delivery, existing behavior). Consumed by the
     // voice.render call sites in [render].
     private var blockTtsStyle: String? = null
+    // PER-MOOD VOICE for the CURRENT block (2026-06-13): the main-host Gemini
+    // voice, set once per block in [planFor] from the EFFECTIVE mood (mix
+    // included via [moodVoice]) so the DJ always has a real voice. Consumed by
+    // the voice.render / renderDialogue call sites in [render].
+    private var blockVoice: String? = null
+    // BANTER sidekick rotation (2026-06-13): a per-renderer counter advanced
+    // each time a banter actually airs, so successive banters rotate across
+    // [DjBrain.sidekickPersonaCount] personas (and [sidekickVoices] if set).
+    private var sidekickRot: Int = 0
     // last hourly-anchor beat that fired ("news"/"weather"), cleared once a beat
     // is chosen outside any anchor window -> each anchor fires at most once per
     // window (deviation 4 above).
@@ -159,6 +187,40 @@ class BlockRenderer(
     // banter turns planned for boundary i of the CURRENT block (feature 11):
     // planFor fills it, render consumes it; cleared at the top of planFor.
     private val pendingBanter = HashMap<Int, List<Pair<String, String>>>()
+    // FUN-SEGMENT two-host turns planned for boundary i (2026-06-13): trivia
+    // (beat "trivia"). Same render-time dialogue handling as banter; cleared
+    // at the top of planFor.
+    private val pendingDialogue = HashMap<Int, List<Pair<String, String>>>()
+    // The sidekick voiceB chosen for the two-host bit at boundary i (banter
+    // persona rotation, 2026-06-13): when [sidekickVoices] is set, banter
+    // rotates the co-host voice alongside the persona; render reads it here.
+    // Absent -> render uses the single constructor [voiceB].
+    private val pendingSidekickVoice = HashMap<Int, String>()
+    // last trivia bit that actually aired (2026-06-13); rare latch. A SKIP
+    // (empty turns) does NOT consume it.
+    private var lastTriviaMs: Long? = null
+    // last listening-cue that actually aired (2026-06-13); rare latch. A SKIP
+    // ("" cue) does NOT consume it.
+    private var lastCueMs: Long? = null
+    // PER-SONG SAFE-INTRO WINDOW (s), keyed by the loaded track's path (task 3,
+    // 2026-06-13): the [VocalOnset.safeIntroWindowS] of each decoded song,
+    // computed once in [loadTracks] (the only place the decoded PCM lives).
+    // [planFor]'s opener (block 0 + back-announce) and [render]'s mid-block
+    // intro talk-over both read it so the DJ never talks over a singer. Keyed
+    // by path because paths are unique within a setlist and LoadedTrack is a
+    // shared type we do not extend.
+    // ConcurrentHashMap (not HashMap): [loadTracks] populates this from
+    // parallel [Dispatchers.IO] coroutines (capped at [LOAD_CONCURRENCY]), so
+    // concurrent put() must be safe - a plain HashMap can drop/lose an entry
+    // under a colliding put, which would make a missing key read back as the
+    // POSITIVE_INFINITY default and wrongly arm the opener (data race).
+    private val safeIntroByPath = ConcurrentHashMap<String, Double>()
+
+    /** The decoded song's safe instrumental window at its start (s); +inf when
+     *  unknown so callers treat "no info" as not-a-constraint (the introEndS
+     *  budget still governs). */
+    private fun safeIntroFor(track: LoadedTrack): Double =
+        safeIntroByPath[track.path] ?: Double.POSITIVE_INFINITY
 
     private fun latchOpen(lastMs: Long?, spacingMs: Long): Boolean =
         lastMs == null || nowMs() - lastMs >= spacingMs
@@ -244,6 +306,9 @@ class BlockRenderer(
      *     trimmed edge is what gets faded to exactly zero).
      */
     suspend fun loadTracks(songs: List<Song>): List<LoadedTrack> = coroutineScope {
+        // VOCAL-ONSET cache is per-load (task 3): clear so a path reused across
+        // blocks never serves a stale window.
+        safeIntroByPath.clear()
         val gate = Semaphore(LOAD_CONCURRENCY)
         songs.map { song ->
             async(loadDispatcher) {
@@ -256,6 +321,13 @@ class BlockRenderer(
                                 sr = Dsp.SR,
                             )
                         )
+                        // VOCAL-ONSET (task 3, 2026-06-13): measure the safe
+                        // instrumental window at this song's start on the
+                        // CONDITIONED PCM (the audio the listener hears), so the
+                        // opener / intro talk-over never lands over a singer.
+                        // Computed here because loadTracks is the only place the
+                        // decoded PCM exists. SAFETY-biased inside VocalOnset.
+                        safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
                         LoadedTrack(song, analyzeFn(path), audio, path)
                     } catch (e: CancellationException) {
                         throw e // cooperative cancellation must propagate
@@ -298,9 +370,25 @@ class BlockRenderer(
         val maxSilence = moodSpec?.maxSilence ?: this.maxSilence
         val talkChance = moodSpec?.talkChance ?: this.talkChance
         val banterChance = moodSpec?.banterChance ?: this.banterChance
-        blockTtsStyle = moodSpec?.ttsStyle?.takeIf { it.isNotBlank() }
+        // VOICE + DELIVERY from the EFFECTIVE mood (task 1 + 2, 2026-06-13).
+        // CRITICAL FIX: a null ctx.mood means "mix" (LiveDjContext maps the
+        // default mood -> null), and the OLD code then left BOTH style and
+        // voice null, so the default/daytime DJ had no delivery and no voice
+        // (the "mix applies no style/voice" bug). We now resolve voice + style
+        // from the effective mood, treating null AS "mix" for voice/style
+        // ONLY, so the DJ always has a real (calm Algieba) voice + calm
+        // delivery. The CADENCE path above is deliberately UNCHANGED: a null
+        // mood still uses the constructor cadence defaults (which are
+        // numerically identical to "mix": talkChance 0.5 / banterChance 0.2 /
+        // maxSilence 4), and the DjBrain moodLine/cadence path stays exactly as
+        // before for null mood (mix djLine == "").
+        val effectiveMood = ctx.mood ?: Moods.DEFAULT
+        blockVoice = moodVoice(effectiveMood)
+        blockTtsStyle = Moods.spec(effectiveMood).ttsStyle.takeIf { it.isNotBlank() }
         val events = ArrayList<PlanEvent>()
         pendingBanter.clear()
+        pendingDialogue.clear()
+        pendingSidekickVoice.clear()
 
         // DAY-PART HANDOVER arming (feature 8): a partOfDay change vs the
         // previous block arms ONE handover for this block first
@@ -311,15 +399,25 @@ class BlockRenderer(
         if (ctx.partOfDay != null) lastPartOfDay = ctx.partOfDay
 
         // ---- block opening ------------------------------------------------
+        // VOCAL-ONSET GUARD (task 3, 2026-06-13): the opener is placed OVER
+        // song 0's intro (see [render]). If song 0 starts singing (almost)
+        // immediately - safe instrumental window < [SAFE_INTRO_MIN_S] - the DJ
+        // must NOT talk over its opening. There is no previous-song outro
+        // inside THIS block to move the opener onto, so we SKIP the opener; the
+        // first eligible boundary (which rides the OUTGOING song's outro, the
+        // safe placement) still carries the DJ. recapBrief openings keep their
+        // own budget but are guarded too. We never block the opener purely on
+        // the introEndS budget - only the true vocal onset.
+        val openerSafe = safeIntroFor(tracks[0]) >= SAFE_INTRO_MIN_S
         val firstSong = tracks[0].song
         if (prevTrack != null) {
             val prevSong = prevTrack.song
             val openCtx = gatedCtx(ctx)
-            val text = brain.writeBreak(
+            val text = if (openerSafe) brain.writeBreak(
                 prev = prevSong, nxt = firstSong, beat = "song", ctx = openCtx,
                 seconds = openingSeconds(tracks[0], openingStartS, defaultS = 8.0),
                 topic = null, allowSkip = false,
-            )
+            ) else null
             if (!text.isNullOrEmpty()) {
                 events.add(PlanEvent(kind = "open", i = 0, text = text))
                 recordTalk(openCtx)
@@ -335,10 +433,11 @@ class BlockRenderer(
             // deliberately not applied; the duck/timing math in [render]
             // already follows the actual clip duration.
             val openCtx = gatedCtx(ctx)
-            val text = if (openCtx.recapBrief != null) {
-                brain.writeRecapOpening(nxt = firstSong, ctx = openCtx, seconds = 20.0)
-            } else {
-                brain.writeOpening(
+            val text = when {
+                !openerSafe -> ""
+                openCtx.recapBrief != null ->
+                    brain.writeRecapOpening(nxt = firstSong, ctx = openCtx, seconds = 20.0)
+                else -> brain.writeOpening(
                     nxt = firstSong, ctx = openCtx,
                     seconds = openingSeconds(tracks[0], openingStartS, defaultS = 10.0),
                 )
@@ -391,6 +490,27 @@ class BlockRenderer(
                     didTalk = true
                 }
             }
+            // 3) TRIVIA (2026-06-13, fun segment): a rare two-host quiz bit
+            // that REPLACES an eligible boundary break (never adds one), at
+            // most once per [TRIVIA_SPACING_MS], never on somber days and never
+            // in the session first block. Non-empty turns render through the
+            // dialogue seam (voiceB) when configured, else joined single-voice;
+            // an empty result (SKIP) does NOT consume the latch and falls
+            // through to the normal beat logic. Subordinate to the sparse-talk
+            // law: it only fires where a break was already eligible.
+            if (eligible && !didTalk && prevTrack != null && !ctx.somber &&
+                latchOpen(lastTriviaMs, TRIVIA_SPACING_MS)
+            ) {
+                val tCtx = gatedCtx(ctx)
+                val turns = brain.writeTrivia(nxt = tracks[i].song, ctx = tCtx)
+                if (turns.isNotEmpty()) {
+                    pendingDialogue[i] = turns
+                    events.add(PlanEvent(kind = "break", i = i, text = joinDialogue(turns), beat = "trivia"))
+                    recordTalk(tCtx)
+                    lastTriviaMs = nowMs()
+                    didTalk = true
+                }
+            }
             if (eligible && !didTalk) {
                 val wantBanter = (
                     (forced && talkCount % banterEvery == banterEvery - 1) ||
@@ -407,9 +527,24 @@ class BlockRenderer(
                     // falls back to the pre-existing single-voice substitute
                     // break below.
                     val bCtx = gatedCtx(ctx)
-                    val turns = brain.writeBanter(prev = tracks[i - 1].song, nxt = tracks[i].song, ctx = bCtx)
+                    // PERSONA ROTATION (2026-06-13): rotate the sidekick across
+                    // [DjBrain.sidekickPersonaCount] so successive banters use a
+                    // different co-host; the counter advances only when a banter
+                    // actually airs (below). The persona TEXT rotation is the
+                    // priority; the voiceB rotation ([sidekickVoices]) is best-
+                    // effort (empty list -> the single constructor voiceB).
+                    val sidekickIndex = sidekickRot
+                    val turns = brain.writeBanter(
+                        prev = tracks[i - 1].song, nxt = tracks[i].song,
+                        ctx = bCtx, seconds = 14.0, sidekickIndex = sidekickIndex,
+                    )
                     if (turns.isNotEmpty()) {
                         pendingBanter[i] = turns
+                        if (sidekickVoices.isNotEmpty()) {
+                            pendingSidekickVoice[i] =
+                                sidekickVoices[Math.floorMod(sidekickIndex, sidekickVoices.size)]
+                        }
+                        sidekickRot += 1
                         events.add(PlanEvent(kind = "break", i = i, text = joinDialogue(turns), beat = "banter"))
                         recordTalk(bCtx)
                         didTalk = true
@@ -431,32 +566,54 @@ class BlockRenderer(
                     val beat = nextBeat()
                     val seconds = if (forced) 18.0 else 9.0
                     val bCtx = gatedCtx(ctx)
-                    // TASTE WINK (feature 9): on a song-beat break, when the
-                    // next song is a taste pick and no wink-enabled intro
-                    // happened for [TASTE_WINK_SPACING_MS], use the intro path
-                    // (writeIntro - no SKIP, a favorite is worth a word) with
-                    // the wink allowed; the brain still gates
-                    // rank < TASTE_WINK_MAX_RANK. The latch is recorded on
-                    // ENABLING, not on render/rank success - simpler, fine.
-                    val wink = beat == "song" && tracks[i].song.tasteRank != null &&
-                        latchOpen(lastWinkMs, TASTE_WINK_SPACING_MS)
-                    val text = if (wink) {
-                        lastWinkMs = nowMs()
-                        brain.writeIntro(
-                            prev = tracks[i - 1].song, nxt = tracks[i].song,
-                            seconds = seconds, ctx = bCtx, allowTasteWink = true,
-                        )
+                    // LISTENING CUE (2026-06-13, fun segment): occasionally a
+                    // song-beat intro becomes a single warm "listen for this
+                    // moment in the song" line - rare ([LISTENING_CUE_SPACING_MS]),
+                    // not somber, not block 0, song-beat only. SKIP-gated in the
+                    // brain ("" = nothing real to point at): a "" REPLACES
+                    // nothing and falls through to the normal intro/wink/break
+                    // below, and does NOT consume the latch. When it fires it
+                    // REPLACES the normal song intro (does not add a break).
+                    val cue = if (beat == "song" && prevTrack != null && !ctx.somber &&
+                        latchOpen(lastCueMs, LISTENING_CUE_SPACING_MS)
+                    ) {
+                        brain.writeListeningCue(nxt = tracks[i].song, ctx = bCtx)
                     } else {
-                        brain.writeBreak(
-                            prev = tracks[i - 1].song, nxt = tracks[i].song, beat = beat,
-                            ctx = bCtx, seconds = seconds, topic = topic,
-                            allowSkip = !forced,
-                        )
+                        ""
                     }
-                    if (!text.isNullOrEmpty()) {
-                        events.add(PlanEvent(kind = "break", i = i, text = text, beat = beat))
+                    if (cue.isNotEmpty()) {
+                        lastCueMs = nowMs()
+                        events.add(PlanEvent(kind = "break", i = i, text = cue, beat = "cue"))
                         recordTalk(bCtx)
                         didTalk = true
+                    } else {
+                        // TASTE WINK (feature 9): on a song-beat break, when the
+                        // next song is a taste pick and no wink-enabled intro
+                        // happened for [TASTE_WINK_SPACING_MS], use the intro path
+                        // (writeIntro - no SKIP, a favorite is worth a word) with
+                        // the wink allowed; the brain still gates
+                        // rank < TASTE_WINK_MAX_RANK. The latch is recorded on
+                        // ENABLING, not on render/rank success - simpler, fine.
+                        val wink = beat == "song" && tracks[i].song.tasteRank != null &&
+                            latchOpen(lastWinkMs, TASTE_WINK_SPACING_MS)
+                        val text = if (wink) {
+                            lastWinkMs = nowMs()
+                            brain.writeIntro(
+                                prev = tracks[i - 1].song, nxt = tracks[i].song,
+                                seconds = seconds, ctx = bCtx, allowTasteWink = true,
+                            )
+                        } else {
+                            brain.writeBreak(
+                                prev = tracks[i - 1].song, nxt = tracks[i].song, beat = beat,
+                                ctx = bCtx, seconds = seconds, topic = topic,
+                                allowSkip = !forced,
+                            )
+                        }
+                        if (!text.isNullOrEmpty()) {
+                            events.add(PlanEvent(kind = "break", i = i, text = text, beat = beat))
+                            recordTalk(bCtx)
+                            didTalk = true
+                        }
                     }
                 }
             }
@@ -490,16 +647,28 @@ class BlockRenderer(
      *    unchanged (an opening has no outgoing audio inside this block to fall
      *    back onto; the boundary breaks are already outro-placed).
      *
-     * NOTE (wave 4 / DJ-content): only the TIMING math lives here - which
-     * brain function gets called may be refined by the DJ-content wave.
-     * vocalOnsetS is deliberately NOT consulted (it is currently junk, ~first
-     * beat); introEndS is the usable intro hint.
+     * VOCAL-ONSET (task 3, 2026-06-13): the usable intro is the MIN of the
+     * Essentia introEndS-based value AND the [VocalOnset.safeIntroWindowS] of
+     * this song (carried in [safeIntroByPath]). The opener is only EMITTED at
+     * all when the safe window >= [SAFE_INTRO_MIN_S] (gated in [planFor]), so
+     * here we just additionally shorten the budget so the DJ finishes before
+     * the (possibly earlier-than-introEnd) vocal entry.
      */
     private fun openingSeconds(track: LoadedTrack, startS: Double, defaultS: Double): Double {
         val introEnd = track.analysis.introEndS
         val durS = track.audio.size.toDouble() / Dsp.SR
-        if (!introEnd.isFinite() || introEnd <= OPENING_INTRO_MIN_S || introEnd >= durS) return defaultS
-        val usable = introEnd - startS - OPENING_TAIL_GUARD_S
+        // The vocal onset bounds how much instrumental bed is REALLY available.
+        val safe = safeIntroFor(track)
+        if (!introEnd.isFinite() || introEnd <= OPENING_INTRO_MIN_S || introEnd >= durS) {
+            // no usable introEnd hint: fall back to the safe-window clamp alone.
+            if (!safe.isFinite()) return defaultS
+            val usableV = safe - startS - OPENING_TAIL_GUARD_S
+            return if (usableV < OPENING_MIN_USABLE_S) defaultS else minOf(defaultS, usableV)
+        }
+        // combine the introEnd hint with the vocal-onset safe window (whichever
+        // is the tighter constraint on where the singer enters).
+        val window = if (safe.isFinite()) minOf(introEnd, safe) else introEnd
+        val usable = window - startS - OPENING_TAIL_GUARD_S
         if (usable < OPENING_MIN_USABLE_S) return defaultS
         return minOf(defaultS, usable)
     }
@@ -624,7 +793,8 @@ class BlockRenderer(
         // opening talkover (if any) - DJ over the intro of song 0
         val opening = events.firstOrNull { it.kind == "open" }
         if (opening != null) {
-            val slot = voice.render(opening.text!!, style = blockTtsStyle)
+            // PER-MOOD VOICE (task 1): the opening rides the block's mood voice.
+            val slot = voice.render(opening.text!!, style = blockTtsStyle, voiceName = blockVoice)
             val djAudio = prepareVoice(slot.audioPath)
             val djDur = djAudio.size.toDouble() / Dsp.SR
             val startS = openingDuckStartS
@@ -682,12 +852,23 @@ class BlockRenderer(
                 // DEFAULT body is still single-voice). Without a voiceB the
                 // joined script (the event text) renders single-voice - the
                 // pre-wave-3 substitute behavior.
-                val banterTurns =
-                    if (talkEvent.beat == "banter") pendingBanter.remove(i) else null
-                val slot = if (banterTurns != null && voiceB != null) {
-                    voice.renderDialogue(banterTurns, voiceB, style = blockTtsStyle)
+                // A "banter" or "trivia" beat carries planned two-host turns
+                // (banter in [pendingBanter], trivia in [pendingDialogue]); with
+                // a configured co-host voice they render through the dialogue
+                // seam, with the MAIN host on the block's mood voice ([voiceA] =
+                // blockVoice) and the sidekick on the rotated voiceB (banter)
+                // or the constructor [voiceB]. Without a voiceB the joined
+                // script renders single-voice in the mood voice.
+                val dialogueTurns = when (talkEvent.beat) {
+                    "banter" -> pendingBanter.remove(i)
+                    "trivia" -> pendingDialogue.remove(i)
+                    else -> null
+                }
+                val sidekick = pendingSidekickVoice.remove(i) ?: voiceB
+                val slot = if (dialogueTurns != null && sidekick != null) {
+                    voice.renderDialogue(dialogueTurns, sidekick, style = blockTtsStyle, voiceA = blockVoice)
                 } else {
-                    voice.render(talkEvent.text!!, style = blockTtsStyle)
+                    voice.render(talkEvent.text!!, style = blockTtsStyle, voiceName = blockVoice)
                 }
                 val djAudio = prepareVoice(slot.audioPath)
                 val djDur = djAudio.size.toDouble() / Dsp.SR
@@ -812,5 +993,22 @@ class BlockRenderer(
         const val GOOD_THING_SPACING_MS: Long = 3L * 60L * 60_000L
         /** Min spacing (ms) between on-air calendar-note mentions (feature 7). */
         const val CALENDAR_MENTION_SPACING_MS: Long = 90L * 60_000L
+
+        // ---- fun-segment latches (2026-06-13) -------------------------------
+        /** Min spacing (ms) between trivia bits - rare (~2.5 h). */
+        const val TRIVIA_SPACING_MS: Long = 150L * 60_000L
+        /** Min spacing (ms) between listening-cue intros (~1.5 h). */
+        const val LISTENING_CUE_SPACING_MS: Long = 90L * 60_000L
+
+        // ---- vocal-onset talk-over guard (2026-06-13, task 3) ---------------
+        /**
+         * Minimum SAFE instrumental window (s) at a song's start for the DJ to
+         * be allowed to open/intro OVER it. Below this, the song starts singing
+         * (almost) immediately, so the opener falls back to the previous song's
+         * outro or is skipped, and a mid-block intro talk-over is not placed
+         * over this song's head. The :analyze VocalOnset is SAFETY-biased
+         * (under-reports), so this threshold pairs with that bias.
+         */
+        const val SAFE_INTRO_MIN_S: Double = 5.0
     }
 }
