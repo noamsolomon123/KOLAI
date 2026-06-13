@@ -110,6 +110,23 @@ class KolaiMediaService : MediaLibraryService() {
     @Volatile private var lastAdvanced = -1
     @Volatile private var startedForeground = false
 
+    // PENDING-SKIP intent ("skip as soon as the next block is ready"):
+    // SegmentSkipPlayer.doNext() used to SILENTLY no-op when the user skipped at
+    // the END of the current block while the NEXT block had not been fed to the
+    // player yet (most acute on block 0 -- a single song -- right after tune-in:
+    // doNext finds no next segment in-block and hasNextMediaItem()==false). The
+    // user perceived "skip doesn't work". Instead, doNext now records this intent
+    // and the feed loop, the MOMENT it appends the next block, honours it by
+    // seeking straight to that freshly-added block. This converts a dead button
+    // into "skip the instant the next block lands" (a few seconds, shrinking with
+    // the render-speed work in parallel) WITHOUT ever risking a silence gap: we
+    // only auto-advance when a real, ready item has just been added. It is
+    // cleared whenever the player naturally moves on (a transition supersedes the
+    // request) so it can never fire stale, and it gracefully expires when the
+    // engine genuinely has nothing more (last block / true frontier): no item is
+    // ever added, so the intent simply never fires.
+    @Volatile private var pendingSkip = false
+
     // Last song mirrored into the CURRENT media item's MediaMetadata (car /
     // lock screen). Mirrors KolaiState's idempotence: we only touch the player
     // when the active segment actually changes the song.
@@ -469,6 +486,9 @@ class KolaiMediaService : MediaLibraryService() {
                             player.prepare()
                             player.playWhenReady = true
                             player.play()
+                            // The first fed block IS where playback starts, so any
+                            // skip armed during the cold render is now satisfied.
+                            pendingSkip = false
                             Log.i(TAG, "block $idx (first fed) added -> prepare()+play() (honoring tap)")
                         } else if (player.playbackState == Player.STATE_IDLE) {
                             // Defensive: never force play on a later block.
@@ -494,6 +514,30 @@ class KolaiMediaService : MediaLibraryService() {
                             Log.w(TAG, "block $idx added into ENDED playlist -> seekTo($addedIndex,0)+play() (drain recovery)")
                             player.seekTo(addedIndex, 0)
                             player.prepare()
+                            player.play()
+                            // The drain-recovery seek already lands on this new
+                            // block, so it equally satisfies any armed skip.
+                            pendingSkip = false
+                        } else if (pendingSkip) {
+                            // PENDING-SKIP FULFILMENT: playback is alive (not the
+                            // cold-start first-fed case above, not STATE_IDLE, and
+                            // the playlist has NOT drained to STATE_ENDED) and the
+                            // user pressed NEXT earlier while THIS block was still
+                            // rendering. The block just landed -> honour the skip
+                            // now by seeking to it instead of letting the current
+                            // song finish. The just-added item is always the LAST
+                            // one (addMediaItem appends), so we seek by POSITION
+                            // (mediaItemCount-1), never by block id, so leading
+                            // pruning can never desync it -- mirroring the
+                            // drain-recovery branch. We only reach here when a real,
+                            // ready item was just added, so there is no silence gap.
+                            pendingSkip = false
+                            val addedIndex = player.mediaItemCount - 1
+                            Log.i(TAG, "block $idx added -> honoring pending skip: seekTo($addedIndex,0)")
+                            player.seekTo(addedIndex, 0)
+                            // playWhenReady is already true here (we are mid-play);
+                            // an explicit play() keeps us robust if the user had
+                            // paused after arming the skip.
                             player.play()
                         }
                     }
@@ -573,6 +617,8 @@ class KolaiMediaService : MediaLibraryService() {
                             player.stop()
                         }
                         // 3) clear caches + UI state; show "tuning" right away.
+                        // Drop any armed skip: it belonged to the OLD station.
+                        pendingSkip = false
                         metaCache.clear()
                         lastMetaSong = null
                         KolaiState.reset()
@@ -659,6 +705,11 @@ class KolaiMediaService : MediaLibraryService() {
 
                         // 1) stop feeding so no stale (old-mood) block lands mid-swap.
                         feedJob?.cancelAndJoin()
+                        // Drop any armed skip: the buffer beyond the playing block
+                        // is being rebuilt under the new mood, so an old "skip to
+                        // the next block" intent should not fire against a freshly
+                        // re-rendered block. The user can simply press NEXT again.
+                        pendingSkip = false
                         // BUG 1a (PRIMARY -- avoid the STATE_ENDED drain entirely):
                         // do NOT strip the immediately-next ALREADY-RENDERED block.
                         // Keep the playing block N AND N+1 (already rendered, old
@@ -903,6 +954,13 @@ class KolaiMediaService : MediaLibraryService() {
 
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            // Any block transition (the player moved on by itself, by drain
+            // recovery, or by the pending-skip seek we just issued) SUPERSEDES a
+            // still-armed skip: the song the user wanted to skip is no longer the
+            // one playing. Clearing here keeps a pending skip from firing stale on
+            // the NEXT block append. (The feed loop already cleared it before its
+            // own pending-skip seekTo, so this is a harmless no-op in that case.)
+            pendingSkip = false
             val idStr = mediaItem?.mediaId ?: return
             val index = idStr.toIntOrNull() ?: return
             Log.i(TAG, "onMediaItemTransition -> block $index (reason=$reason)")
@@ -1189,8 +1247,20 @@ class KolaiMediaService : MediaLibraryService() {
             }
             // last segment (or unknown meta): advance to the next block.
             if (hasNextMediaItem()) {
+                // A next block is already fed to the player: cross to it AND drop
+                // any earlier pending-skip intent (we just satisfied it directly).
+                pendingSkip = false
                 seekToNextMediaItemRaw()
                 Log.i(TAG, "next -> next block")
+            } else {
+                // NO next block is fed yet (engine still rendering it, or true
+                // frontier). Previously this SILENTLY no-opped ("skip doesn't
+                // work"). Instead record the intent: the feed loop auto-advances
+                // to the next block the moment it lands (see startFeedLoop). If
+                // this is genuinely the last block the engine will ever produce,
+                // no item is ever added so the intent harmlessly never fires.
+                pendingSkip = true
+                Log.i(TAG, "next -> no next block fed yet; pending skip armed (advance when ready)")
             }
         }
 
