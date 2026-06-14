@@ -173,6 +173,10 @@ class KolaiEngine private constructor(
                 bpm = bpmSource,
                 genre = genreSource,
                 bannedArtists = bannedArtists,
+                // ENERGY-BASED MOOD-FIT: measured RMS lookup (energy_cache.json)
+                // demotes bangers from calm moods / ballads from party even when
+                // BPM mis-reads tempo. Cache-only; un-measured songs stay neutral.
+                energyOf = energySource::cachedEnergy,
             )
 
             // PER-MOOD VOICE resolver: an override wins, else the Moods

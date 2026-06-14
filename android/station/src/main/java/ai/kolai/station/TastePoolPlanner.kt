@@ -121,6 +121,13 @@ class TastePoolPlanner(
     // that must NEVER be picked -- filtered from BOTH the taste pool and
     // discovery. Empty disables it. Wired from DevConfig.bannedArtists.
     private val bannedArtists: Set<String> = emptySet(),
+    // ENERGY-BASED MOOD-FIT (2026-06-15): a synchronous, measured-only (Essentia
+    // RMS) energy lookup (artist,title)->energy?. null disables the per-mood
+    // ENERGY window entirely (every existing test passes null -> byte-identical).
+    // The octave-UNAMBIGUOUS complement to [bpm]: it demotes high-energy bangers
+    // from calm moods (and ballads from party) even when BPM mis-reads the tempo.
+    // Cache-only (no network/warm); an un-measured song is NEUTRAL.
+    private val energyOf: ((String, String) -> Double?)? = null,
 ) : SetlistSource {
 
     private companion object {
@@ -137,6 +144,15 @@ class TastePoolPlanner(
         const val BPM_IN_WINDOW_BOOST = 3.0
         const val BPM_FAR_OUTSIDE_DEMOTE = 0.4 // gentle: BPM is a noisy assist (Essentia octave/double-time errors, e.g. a ballad read as 162bpm); the low-temp curator is the PRIMARY mood signal
         const val BPM_FAR_MARGIN = 20.0
+
+        // --- per-mood ENERGY bias (octave-UNAMBIGUOUS; calibrated on-device RMS)
+        // Energy is a RELIABLE axis (no octave error), so it demotes a bit harder
+        // than BPM: at x0.15 a banger the curator wrongly approved (x8) nets ~1.2,
+        // far below a song boosted on BOTH curator+energy (~x20) -- so it can no
+        // longer surface ahead of true mood-fits. In-window x2.5.
+        const val ENERGY_IN_WINDOW_BOOST = 2.5
+        const val ENERGY_FAR_OUTSIDE_DEMOTE = 0.15
+        const val ENERGY_FAR_MARGIN = 0.05
 
         // --- seed proximity tilt for the FIRST pick -------------------------
         const val BPM_SEED_NEAR = 8.0
@@ -299,6 +315,30 @@ class TastePoolPlanner(
                         b < lo - BPM_FAR_MARGIN || b > hi + BPM_FAR_MARGIN -> BPM_FAR_OUTSIDE_DEMOTE
                         else -> 1.0
                     }
+                }
+            }
+        }
+
+        // --- per-mood ENERGY window: CACHE-ONLY measured RMS, the octave-SAFE
+        // complement to the BPM window. Energy reads HIGH for a banger and LOW
+        // for a ballad regardless of tempo, so it catches what the noisy BPM
+        // window cannot: a ballad mis-read as double-time stays low (kept in calm
+        // moods), and a banger like "The Middle" stays high (demoted from them).
+        // [energyOf] is a synchronous measured-only lookup (no network, no warm);
+        // an un-measured song returns null -> NEUTRAL. Soft + never-shrinking.
+        if (energyOf != null && spec.hasEnergyWindow && spec.key == (mood ?: Moods.DEFAULT)) {
+            val lo = spec.energyLo!!
+            val hi = spec.energyHi!!
+            for (c in pool) {
+                val e = try {
+                    energyOf.invoke(c.track.artist, c.track.title)
+                } catch (ex: Exception) {
+                    null // an energy read must never break song selection
+                } ?: continue
+                c.weight *= when {
+                    e in lo..hi -> ENERGY_IN_WINDOW_BOOST
+                    e < lo - ENERGY_FAR_MARGIN || e > hi + ENERGY_FAR_MARGIN -> ENERGY_FAR_OUTSIDE_DEMOTE
+                    else -> 1.0
                 }
             }
         }

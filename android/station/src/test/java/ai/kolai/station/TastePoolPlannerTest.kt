@@ -743,6 +743,67 @@ class TastePoolPlannerTest {
         assertTrue("biasedFast=$biasedFast plainFast=$plainFast", biasedFast > plainFast + 30)
     }
 
+    // --- per-mood ENERGY window (octave-unambiguous mood-fit) -----------------
+
+    /** Fast tracks in party's energy window (0.18..0.50); Slow far below (0.05). */
+    private val energyMap: Map<String, Double> = mapOf(
+        "Fast A" to 0.30, "Fast B" to 0.30, "Fast C" to 0.30, "Fast D" to 0.30,
+        "Slow A" to 0.05, "Slow B" to 0.05, "Slow C" to 0.05, "Slow D" to 0.05,
+    )
+
+    @Test
+    fun per_mood_energy_window_biases_selection_toward_in_window_energy() = runTest {
+        // mood=party energy window 0.18..0.50: high-energy "Fast" tracks must open
+        // far more often WITH the energy lookup than the energy-blind planner.
+        var biasedFast = 0
+        var plainFast = 0
+        for (seed in 0 until 200) {
+            val withE = TastePoolPlanner(
+                rng = kotlin.random.Random(seed),
+                energyOf = { _, title -> energyMap[title] },
+            ).plan(tempoTaste, n = 1, mood = "party").single()
+            if (withE.title.startsWith("Fast")) biasedFast++
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "party").single()
+            if (plain.title.startsWith("Fast")) plainFast++
+        }
+        // x2.5 in-window vs x0.15 far-outside is a ~16x odds tilt per track.
+        assertTrue("biasedFast=$biasedFast", biasedFast >= 150)
+        assertTrue("biasedFast=$biasedFast plainFast=$plainFast", biasedFast > plainFast + 30)
+    }
+
+    @Test
+    fun energy_window_demotes_high_energy_from_late_night() = runTest {
+        // late_night energy window 0.0..0.14: Slow (0.05) is in-window, Fast (0.30)
+        // is far above -> the opener must be Slow far more than the blind ~50%.
+        // This is the octave-safe fix for bangers (e.g. The Middle) leaking into
+        // calm moods past the BPM window.
+        var slow = 0
+        for (seed in 0 until 200) {
+            val withE = TastePoolPlanner(
+                rng = kotlin.random.Random(seed),
+                energyOf = { _, title -> energyMap[title] },
+            ).plan(tempoTaste, n = 1, mood = "late_night").single()
+            if (withE.title.startsWith("Slow")) slow++
+        }
+        assertTrue("slow=$slow", slow >= 150)
+    }
+
+    @Test
+    fun mix_mood_applies_no_energy_window_bias() = runTest {
+        // "mix" has no energy window: even WITH a lookup, n=1 picks must match the
+        // energy-blind planner.
+        for (seed in 0 until 20) {
+            val withE = TastePoolPlanner(
+                rng = kotlin.random.Random(seed),
+                energyOf = { _, title -> energyMap[title] },
+            ).plan(tempoTaste, n = 1, mood = "mix").single()
+            val plain = TastePoolPlanner(rng = kotlin.random.Random(seed))
+                .plan(tempoTaste, n = 1, mood = "mix").single()
+            assertEquals("rng seed $seed", plain.title, withE.title)
+        }
+    }
+
     @Test
     fun mix_mood_applies_no_window_bias() = runTest {
         // "mix" has no BPM window: even WITH a source, picks must match the

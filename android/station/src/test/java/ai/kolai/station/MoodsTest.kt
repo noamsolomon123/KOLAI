@@ -212,4 +212,51 @@ class MoodsTest {
         assertTrue("party floor must clear late_night ceiling",
             party.bpmLo!! > lateNight.bpmHi!!)
     }
+
+    // --- per-mood ENERGY windows (octave-unambiguous mood-fit) ---------------
+
+    @Test
+    fun mix_has_no_energy_window_the_others_do() {
+        val mix = Moods.ALL.getValue("mix")
+        assertNull(mix.energyLo)
+        assertNull(mix.energyHi)
+        assertFalse("mix must NOT carry an energy window", mix.hasEnergyWindow)
+        for (key in listOf("party", "late_night", "focus", "morning")) {
+            assertTrue("$key must carry an energy window", Moods.ALL.getValue(key).hasEnergyWindow)
+        }
+    }
+
+    @Test
+    fun energy_windows_are_well_formed_and_ordered() {
+        for (spec in Moods.ALL.values) {
+            if (!spec.hasEnergyWindow) continue
+            val lo = spec.energyLo!!
+            val hi = spec.energyHi!!
+            assertTrue("${spec.key} energyLo must be >= 0", lo >= 0.0)
+            assertTrue("${spec.key} energyLo < energyHi", lo < hi)
+        }
+    }
+
+    @Test
+    fun energy_windows_match_the_chosen_per_mood_values() {
+        fun win(key: String, lo: Double, hi: Double) {
+            val s = Moods.ALL.getValue(key)
+            assertEquals("$key energyLo", lo, s.energyLo!!, 0.0)
+            assertEquals("$key energyHi", hi, s.energyHi!!, 0.0)
+        }
+        win("party", 0.18, 0.50)
+        win("late_night", 0.0, 0.14)
+        win("focus", 0.06, 0.16)
+        win("morning", 0.12, 0.19)
+    }
+
+    @Test
+    fun moods_are_energy_distinct_party_is_louder_than_late_night() {
+        // The point of the energy windows: party's loudness band sits clearly
+        // ABOVE late_night's, so a banger cannot pass as a late-night track.
+        val party = Moods.ALL.getValue("party")
+        val lateNight = Moods.ALL.getValue("late_night")
+        assertTrue("party energy floor must clear late_night ceiling",
+            party.energyLo!! > lateNight.energyHi!!)
+    }
 }

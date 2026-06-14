@@ -56,9 +56,26 @@ data class MoodSpec(
      */
     val bpmLo: Double? = null,
     val bpmHi: Double? = null,
+    /**
+     * Optional TARGET ENERGY WINDOW (Essentia RMS) -- the octave-UNAMBIGUOUS
+     * complement to [bpmLo]/[bpmHi]. BPM is octave-noisy (a slow ballad can read
+     * double-time), so a BPM window alone leaks bangers into calm moods (e.g.
+     * "The Middle" leaked into late_night). Energy (signal RMS) reads HIGH for a
+     * dense banger and LOW for a sparse ballad REGARDLESS of tempo. Calibrated
+     * from on-device measured RMS (docs/studies energy dump): ballads ~0.04-0.12,
+     * mid-pop ~0.12-0.18, bangers/rap ~0.20-0.42. Same SOFT contract as the BPM
+     * window (favored in-window, gently demoted far-outside, unknown NEUTRAL);
+     * measured-only, so it warms in as songs are analyzed. Both null (and "mix")
+     * = NO energy constraint.
+     */
+    val energyLo: Double? = null,
+    val energyHi: Double? = null,
 ) {
     /** True when this mood carries a usable target tempo window. */
     val hasBpmWindow: Boolean get() = bpmLo != null && bpmHi != null
+
+    /** True when this mood carries a usable target energy window. */
+    val hasEnergyWindow: Boolean get() = energyLo != null && energyHi != null
 }
 
 object Moods {
@@ -96,6 +113,8 @@ object Moods {
                 "NEVER be in a party set. Keep the tempo up and the floor moving",
             // Fast, danceable floor: the upper end reaches double-time pop/EDM.
             bpmLo = 118.0, bpmHi = 150.0,
+            // High-energy floor: bangers/dance read >=~0.18 RMS; ballads <0.13.
+            energyLo = 0.18, energyHi = 0.50,
         ),
         MoodSpec(
             key = "late_night",
@@ -113,6 +132,8 @@ object Moods {
                 "when in doubt toward energy, EXCLUDE. Keep it calm and slow",
             // Slowest mood: downtempo ballads / chill electronica.
             bpmLo = 60.0, bpmHi = 95.0,
+            // Lowest energy: mellow <=~0.14 RMS; demotes bangers like The Middle (0.27).
+            energyLo = 0.0, energyHi = 0.14,
         ),
         MoodSpec(
             key = "focus",
@@ -129,6 +150,8 @@ object Moods {
                 "nothing that pulls focus or makes you look up. Keep it calm and unobtrusive",
             // Steady mid-low groove: nothing jarring, nothing sleepy.
             bpmLo = 70.0, bpmHi = 110.0,
+            // Calm-but-present groove: ~0.06-0.16 RMS; demotes loud/banger >0.21.
+            energyLo = 0.06, energyHi = 0.16,
         ),
         MoodSpec(
             key = "morning",
@@ -146,6 +169,8 @@ object Moods {
                 "It) - morning is WARM, not depressing or harsh",
             // Rising-but-easy mid energy: brighter than focus, calmer than party.
             bpmLo = 90.0, bpmHi = 120.0,
+            // Bright mid energy: ~0.12-0.19 RMS; demotes sad-ballad <0.07 AND banger >0.24.
+            energyLo = 0.12, energyHi = 0.19,
         ),
     ).associateBy { it.key }
 
