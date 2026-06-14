@@ -149,7 +149,7 @@ class KolaiEngine private constructor(
             // docs/studies/findings-bpm-v3.md). LONG-LIVED so its BPM cache
             // survives across plan() calls. Best-effort: unknown BPM (the
             // ~57-70% catalog gap) is neutral and never blocks a pick.
-            val bpmSource = DeezerBpmSource(http)
+            val bpmSource = DeezerBpmSource(http, persistFile = File(cacheDir, "bpm_cache.json"))
             // SONG-FLOW COHESION (2026-06-13): a Deezer genre source feeds the
             // planner's language + genre cohesion (chaining picks into rap / jazz /
             // English RUNS), run-length-eased so a stretch ends organically.

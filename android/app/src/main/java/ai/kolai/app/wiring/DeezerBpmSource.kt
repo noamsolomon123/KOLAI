@@ -49,6 +49,10 @@ class DeezerBpmSource(
      *  single warm failure never cancels siblings and the app need not manage a
      *  lifecycle. Inject one in tests to control / await background work. */
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** Optional disk cache so resolved + MEASURED (Essentia) BPMs survive app
+     *  restarts and ACCUMULATE across runs, building a full tempo picture of the
+     *  pool for vibe-match. Null = in-memory only. */
+    private val persistFile: java.io.File? = null,
 ) : BpmSource {
 
     /** "artistLower|titleLower" -> resolved BPM. NULL VALUE = a cached "unknown"
@@ -62,6 +66,28 @@ class DeezerBpmSource(
 
     private fun keyOf(artist: String, title: String): String =
         artist.trim().lowercase() + "|" + title.trim().lowercase()
+
+    init { loadCache() }
+
+    private fun loadCache() {
+        val f = persistFile ?: return
+        try {
+            if (!f.exists()) return
+            val obj = org.json.JSONObject(f.readText())
+            val ks = obj.keys()
+            while (ks.hasNext()) { val k = ks.next(); cache[k] = obj.getDouble(k) }
+        } catch (_: Throwable) { }
+    }
+
+    @Synchronized private fun saveCache() {
+        val f = persistFile ?: return
+        try {
+            val obj = org.json.JSONObject()
+            for ((k, v) in cache) obj.put(k, v)
+            f.parentFile?.mkdirs()
+            f.writeText(obj.toString())
+        } catch (_: Throwable) { }
+    }
 
     override suspend fun bpm(artist: String, title: String): Double? {
         if (title.isBlank()) return null
@@ -103,6 +129,7 @@ class DeezerBpmSource(
             }
             cache[key] = resolved ?: UNKNOWN
             inFlight.remove(key)
+            saveCache()
             if (resolved != null) logI("warm bpm '$title' - $artist = $resolved")
         }
     }
@@ -114,6 +141,7 @@ class DeezerBpmSource(
     fun put(artist: String, title: String, bpm: Double) {
         if (title.isBlank() || bpm <= 0.0) return
         cache[keyOf(artist, title)] = bpm
+        saveCache()
     }
 
     /** Cancel the background warm scope; call from a lifecycle hook if one exists
