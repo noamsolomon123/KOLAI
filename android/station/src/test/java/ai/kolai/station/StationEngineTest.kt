@@ -507,8 +507,8 @@ class StationEngineTest {
         assertEquals(1, engine.frontierForTest())
         assertEquals(0, engine.getBlockMeta(0)?.index)
         assertTrue(blockFile(dir, 0).exists())
-        // backoff actually applied between attempts: 5s then 30s (virtual time)
-        assertEquals(35_000L, currentTime)
+        // backoff actually applied between attempts: 3s then 8s (virtual time)
+        assertEquals(11_000L, currentTime)
     }
 
     @Test
@@ -535,8 +535,8 @@ class StationEngineTest {
         assertEquals(2, calls)
         assertEquals(1, engine.frontierForTest())
         assertEquals(0, engine.getBlockMeta(0)?.index)
-        // 8min render timeout + 5s first backoff (virtual)
-        assertEquals(8 * 60_000L + 5_000L, currentTime)
+        // 8min render timeout + 3s first backoff (virtual)
+        assertEquals(8 * 60_000L + 3_000L, currentTime)
     }
 
     @Test

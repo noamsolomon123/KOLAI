@@ -78,8 +78,12 @@ class StationEngine(
     // loop keeps retrying every [failureRetryDelayMs] forever (self-recovery
     // when the network returns).
     private val renderTimeoutMs: Long = 8 * 60_000L,
-    private val renderRetryDelaysMs: List<Long> = listOf(5_000L, 30_000L, 120_000L),
-    private val failureRetryDelayMs: Long = 180_000L,
+    // Shorter backoffs (2026-06-14): "no playable tracks" means the batch failed to
+    // download; retrying the SAME songs with minute waits is dead air, so fail fast
+    // and let the run loop re-PICK different (downloadable) songs.
+    private val renderRetryDelaysMs: List<Long> = listOf(3_000L, 8_000L, 20_000L),
+    // Re-pick fast after a TOTAL render failure (was 180s = 3min dead air per cycle).
+    private val failureRetryDelayMs: Long = 15_000L,
     // THERMAL COURTESY: breather between back-to-back render-ahead renders once
     // the buffer is already comfortable (applied by the run loop only; urgent
     // getBlockPath callers never pay it).
