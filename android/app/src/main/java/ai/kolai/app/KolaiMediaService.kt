@@ -421,6 +421,12 @@ class KolaiMediaService : MediaLibraryService() {
             try {
                 // Let the cold-start opener + first block win the network first.
                 kotlinx.coroutines.delay(20_000L)
+                // Warm each track AT MOST ONCE: ~58/80 tracks have no Deezer BPM
+                // (catalog gap), so a re-warm-on-null loop re-fetches them every
+                // round forever -> runaway HTTP/heap pressure that tipped large
+                // decodes into OOM. Dedupe by attempted key; the expanding pool's
+                // NEW tracks are still picked up (not yet in `attempted`).
+                val attempted = HashSet<String>()
                 // A few rounds so the pool's background expansion (base ~20 ->
                 // ~60-80) is also covered once it lands; stop early once warm.
                 repeat(6) { round ->
@@ -432,6 +438,7 @@ class KolaiMediaService : MediaLibraryService() {
                     var requested = 0
                     for (track in pool) {
                         if (track.artist.isBlank() || track.title.isBlank()) continue
+                        if (!attempted.add((track.artist + "|" + track.title).lowercase())) continue
                         var fetched = false
                         if (genre.cachedGenre(track.artist, track.title) == null) {
                             genre.warm(track.artist, track.title); fetched = true
