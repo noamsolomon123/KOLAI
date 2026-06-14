@@ -178,7 +178,7 @@ class DjBrain(
     private fun backAnnounceLine(prev: Song?): String =
         if (prev == null) "" else
             "\n" + "אם זה יושב טוב, אפשר גם מילה קטנה על השיר שהרגע הסתיים - " +
-                "\"${prev.title}\" של ${prev.artist} - כמו שדרן שסוגר שיר באוויר. לא חובה."
+                "\"${spoken(prev.title)}\" של ${prev.artist} - כמו שדרן שסוגר שיר באוויר. לא חובה."
 
     /** NEW: raises the SKIP bar; appended right after the verbatim [skipLine]. */
     private fun skipGateLine(): String =
@@ -374,6 +374,13 @@ class DjBrain(
 
     // ---- shared prompt fragments ----------------------------------------
 
+    /** Strip a trailing parenthetical ("(2012 Remaster)", "(To Your Heart)",
+     *  "(Jammin'')") for the SPOKEN song reference, so the DJ names songs cleanly
+     *  and does not garble version/comma suffixes. The canonical Song.title is
+     *  untouched (matching + aired log use the originals); this is display-only. */
+    private fun spoken(title: String): String =
+        title.replace(Regex("""\s*\([^)]*\)\s*$"""), "").trim().ifBlank { title }
+
     private fun personaLine(): String =
         "אתה $persona, שדרן רדיו ישראלי כריזמטי, שנון ומצחיק שמדבר כמו " +
             "בנאדם אמיתי ברדיו FM - חם, אנרגטי, זורם ואנושי."
@@ -518,13 +525,13 @@ class DjBrain(
 
     private fun prompt(prev: Song?, nxt: Song, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null, allowTasteWink: Boolean = false): String {
         val prevLine = if (prev != null) {
-            "השיר שהרגע התנגן: \"${prev.title}\" של ${prev.artist}."
+            "השיר שהרגע התנגן: \"${spoken(prev.title)}\" של ${prev.artist}."
         } else {
             "זו פתיחת השידור."
         }
         return personaLine() + "\n" +
             prevLine + "\n" +
-            "עכשיו עומד להתנגן: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "עכשיו עומד להתנגן: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "כתוב קישור מדובר אל השיר הבא. ${depthLine(budget)}\n" +
             namingLine() + "\n" +
             witLine() + "\n" +
@@ -537,7 +544,7 @@ class DjBrain(
     private fun weatherPrompt(nxt: Song, ctx: DjContext, budget: Int, allowSkip: Boolean = false): String =
         personaLine() + "\n" +
             "השעה ${ctx.timeStr}, ${ctx.partOfDay}. מזג האוויר עכשיו: ${ctx.weather}.\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "שלב את השעה/מזג האוויר וזרום אל השיר הבא. ${depthLine(budget)}\n" +
             witLine() + "\n" +
             oneListenerLine() + "\n" +
@@ -547,7 +554,7 @@ class DjBrain(
     private fun newsPrompt(nxt: Song, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + "\n" +
             "כותרת חדשות עכשווית: \"$headline\".\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "הזכר בקצרה את הכותרת בניסוח שלך (לא מילה במילה) והמשך לשיר. " +
             depthLine(budget) + "\n" +
             witLine() + "\n" +
@@ -558,7 +565,7 @@ class DjBrain(
     private fun topicPrompt(nxt: Song, topic: String, headline: String, budget: Int, allowSkip: Boolean = false, ctx: DjContext? = null): String =
         personaLine() + " אתה אוהב את הנושא '$topic'.\n" +
             "כותרת עדכנית בנושא $topic: \"$headline\".\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "הזכר את החדשה בנושא $topic בניסוח שלך וזרום לשיר הבא. " +
             depthLine(budget) + "\n" +
             witLine() + "\n" +
@@ -580,7 +587,7 @@ class DjBrain(
             "קבל את פני המאזין אל השידור, והוסף שורה חמה אחת שפוגשת אותו בתוך " +
             "הרגע שלו - נסיעה בבוקר, קפה ראשון, סוף יום עבודה או שעת לילה " +
             "מאוחרת - לפי מה שמתאים לחלק היום.\n" +
-            "ומשם זרום בטבעיות אל השיר הראשון: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "ומשם זרום בטבעיות אל השיר הראשון: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             oneListenerLine() + "\n" +
             formatLine(budget) + moodLine(ctx) + calendarLine(ctx)
     }
@@ -1013,7 +1020,7 @@ class DjBrain(
             "כמו קריין. דוגמאות לתחושה (אל תצטט אותן): " +
             "\"עשר בלילה. העיר נרגעת - גם אנחנו.\" / " +
             "\"שש בערב. היום משחרר את האחיזה.\"\n" +
-            "ומשם מסור אל השיר הבא בשמו: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "ומשם מסור אל השיר הבא בשמו: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             oneListenerLine() + "\n" +
             formatLine(budget) + moodLine(ctx) + calendarLine(ctx)
     }
@@ -1053,7 +1060,7 @@ class DjBrain(
             "באמת טוב, חיובי או מרים.\n" +
             sourceLine + "\n" +
             "חובה לפתוח בדיוק במילים: \"$GOOD_THING_OPENER\" ומיד אחריהן התוכן עצמו.\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             noInventedFactsLine() + "\n" +
             oneListenerLine() + "\n" +
             skipLine() + "\n" +
@@ -1084,14 +1091,14 @@ class DjBrain(
 
     private fun banterPrompt(prev: Song?, nxt: Song, ctx: DjContext, budget: Int, sidekick: String = SIDEKICK_PERSONA): String {
         val prevLine = if (prev != null) {
-            "השיר שהרגע התנגן: \"${prev.title}\" של ${prev.artist}.\n"
+            "השיר שהרגע התנגן: \"${spoken(prev.title)}\" של ${prev.artist}.\n"
         } else {
             ""
         }
         return personaLine() + " אתה המגיש הראשי (A).\n" +
             "לידך באולפן B: $sidekick\n" +
             prevLine +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "כתבו קטע באנטר קצרצר בין A ל-B: 2-3 חילופי דברים לכל היותר, על " +
             "השיר הבא או על אבחנה קטנה אחת מהרגע - מצחיק-חם, בלי עוקצנות " +
             "אמיתית. A פותח, ו-A תמיד סוגר במסירה אל המוזיקה.\n" +
@@ -1283,7 +1290,7 @@ class DjBrain(
             "קונקרטיים מהנתונים - סיכום שבועי אישי שמוגש בקול של התחנה, הכל " +
             "בעברית בלבד, בלי אף מילה באנגלית. בחר נתון אחד מפתיע במיוחד " +
             "והבלט אותו בקריצה.\n" +
-            "ומשם זרום בטבעיות אל השיר הראשון: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "ומשם זרום בטבעיות אל השיר הראשון: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             oneListenerLine() + "\n" +
             formatLine(budget) + moodLine(ctx) + calendarLine(ctx)
 
@@ -1313,7 +1320,7 @@ class DjBrain(
     private fun triviaPrompt(nxt: Song, ctx: DjContext, budget: Int): String =
         personaLine() + " אתה המגיש הראשי (A).\n" +
             "לידך באולפן B, שדרן משנה שמשתתף במשחק.\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             QUIZMASTER_FRAMING + "\n" +
             noInventedFactsLine() + "\n" +
             "שמור על זה קצר וכיפי - 2 עד 4 חילופי דברים בלבד, לא הרצאה. " +
@@ -1348,7 +1355,7 @@ class DjBrain(
 
     private fun listeningCuePrompt(nxt: Song, ctx: DjContext, budget: Int): String =
         personaLine() + "\n" +
-            "השיר שעולה עכשיו: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר שעולה עכשיו: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "כתוב שורה חמה אחת שמכוונת את האוזן של המאזין לרגע מגניב אחד בשיר " +
             "שעומד להתנגן - הדרופ, מעבר יפה, הרמוניה, סולו, רגע שקט - " +
             "\"שים לב לרגע ב...\". טבעי לגמרי, בלי קלישאות.\n" +
@@ -1383,7 +1390,7 @@ class DjBrain(
     private fun twoTruthsLiePrompt(nxt: Song, ctx: DjContext, budget: Int): String =
         personaLine() + " אתה המגיש הראשי (A).\n" +
             "לידך באולפן B, שדרן משנה שמנחש.\n" +
-            "השיר הבא: \"${nxt.title}\" של ${nxt.artist}.\n" +
+            "השיר הבא: \"${spoken(nxt.title)}\" של ${nxt.artist}.\n" +
             "פינת \"שתי אמיתות ושקר\" קצרצרה ומשעשעת על ${nxt.artist} - האמן " +
             "של השיר הבא בלבד: A זורק שלוש אמירות שאחת מהן שקר, B מנחש איזו, " +
             "ו-A חושף ומוסר אל המוזיקה. הגבל הכל לאמן הזה, ונסח את ה'עובדות' " +
