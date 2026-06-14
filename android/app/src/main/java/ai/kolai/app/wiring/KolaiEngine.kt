@@ -150,6 +150,14 @@ class KolaiEngine private constructor(
             // survives across plan() calls. Best-effort: unknown BPM (the
             // ~57-70% catalog gap) is neutral and never blocks a pick.
             val bpmSource = DeezerBpmSource(http, persistFile = File(cacheDir, "bpm_cache.json"))
+            // ENERGY CAPTURE (2026-06-15): a measured-only (Essentia RMS) cache,
+            // fed every rendered song via onAnalyzed and persisted across runs.
+            // BPM is octave-noisy (a ballad can read double-time), so it cannot
+            // alone keep bangers out of calm moods -- "The Middle" leaked into
+            // late_night. Energy (RMS) is octave-UNAMBIGUOUS, the robust axis for
+            // mood-fit. Capturing first; the planner gate that READS it lands once
+            // enough real RMS values have accumulated to calibrate windows.
+            val energySource = MeasuredEnergySource(persistFile = File(cacheDir, "energy_cache.json"))
             // SONG-FLOW COHESION (2026-06-13): a Deezer genre source feeds the
             // planner's language + genre cohesion (chaining picks into rap / jazz /
             // English RUNS), run-length-eased so a stretch ends organically.
@@ -199,7 +207,10 @@ class KolaiEngine private constructor(
                 rng = kotlin.random.Random(System.nanoTime()),
                 // Feed measured Essentia BPM into the planner's BPM cache so
                 // mood vibe-match uses real tempo (esp. for Hebrew songs).
-                onAnalyzed = { s, a -> bpmSource.put(s.artist, s.title, a.bpm) },
+                onAnalyzed = { s, a ->
+                    bpmSource.put(s.artist, s.title, a.bpm)
+                    energySource.put(s.artist, s.title, a.energy)
+                },
             )
 
             return KolaiEngine(
