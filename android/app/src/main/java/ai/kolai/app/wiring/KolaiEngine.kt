@@ -192,6 +192,11 @@ class KolaiEngine private constructor(
                 write = true,
                 moodVoice = moodVoiceResolver,
                 sidekickVoices = sidekickVoices,
+                // Time-seeded RNG (2026-06-14) so the DJ's talk cadence + segment
+                // choices VARY each session. The default is a FIXED Random(7) (for
+                // test reproducibility), which made every launch follow the same
+                // talk/segment pattern -- the opposite of "feel different each time".
+                rng = kotlin.random.Random(System.nanoTime()),
             )
 
             return KolaiEngine(
