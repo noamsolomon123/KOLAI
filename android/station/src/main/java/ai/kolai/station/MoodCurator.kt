@@ -64,7 +64,11 @@ class MoodCurator(private val client: LlmClient) {
 
             // Ask ONLY about the unknown songs, renumbered 0..unknown.size-1;
             // the reply's indices are mapped back to the original positions.
-            val reply = client.complete(prompt(vibeHint, unknown.map { songs[it] }))
+            // Low temperature (2026-06-14): vibe-fit is a CLASSIFICATION, not
+            // creative writing. At the model default (~1.0) the verdict varied
+            // run-to-run - bangers leaked into SOME late_night blocks but not
+            // others. 0.2 makes "does this fit the vibe?" consistent + accurate.
+            val reply = client.complete(prompt(vibeHint, unknown.map { songs[it] }), 0.2)
             val fitAsked = parseIndices(reply, unknown.size) ?: return null
 
             unknown.forEachIndexed { askedIdx, originalIdx ->
@@ -85,6 +89,8 @@ class MoodCurator(private val client: LlmClient) {
         return "You are curating a radio block. Below is a numbered list of " +
             "real songs:\n" +
             listing + "\n\n" +
+            "Be STRICT: include a song ONLY if it clearly matches. The vibe " +
+            "may list things to EXCLUDE - honor those; when unsure, leave it OUT.\n" +
             "Return ONLY a JSON array of the indices of the songs that fit " +
             "this vibe: $vibeHint\n" +
             "No prose, no code fence, no explanations - just the JSON array " +
