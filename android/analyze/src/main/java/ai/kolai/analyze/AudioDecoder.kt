@@ -40,7 +40,7 @@ object AudioDecoder {
      * cap is reached. 10 min is comfortably above any real single, so a normal
      * song NEVER hits this path - it is purely a guard.
      */
-    const val MAX_DECODE_SECONDS: Int = 420
+    const val MAX_DECODE_SECONDS: Int = 300
 
     /**
      * ANALYZE-decode cap (OOM fix, 2026-06-14). BPM/key are GLOBAL song

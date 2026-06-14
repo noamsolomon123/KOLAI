@@ -371,7 +371,7 @@ class KolaiMediaService : MediaLibraryService() {
             // Reactive warm-on-miss fired AFTER the pick it would have shaped,
             // so history.genres stayed empty and genre runs never formed.
             // Background, off the cold-start path, rate-limited.
-            warmPoolGenres(taste, engine.genreSource, engine.bpmSource)
+            warmPoolGenres(taste, engine.genreSource)
 
             stationEngine = StationEngine(
                 nextSongs = rollingPlanner::nextSongs,
@@ -415,7 +415,6 @@ class KolaiMediaService : MediaLibraryService() {
     private fun warmPoolGenres(
         taste: ai.kolai.station.TasteSource,
         genre: ai.kolai.station.GenreSource,
-        bpm: ai.kolai.station.BpmSource,
     ) {
         serviceScope.launch {
             try {
@@ -443,15 +442,12 @@ class KolaiMediaService : MediaLibraryService() {
                         if (genre.cachedGenre(track.artist, track.title) == null) {
                             genre.warm(track.artist, track.title); fetched = true
                         }
-                        if (bpm.cachedBpm(track.artist, track.title) == null) {
-                            bpm.warm(track.artist, track.title); fetched = true
-                        }
                         if (fetched) {
                             requested++
                             kotlinx.coroutines.delay(400L) // gentle on Deezer
                         }
                     }
-                    Log.i(TAG, "pool meta warm round $round: $requested fetches (pool=${pool.size})")
+                    Log.i(TAG, "pool genre warm round $round: $requested fetches (pool=${pool.size})")
                     if (requested == 0 && round >= 1) return@launch
                     kotlinx.coroutines.delay(30_000L)
                 }
