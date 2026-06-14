@@ -129,15 +129,19 @@ class MoodsTest {
             Moods.ALL.getValue("late_night").curationHint,
         )
         assertEquals(
-            "steady, mellow, non-distracting songs for focus - chill, " +
-                "instrumental-leaning, lo-fi, smooth grooves, minimal vocals; " +
-                "consistent calm energy, nothing jarring",
+            "steady, mellow, non-distracting background songs for focus - chill, " +
+                "instrumental-leaning, lo-fi, smooth grooves, soft vocals. STRICTLY " +
+                "EXCLUDE high-energy/danceable, loud, aggressive, hype, or attention-" +
+                "grabbing lyric-heavy songs - nothing that pulls focus or makes you " +
+                "look up. Keep it calm, even and unobtrusive",
             Moods.ALL.getValue("focus").curationHint,
         )
         assertEquals(
             "bright, warm, uplifting mid-energy morning songs - feel-good " +
-                "pop, sunny vibes, easy upbeat tracks; a positive start to the " +
-                "day",
+                "pop, sunny vibes, easy upbeat tracks, a positive start to the day. " +
+                "EXCLUDE sad/melancholic/heartbreak ballads, dark or heavy songs, " +
+                "aggressive bangers, and slow downers - nothing depressing or harsh " +
+                "for the morning",
             Moods.ALL.getValue("morning").curationHint,
         )
     }

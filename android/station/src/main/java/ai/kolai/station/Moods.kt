@@ -122,9 +122,11 @@ object Moods {
                 "unobtrusive, barely-there, low-key and steady. Do NOT add " +
                 "energy or excitement. Speak only the Hebrew, naturally:",
             djLine = "השידור עכשיו במצב ריכוז - דבר מעט, קצר ושקט, בלי להפריע.",
-            curationHint = "steady, mellow, non-distracting songs for focus - chill, " +
-                "instrumental-leaning, lo-fi, smooth grooves, minimal vocals; " +
-                "consistent calm energy, nothing jarring",
+            curationHint = "steady, mellow, non-distracting background songs for focus - chill, " +
+                "instrumental-leaning, lo-fi, smooth grooves, soft vocals. STRICTLY " +
+                "EXCLUDE high-energy/danceable, loud, aggressive, hype, or attention-" +
+                "grabbing lyric-heavy songs - nothing that pulls focus or makes you " +
+                "look up. Keep it calm, even and unobtrusive",
             // Steady mid-low groove: nothing jarring, nothing sleepy.
             bpmLo = 70.0, bpmHi = 110.0,
         ),
@@ -138,8 +140,10 @@ object Moods {
                 "the Hebrew, naturally:",
             djLine = "השידור עכשיו במצב בוקר - חם, אופטימי ומאיר פנים.",
             curationHint = "bright, warm, uplifting mid-energy morning songs - feel-good " +
-                "pop, sunny vibes, easy upbeat tracks; a positive start to the " +
-                "day",
+                "pop, sunny vibes, easy upbeat tracks, a positive start to the day. " +
+                "EXCLUDE sad/melancholic/heartbreak ballads, dark or heavy songs, " +
+                "aggressive bangers, and slow downers - nothing depressing or harsh " +
+                "for the morning",
             // Rising-but-easy mid energy: brighter than focus, calmer than party.
             bpmLo = 90.0, bpmHi = 120.0,
         ),
