@@ -139,9 +139,9 @@ class MoodsTest {
         assertEquals(
             "bright, warm, uplifting mid-energy morning songs - feel-good " +
                 "pop, sunny vibes, easy upbeat tracks, a positive start to the day. " +
-                "EXCLUDE sad/melancholic/heartbreak ballads, dark or heavy songs, " +
-                "aggressive bangers, and slow downers - nothing depressing or harsh " +
-                "for the morning",
+                "EXCLUDE sad/melancholic/heartbreak ballads, dark/heavy songs, slow " +
+                "downers, AND aggressive or hard-edged songs even if upbeat (e.g. Beat " +
+                "It) - morning is WARM, not depressing or harsh",
             Moods.ALL.getValue("morning").curationHint,
         )
     }

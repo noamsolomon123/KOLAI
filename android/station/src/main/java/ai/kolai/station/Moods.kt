@@ -141,9 +141,9 @@ object Moods {
             djLine = "השידור עכשיו במצב בוקר - חם, אופטימי ומאיר פנים.",
             curationHint = "bright, warm, uplifting mid-energy morning songs - feel-good " +
                 "pop, sunny vibes, easy upbeat tracks, a positive start to the day. " +
-                "EXCLUDE sad/melancholic/heartbreak ballads, dark or heavy songs, " +
-                "aggressive bangers, and slow downers - nothing depressing or harsh " +
-                "for the morning",
+                "EXCLUDE sad/melancholic/heartbreak ballads, dark/heavy songs, slow " +
+                "downers, AND aggressive or hard-edged songs even if upbeat (e.g. Beat " +
+                "It) - morning is WARM, not depressing or harsh",
             // Rising-but-easy mid energy: brighter than focus, calmer than party.
             bpmLo = 90.0, bpmHi = 120.0,
         ),
