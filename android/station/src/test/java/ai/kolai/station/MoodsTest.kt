@@ -121,9 +121,11 @@ class MoodsTest {
             Moods.ALL.getValue("party").curationHint,
         )
         assertEquals(
-            "low-energy, slow, smooth, intimate late-night songs - mellow " +
-                "R&B, downtempo, soft ballads, chill electronic, dreamy vibes; " +
-                "avoid loud high-tempo bangers",
+            "low-energy, slow, smooth, MELLOW late-night songs - downtempo, " +
+                "soft ballads, mellow R&B, chill electronic, acoustic, dreamy Israeli " +
+                "ballads, quiet vibes. STRICTLY EXCLUDE upbeat/danceable/high-energy or " +
+                "party songs, loud bangers, fast pop/EDM, anything you'd play at a party - " +
+                "when in doubt toward energy, EXCLUDE. Keep it calm and slow",
             Moods.ALL.getValue("late_night").curationHint,
         )
         assertEquals(
