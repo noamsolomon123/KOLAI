@@ -126,6 +126,11 @@ class TastePoolPlanner(
     private companion object {
         const val MOOD_ASK_CAP = 60
         const val MOOD_BOOST = 8.0
+        // Songs the curator judges as NOT fitting the mood are DEMOTED (not just
+        // left unboosted) so a slow ballad that is a top taste track no longer
+        // leaks into a high-energy mood (party) -- and vice versa for late_night.
+        // Soft (never zero) so a mis-judged song can still occasionally surface.
+        const val MOOD_MISFIT_DEMOTE = 0.15
         const val ARTIST_FATIGUE = 0.25
 
         // --- per-mood BPM bias ----------------------------------------------
@@ -249,8 +254,12 @@ class TastePoolPlanner(
                     asked.map { Song(title = it.track.title, artist = it.track.artist) },
                 )
                 if (fit != null) {
-                    for (i in fit) {
-                        if (i in asked.indices) asked[i].weight *= MOOD_BOOST
+                    // BOOST fitting songs AND demote the rest, so the mood actually
+                    // SHAPES the selection (party stays upbeat, late_night mellow)
+                    // instead of merely nudging it (vibe-match, Noam 2026-06-14).
+                    val fitSet = fit.toHashSet()
+                    for (idx in asked.indices) {
+                        asked[idx].weight *= if (idx in fitSet) MOOD_BOOST else MOOD_MISFIT_DEMOTE
                     }
                 }
             }
