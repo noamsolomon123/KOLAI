@@ -113,9 +113,11 @@ class MoodsTest {
             Moods.ALL.getValue("mix").curationHint,
         )
         assertEquals(
-            "high-energy, upbeat, danceable party bangers - energetic pop, " +
-                "dance, EDM, hip-hop bangers (think 'The Middle' energy); keep " +
-                "the energy high and the tempo up",
+            "ONLY high-energy, upbeat, DANCEABLE party songs - energetic pop, " +
+                "dance, EDM, funk, disco, Mizrahi party hits, hip-hop bangers (think " +
+                "'The Middle' / 'Don't Stop Til You Get Enough' energy). EXCLUDE ballads, " +
+                "slow or melancholic songs, acoustic, downtempo - a slow longing ballad must " +
+                "NEVER be in a party set. Keep the tempo up and the floor moving",
             Moods.ALL.getValue("party").curationHint,
         )
         assertEquals(

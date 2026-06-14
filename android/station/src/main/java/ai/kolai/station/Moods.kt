@@ -89,9 +89,11 @@ object Moods {
                 "Bring energy without screaming or going over-the-top. Speak " +
                 "only the Hebrew, naturally:",
             djLine = "השידור עכשיו במצב מסיבה - אנרגיה גבוהה, קצבי, משפטים קצרים ומלאי חיים.",
-            curationHint = "high-energy, upbeat, danceable party bangers - energetic pop, " +
-                "dance, EDM, hip-hop bangers (think 'The Middle' energy); keep " +
-                "the energy high and the tempo up",
+            curationHint = "ONLY high-energy, upbeat, DANCEABLE party songs - energetic pop, " +
+                "dance, EDM, funk, disco, Mizrahi party hits, hip-hop bangers (think " +
+                "'The Middle' / 'Don't Stop Til You Get Enough' energy). EXCLUDE ballads, " +
+                "slow or melancholic songs, acoustic, downtempo - a slow longing ballad must " +
+                "NEVER be in a party set. Keep the tempo up and the floor moving",
             // Fast, danceable floor: the upper end reaches double-time pop/EDM.
             bpmLo = 118.0, bpmHi = 150.0,
         ),
