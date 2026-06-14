@@ -135,7 +135,7 @@ class TastePoolPlanner(
 
         // --- per-mood BPM bias ----------------------------------------------
         const val BPM_IN_WINDOW_BOOST = 3.0
-        const val BPM_FAR_OUTSIDE_DEMOTE = 0.4
+        const val BPM_FAR_OUTSIDE_DEMOTE = 0.2 // stronger: keep far-outside-window tempos out of a mood (esp. calm moods)
         const val BPM_FAR_MARGIN = 20.0
 
         // --- seed proximity tilt for the FIRST pick -------------------------
