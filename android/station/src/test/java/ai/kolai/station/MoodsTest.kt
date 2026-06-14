@@ -131,9 +131,9 @@ class MoodsTest {
         assertEquals(
             "steady, mellow, non-distracting background songs for focus - chill, " +
                 "instrumental-leaning, lo-fi, smooth grooves, soft vocals. STRICTLY " +
-                "EXCLUDE high-energy/danceable, loud, aggressive, hype, or attention-" +
-                "grabbing lyric-heavy songs - nothing that pulls focus or makes you " +
-                "look up. Keep it calm, even and unobtrusive",
+                "EXCLUDE high-energy/danceable songs, upbeat Mizrahi or pop vocal hits, " +
+                "loud, aggressive, hype, or attention-grabbing lyric-heavy songs - " +
+                "nothing that pulls focus or makes you look up. Keep it calm and unobtrusive",
             Moods.ALL.getValue("focus").curationHint,
         )
         assertEquals(
