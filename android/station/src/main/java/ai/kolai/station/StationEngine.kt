@@ -258,6 +258,14 @@ class StationEngine(
                 }
                 false
             }
+            // MEMORY HYGIENE (2026-06-14): the just-rendered block's mix timeline
+            // (a multi-MB FloatArray) is now garbage; ART tends to grow the heap
+            // FOOTPRINT to the cap rather than collect it, so across a long session
+            // the next block's decode eventually finds no room (the emulator's
+            // 512MB heap OOM'd this way). Nudge a collection at the block boundary.
+            // Cheap: blocks are minutes apart, so the brief GC is inaudible, and it
+            // keeps the steady-state footprint lower on every device.
+            if (!done) System.gc()
             if (done) break
             if (cooldownMs > 0 && cooldownEligible) delay(cooldownMs)
         }
