@@ -50,6 +50,10 @@ class KolaiEngine private constructor(
     private val bpmSourceImpl: DeezerBpmSource,
     private val genreSourceImpl: DeezerGenreSource,
 ) {
+    /** Exposed (read-only) so the service can proactively warm the BPM cache for
+     *  the taste pool alongside [genreSource]. Same instance as the planner uses. */
+    val bpmSource: ai.kolai.station.BpmSource get() = bpmSourceImpl
+
     /** Release the underlying HTTP engine and the background warm scopes. */
     fun close() {
         try { bpmSourceImpl.close() } catch (_: Throwable) { }
