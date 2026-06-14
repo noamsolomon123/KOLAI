@@ -197,6 +197,9 @@ class KolaiEngine private constructor(
                 // test reproducibility), which made every launch follow the same
                 // talk/segment pattern -- the opposite of "feel different each time".
                 rng = kotlin.random.Random(System.nanoTime()),
+                // Feed measured Essentia BPM into the planner's BPM cache so
+                // mood vibe-match uses real tempo (esp. for Hebrew songs).
+                onAnalyzed = { s, a -> bpmSource.put(s.artist, s.title, a.bpm) },
             )
 
             return KolaiEngine(

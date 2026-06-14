@@ -143,6 +143,10 @@ class BlockRenderer(
     // PERSONA so successive two-host bits use a distinct co-host voice. Index
     // wraps modulo the list; empty -> always the single constructor [voiceB].
     private val sidekickVoices: List<String> = emptyList(),
+    // ESSENTIA ENERGY-FEED (2026-06-14): invoked per loaded track with its Song +
+    // REAL Essentia analysis, so the app can cache MEASURED bpm for the planner's
+    // vibe-match (Deezer bpm is sparse and absent for most Hebrew songs). Optional.
+    private val onAnalyzed: ((Song, ai.kolai.core.TrackAnalysis) -> Unit)? = null,
     // VOCAL-ONSET seam (task 3, 2026-06-13): (conditioned mono PCM, sr) -> the
     // safe instrumental window (s) at the song's start. Defaults to the real
     // :analyze VocalOnset; injectable so tests pin a known window (e.g. ~0 to
@@ -435,7 +439,9 @@ class BlockRenderer(
                     // Computed here because loadTracks is the only place the
                     // decoded PCM exists. SAFETY-biased inside VocalOnset.
                     safeIntroByPath[path] = safeIntroFn(audio, Dsp.SR)
-                    LoadedTrack(song, analyzeFn(path), audio, path)
+                    val analysis = analyzeFn(path)
+                    onAnalyzed?.invoke(song, analysis)
+                    LoadedTrack(song, analysis, audio, path)
                 }
             } catch (e: CancellationException) {
                 throw e // cooperative cancellation must propagate

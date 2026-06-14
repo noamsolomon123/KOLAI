@@ -107,6 +107,15 @@ class DeezerBpmSource(
         }
     }
 
+    /** Inject a MEASURED bpm (on-device Essentia analysis) into the cache so the
+     *  planner's [cachedBpm] returns real tempo even for songs Deezer has no bpm
+     *  for (most Hebrew songs). A measured tempo overrides a Deezer value/tombstone
+     *  (Deezer's is often octave-off or absent). Lets vibe-match work on real energy. */
+    fun put(artist: String, title: String, bpm: Double) {
+        if (title.isBlank() || bpm <= 0.0) return
+        cache[keyOf(artist, title)] = bpm
+    }
+
     /** Cancel the background warm scope; call from a lifecycle hook if one exists
      *  (the default daemon SupervisorJob is otherwise fine to leave running). */
     fun close() {
