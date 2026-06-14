@@ -55,7 +55,13 @@ data class DevConfig(
          */
         fun load(context: Context): DevConfig {
             val props = Properties()
-            context.assets.open(ASSET).use { props.load(it) }
+            // UTF-8 reader (2026-06-14 BUG FIX): Properties.load(InputStream)
+            // decodes ISO-8859-1, which MANGLED the Hebrew bans.artists value
+            // ("טאקי") on read, so the artist ban never matched and a banned
+            // artist aired. The Reader overload honors the charset.
+            context.assets.open(ASSET).use { stream ->
+                java.io.InputStreamReader(stream, Charsets.UTF_8).use { reader -> props.load(reader) }
+            }
 
             val keys = listOfNotNull(
                 props.getProperty("gemini.key.1"),
